@@ -41,9 +41,16 @@ The **Release Server** workflow uses the default `GITHUB_TOKEN` with
 belong in the repo; keep them in local `scripts/deploy.env`.
 
 To re-run without a new tag: Actions → **Release Server** → Run workflow → enter
-tag (e.g. `v0.15.0`).
+tag (e.g. `v0.15.0` or `v0.0.1`).
 
-Desktop/Tauri assets still come from `.github/workflows/release.yml` (unchanged).
+**Tag → workflow map**
+
+| Tag / trigger | Workflow | Asset |
+|---------------|----------|--------|
+| `vX.Y.Z` (e.g. `v0.0.1`) | **Release Server** | `papr-linux-amd64-vX.Y.Z.tar.gz` |
+
+There is no desktop/Tauri release workflow in CI. Deploy with
+`scripts/deploy.sh --from-release vX.Y.Z` (or `latest`).
 
 ## Scripts
 
