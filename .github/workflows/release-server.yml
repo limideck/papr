@@ -1,5 +1,5 @@
 # Build Linux amd64 papr-server + frontend and attach to a GitHub Release.
-# Production web deploy path (ubuntu-latest = x86_64 / amd64).
+# Production web deploy: static musl amd64 binary (glibc/OpenSSL-independent).
 #
 # Triggers: push tags v0.1.2 / v1.0.0, or workflow_dispatch.
 # Permissions: contents: write (GITHUB_TOKEN) is enough to create/update the release.
@@ -65,11 +65,17 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
 
       - name: Cache Rust build
         uses: swatinem/rust-cache@v2
         with:
           workspaces: .
+          key: musl-amd64
+
+      - name: Install musl linker
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Install frontend deps
         run: pnpm install --frozen-lockfile
@@ -77,8 +83,8 @@ jobs:
       - name: Build frontend
         run: pnpm build
 
-      - name: Build papr-server (release, stripped)
-        run: cargo build --release -p papr-server
+      - name: Build papr-server (static musl, stripped)
+        run: cargo build --release -p papr-server --target x86_64-unknown-linux-musl
 
       - name: Package tarball
         env:
@@ -100,7 +106,7 @@ jobs:
           install_env_example
           rm -f "$ENV_FILE"
 
-          install -m 755 target/release/papr-server "$BIN"
+          install -m 755 target/x86_64-unknown-linux-musl/release/papr-server "$BIN"
           rsync -a --delete dist/ "$STATIC_DIR/"
           cp -f scripts/papr-server.service "$STAGE/papr-server.service"
 
@@ -113,10 +119,11 @@ jobs:
             papr-server.service
 
           ls -lh "$ASSET_NAME"
-          file target/release/papr-server
+          file target/x86_64-unknown-linux-musl/release/papr-server
+          ldd target/x86_64-unknown-linux-musl/release/papr-server 2>&1 || true
           # Confirm release profile was used (stripped ELF).
           if command -v readelf >/dev/null 2>&1; then
-            if readelf -S target/release/papr-server 2>/dev/null | grep -q '\.symtab'; then
+            if readelf -S target/x86_64-unknown-linux-musl/release/papr-server 2>/dev/null | grep -q '\.symtab'; then
               echo "warning: binary still has .symtab (strip may not have run)" >&2
             else
               echo "OK: release binary appears stripped"
