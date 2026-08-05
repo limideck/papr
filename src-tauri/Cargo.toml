@@ -1,0 +1,105 @@
+[package]
+name = "papr"
+version = "0.15.0"
+description = "Papr — a modern RSS reader"
+authors = ["you"]
+edition = "2021"
+# Disable binary auto-discovery so Cargo does not also infer a `papr` binary
+# from `src/main.rs` (package-named) alongside the explicit `papr-desktop`
+# target below. Without this, the workspace target dir could contain a stray
+# `papr` that collides with the agent CLI's binary.
+autobins = false
+
+[lib]
+name = "papr_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+# Distinct binary name so the desktop app's cargo output (`papr-desktop`) does
+# not collide with the agent CLI's `papr` binary in the shared workspace target
+# dir. The bundled product is still "Papr" (see tauri.conf.json productName /
+# mainBinaryName); only the intermediate cargo binary name changes.
+[[bin]]
+name = "papr-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# `unstable` unlocks the child-webview API (Window::add_child) used by the
+# in-app original-page view (issue #49) — sites that refuse iframes
+# (X-Frame-Options) still render in a native child webview. API may change
+# across Tauri minors; pinned via Cargo.lock.
+tauri = { version = "2", features = ["tray-icon", "image-png", "unstable"] }
+tauri-plugin-opener = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-autostart = "2"
+tauri-plugin-os = "2"
+tauri-plugin-window-state = "2"
+# Custom-scheme deep links (feature F6): the browser extension's
+# "Subscribe in Papr" button opens a `papr://subscribe?url=…` link.
+tauri-plugin-deep-link = "2"
+# In-app auto-update: checks the GitHub release feed, downloads the signed
+# bundle, and relaunches into the new version (process plugin does the restart).
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# The UI-free core: SQLite data layer, ingestion building blocks, sanitization.
+# Shared verbatim with the agent CLI so both link the same data code.
+papr-core = { path = "../crates/papr-core" }
+
+# data layer
+rusqlite = { version = "0.32", features = ["bundled", "functions"] }
+rusqlite_migration = "1"
+
+# ingestion
+feed-rs = "2"
+reqwest = { version = "0.12", features = ["gzip", "brotli", "json"] }
+tokio = { version = "1", features = ["full"] }
+scraper = "0.21"
+ego-tree = "0.9"  # scraper's DOM tree type — walked directly for text extraction
+url = "2"
+opml = "1"
+# Decode fetched HTML pages in their declared charset (Shift-JIS, GBK,
+# ISO-8859-1, …) instead of assuming UTF-8. Already in the tree via reqwest.
+encoding_rs = "0.8"
+
+# email newsletter ingestion (F5): IMAP polling + RFC822 parsing.
+# `imap` 3.x is pre-release; pinned exactly. `rustls-tls` avoids an OpenSSL
+# system dependency, keeping the CI/build environment self-contained.
+imap = { version = "=3.0.0-alpha.15", default-features = false, features = ["rustls-tls"] }
+mail-parser = "0.11"
+
+# content
+ammonia = "4.1.2"
+dom_smoothie = "0.17"
+# Rewrite lazy-loaded <img> tags (real URL in data-src/srcset) before ammonia
+# strips those attributes — see sanitize::promote_lazy_images.
+lol_html = "2"
+
+# "Send to Kindle" delivers the article as an email attachment (feature F8).
+# `rustls-tls` keeps the build self-contained (no system OpenSSL), matching the
+# `imap` crate's TLS choice above. The blocking transport is enough — sends run
+# on the Tokio blocking pool.
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "rustls-tls", "builder"] }
+
+# misc
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+thiserror = "2"
+log = "0.4"
+
+# macOS-only: used in setup() to turn off the WKWebview's opaque white backing
+# (wry only does this under its `transparent` feature, which we don't enable),
+# so a live window resize stops flashing white. Versions track what tauri/wry
+# already pull in, keeping a single objc2 in the tree.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+# Typed handles to the WKWebView / NSWindow / NSColor we repaint per theme to
+# kill the resize flash (see src/backing.rs). Versions track tauri/wry's own
+# objc2 to keep a single copy in the tree.
+objc2-web-kit = { version = "0.3", features = ["WKWebView"] }
+objc2-app-kit = { version = "0.3", features = ["NSColor", "NSWindow", "NSView", "NSResponder"] }

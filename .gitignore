@@ -1,0 +1,65 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Node
+node_modules
+.pnpm-store/
+dist
+dist-ssr
+*.local
+
+# Rust / Cargo build output
+/target
+**/target/
+
+# Stray compiler scratch output
+a.out
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+._*
+
+# ralph-loop / Claude local state
+.claude/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Local SQLite databases (never commit)
+*.db
+*.db-shm
+*.db-wal
+papr.db*
+rss.db*
+
+# Env / secrets (keep *.example tracked)
+.env
+.env.*
+!.env.example
+!**/.env.example
+scripts/deploy.env
+.env.deploy
+deploy.env
+**/.env
+!scripts/deploy.env.example
+!crates/papr-server/.env.example
+
+# Deploy / packaging artifacts
+Deploy/
+**/Deploy/
+*.tar.gz
+feedoverflow/
+
+# Accidental curl/cookie scratch files at repo root
+/-X

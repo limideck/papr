@@ -1,0 +1,593 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { useQueryClient } from "@tanstack/react-query";
+import * as api from "./api";
+import { useAuth } from "./auth";
+import { useUi, READER_FONTS, resolveMode, systemPrefersDark } from "./store";
+import type { Palette, ResolvedMode } from "./store";
+import { useArticleActions } from "./hooks/articleActions";
+import { readCurrentItems } from "./lib/currentList";
+import { openUrl } from "./lib/openUrl";
+import { useToasts, toast as toastApi, reportError } from "./toast";
+import type { ArticleQuery, ArticleSummary, Feed } from "./types";
+import Sidebar from "./components/Sidebar";
+import ArticleList from "./components/ArticleList";
+import Reader from "./components/Reader";
+import CommandPalette, { type CommandAction } from "./components/CommandPalette";
+import SettingsDialog from "./components/SettingsDialog";
+import AddFeedDialog from "./components/AddFeedDialog";
+import ExploreDialog from "./components/ExploreDialog";
+import PromptDialog from "./components/PromptDialog";
+import PlayerBar from "./components/PlayerBar";
+import ResizeHandle from "./components/ResizeHandle";
+import Icon from "./components/Icon";
+import LoginPage from "./components/LoginPage";
+import { PANEL_BOUNDS } from "./store";
+
+// The accent per (palette, mode), fed to --accent / --accent-soft / --accent-ink.
+const ACCENTS: Record<Palette, Record<ResolvedMode, { accent: string; soft: string; ink: string }>> = {
+  paper: {
+    light: { accent: "oklch(0.60 0.13 38)", soft: "oklch(0.94 0.04 50)", ink: "oklch(0.42 0.10 38)" },
+    dark: { accent: "oklch(0.74 0.13 45)", soft: "oklch(0.32 0.06 40)", ink: "oklch(0.80 0.10 45)" },
+  },
+  frost: {
+    light: { accent: "#007AFF", soft: "rgba(0, 122, 255, 0.13)", ink: "#0062CC" },
+    dark: { accent: "#0A84FF", soft: "rgba(10, 132, 255, 0.20)", ink: "#6FB4FF" },
+  },
+  contrast: {
+    light: { accent: "#0057D9", soft: "rgba(0, 87, 217, 0.14)", ink: "#003E9E" },
+    dark: { accent: "#0A84FF", soft: "rgba(10, 132, 255, 0.24)", ink: "#8CC4FF" },
+  },
+};
+
+export default function App() {
+  const { t } = useTranslation();
+  const { user } = useAuth();
+  const isAdmin = !!user?.isAdmin;
+  const qc = useQueryClient();
+
+  const palette = useUi((s) => s.palette);
+  const mode = useUi((s) => s.mode);
+  const density = useUi((s) => s.density);
+  // OS colour scheme, tracked live so `mode: "system"` follows it without a
+  // restart. Only matters while `mode === "system"`, but the listener is cheap
+  // and always mounted so a switch to System takes effect immediately.
+  const [systemDark, setSystemDark] = useState(systemPrefersDark);
+  useEffect(() => {
+    const mq = window.matchMedia?.("(prefers-color-scheme: dark)");
+    if (!mq) return;
+    const onChange = () => setSystemDark(mq.matches);
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, []);
+  // The concrete light/dark actually applied: `mode` unless it's "system", in
+  // which case the OS decides.
+  const effectiveMode: ResolvedMode = mode === "system" ? (systemDark ? "dark" : "light") : mode;
+  const readerFont = useUi((s) => s.readerFont);
+  const readerSize = useUi((s) => s.readerSize);
+  const readerLeading = useUi((s) => s.readerLeading);
+  const readerWidth = useUi((s) => s.readerWidth);
+  const sidebarWidth = useUi((s) => s.sidebarWidth);
+  const listWidth = useUi((s) => s.listWidth);
+  const aiWidth = useUi((s) => s.aiWidth);
+  const reduceMotion = useUi((s) => s.prefs.reduceMotion);
+  const focusMode = useUi((s) => s.focusMode);
+
+  const activeToast = useToasts((s) => s.current);
+  const dismissToast = useToasts((s) => s.dismiss);
+  const [refreshing, setRefreshing] = useState(false);
+  const [cpOpen, setCpOpen] = useState(false);
+  const [settings, setSettings] = useState<{ open: boolean; section?: string }>({
+    open: false,
+  });
+  const [addFeed, setAddFeed] = useState(false);
+  // Feed URL handed over by a `papr://subscribe` deep link (browser extension).
+  const [addFeedUrl, setAddFeedUrl] = useState<string | undefined>(undefined);
+  // The standalone Explore (curated-directory marketplace) dialog.
+  const [explore, setExplore] = useState(false);
+  const [newFolder, setNewFolder] = useState(false);
+
+  // Mirror "any covering modal is open" into the store. The reader's
+  // original-page view is a native child webview that floats above the whole
+  // DOM, so it would occlude a dialog opened over the reader (issue #54). The
+  // reader watches this flag and tears the view down while a modal is up.
+  const setModalOpen = useUi((s) => s.setModalOpen);
+  useEffect(() => {
+    setModalOpen(cpOpen || settings.open || addFeed || explore || newFolder);
+  }, [cpOpen, settings.open, addFeed, explore, newFolder, setModalOpen]);
+
+  // ── apply appearance to the document root ──
+  useEffect(() => {
+    const root = document.documentElement;
+    root.dataset.palette = palette;
+    root.dataset.mode = effectiveMode;
+    root.dataset.density = density;
+    if (user) api.setSetting("mode", effectiveMode).catch(() => {});
+    const a = ACCENTS[palette][effectiveMode];
+    root.style.setProperty("--accent", a.accent);
+    root.style.setProperty("--accent-soft", a.soft);
+    root.style.setProperty("--accent-ink", a.ink);
+  }, [palette, effectiveMode, density, user]);
+
+  // ── dismiss the boot splash once the app shell has mounted ──
+  useEffect(() => {
+    const el = document.getElementById("app-loading");
+    if (!el) return;
+    el.classList.add("hide");
+    const timer = window.setTimeout(() => el.remove(), 360);
+    return () => window.clearTimeout(timer);
+  }, []);
+
+  useEffect(() => {
+    document.documentElement.dataset.reduceMotion = String(reduceMotion);
+  }, [reduceMotion]);
+
+  // Apply the startup view preference once, on first mount.
+  useEffect(() => {
+    const { startupView, hideReadOnStartup } = useUi.getState().prefs;
+    // Smart-view header labels in the *current* UI language. Smart-view
+    // selections persist a translated label into `lastView`; re-deriving it
+    // here keeps the header correct after a language switch (a feed/folder/tag
+    // label is a proper name, so that case keeps the persisted value).
+    const labels: Record<string, string> = {
+      all: t("smart.all"),
+      unread: t("smart.unread"),
+      starred: t("smart.starred"),
+      readLater: t("smart.readLater"),
+    };
+    if (startupView !== "last" && labels[startupView]) {
+      useUi
+        .getState()
+        .select({ kind: startupView } as ArticleQuery, labels[startupView]);
+    } else if (startupView === "last") {
+      // Restore the view that was open when the app last closed.
+      try {
+        const raw = localStorage.getItem("lastView");
+        if (raw) {
+          const saved = JSON.parse(raw) as { query?: ArticleQuery; label?: string };
+          if (saved.query?.kind) {
+            // The persisted label was captured in whatever language was
+            // active when the view was last selected — for a smart view it
+            // would now be stale if the user has since changed languages, so
+            // re-translate it from the current locale.
+            const label = labels[saved.query.kind] ?? saved.label ?? "";
+            useUi.getState().select(saved.query, label);
+          }
+        }
+      } catch {
+        /* ignore a corrupt persisted value */
+      }
+    }
+    if (hideReadOnStartup && !useUi.getState().unreadOnly) {
+      useUi.getState().toggleUnreadOnly();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    const root = document.documentElement.style;
+    const font = READER_FONTS[readerFont];
+    root.setProperty("--reader-font", font.stack);
+    root.setProperty("--reader-font-adjust", font.adjust);
+    root.setProperty("--reader-size", `${readerSize}px`);
+    root.setProperty("--reader-leading", String(readerLeading / 100));
+    root.setProperty("--reader-width", `${readerWidth}px`);
+  }, [readerFont, readerSize, readerLeading, readerWidth]);
+
+  // ── apply the draggable pane widths as the grid/drawer CSS variables ──
+  // These drive `.window`'s grid columns and the AI drawer's width; the resize
+  // handles write to the store, the store persists, and this mirrors the value
+  // back onto the document root.
+  useEffect(() => {
+    const root = document.documentElement.style;
+    root.setProperty("--col-sidebar", `${sidebarWidth}px`);
+    root.setProperty("--col-list", `${listWidth}px`);
+    root.setProperty("--ai-width", `${aiWidth}px`);
+  }, [sidebarWidth, listWidth, aiWidth]);
+
+  // ── toast ──
+  // The store owns the queue; App owns only the dwell timer and the render.
+  const showToast = toastApi.show;
+  useEffect(() => {
+    if (!activeToast) return;
+    const timer = window.setTimeout(
+      () => dismissToast(activeToast.id),
+      activeToast.duration,
+    );
+    return () => window.clearTimeout(timer);
+  }, [activeToast, dismissToast]);
+
+  // Article-action failures route to an error toast, not a silent default one.
+  const actions = useArticleActions(toastApi.error);
+
+  // ── poll for background feed updates (replaces Tauri "feeds-updated") ──
+  useEffect(() => {
+    if (!user) return;
+    const id = window.setInterval(() => {
+      qc.invalidateQueries({ queryKey: ["feeds"] });
+      qc.invalidateQueries({ queryKey: ["counts"] });
+    }, 60_000);
+    return () => window.clearInterval(id);
+  }, [qc, user]);
+
+  // A ref — not the `refreshing` state — is the concurrency guard: it must be
+  // read-and-set synchronously, and the kick-off has side effects (a network
+  // refresh, a toast). A setState updater must stay pure; React invokes it
+  // twice under StrictMode, which previously fired the refresh twice in dev.
+  // `refreshing` state is kept purely to drive the sidebar spinner.
+  const refreshingRef = useRef(false);
+  const doRefresh = useCallback((scope?: { feedId?: number; folderId?: number }) => {
+    if (refreshingRef.current) return;
+    refreshingRef.current = true;
+    setRefreshing(true);
+    showToast(
+      scope?.feedId != null
+        ? t("app.refreshingFeed")
+        : scope?.folderId != null
+          ? t("app.refreshingFolder")
+          : t("app.refreshing"),
+    );
+    api
+      .refreshFeeds(undefined, scope)
+      .then((n) => {
+        // Refresh only the caches a feed fetch can actually change — a bare
+        // `invalidateQueries()` would also refetch unrelated queries (rules,
+        // FreshRSS status, the open feed-discovery search).
+        actions.refreshAfterFetch();
+        showToast(n > 0 ? t("app.foundNew", { count: n }) : t("app.upToDate"));
+      })
+      .catch(reportError)
+      .finally(() => {
+        refreshingRef.current = false;
+        setRefreshing(false);
+      });
+  }, [actions, showToast, t]);
+
+  const markAllRead = useCallback(async () => {
+    try {
+      const n = await api.markAllRead(useUi.getState().query);
+      actions.refreshAfterBulk();
+      showToast(n > 0 ? t("app.markedRead", { count: n }) : t("app.nothingToMark"));
+    } catch (e) {
+      reportError(e);
+    }
+  }, [actions, showToast, t]);
+
+  const openSettings = (section?: string) => setSettings({ open: true, section });
+
+  // ── command-palette actions ──
+  const handleCommand = (action: CommandAction) => {
+    switch (action) {
+      case "mark-all-read": markAllRead(); break;
+      case "toggle-theme":
+        // Flip to the opposite of what's *shown* — so from "system" it lands on
+        // an explicit light/dark rather than appearing to do nothing.
+        useUi.getState().setMode(effectiveMode === "dark" ? "light" : "dark");
+        break;
+      case "toggle-focus":
+        useUi.getState().setFocusMode(!useUi.getState().focusMode);
+        break;
+      case "toggle-ai":
+        if (useUi.getState().selectedArticleId != null)
+          useUi.getState().setAiOpen(!useUi.getState().aiOpen);
+        break;
+      case "refresh":
+        if (isAdmin) doRefresh();
+        break;
+      case "add-feed":
+        if (isAdmin) setAddFeed(true);
+        break;
+      case "new-folder":
+        if (isAdmin) setNewFolder(true);
+        break;
+      case "opml":
+        if (isAdmin) openSettings("subscriptions");
+        break;
+      case "open-settings": openSettings(); break;
+    }
+  };
+
+  const navigateFeed = (feed: Feed) => {
+    useUi.getState().select({ kind: "feed", value: feed.id }, feed.title);
+  };
+  const navigateArticle = (a: ArticleSummary) => {
+    useUi.getState().select({ kind: "feed", value: a.feedId }, a.feedTitle);
+    useUi.getState().openArticle(a.id);
+  };
+
+  // ── global keyboard shortcuts (design app.jsx parity) ──
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement)?.tagName;
+      const inField = tag === "INPUT" || tag === "TEXTAREA";
+      const mod = e.metaKey || e.ctrlKey;
+
+      // The modifier-key shortcuts (⌘K / ⌘, / ⌘R) are *application-global* —
+      // they must fire regardless of where focus sits. The INPUT/TEXTAREA
+      // guard below only suppresses the single-key list/reader shortcuts so a
+      // plain "j" typed into a search box doesn't navigate; it must not block
+      // a ⌘-combo. Crucially, the command palette and Settings each own a
+      // focused text field, so gating these on focus would make ⌘K / ⌘, fail
+      // to *close* their own dialog — the one path Escape isn't the only key
+      // for.
+
+      // ⌘K / ⌘, open their own modal. Firing them while another modal is
+      // already open would stack a second dialog on top — two focus traps
+      // then fight over the keyboard, and dismissing the inner one drops
+      // focus to nowhere. So suppress the *open* half when a blocking modal
+      // is up; the *close* (toggle-off) half stays live so ⌘K still shuts
+      // the command palette and ⌘, still shuts Settings.
+      if (mod && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        const cpOpen = !!document.querySelector(".cp-backdrop");
+        if (
+          !cpOpen &&
+          document.querySelector(
+            ".settings-backdrop, .modal-backdrop, .tag-picker, .hl-popover",
+          )
+        )
+          return;
+        setCpOpen((o) => !o);
+        return;
+      }
+      if (mod && e.key === ",") {
+        e.preventDefault();
+        const settingsOpen = !!document.querySelector(".settings-backdrop");
+        if (
+          !settingsOpen &&
+          document.querySelector(
+            ".cp-backdrop, .modal-backdrop, .tag-picker, .hl-popover",
+          )
+        )
+          return;
+        setSettings((s) => ({ open: !s.open }));
+        return;
+      }
+      if (mod && e.key.toLowerCase() === "r") {
+        e.preventDefault();
+        if (isAdmin) doRefresh();
+        return;
+      }
+      if (mod) return;
+
+      // Past this point only the single-key list/reader shortcuts remain —
+      // a bare "j" / "s" / "a" etc. Those must never fire while the user is
+      // typing into a text field, so bail once the modifier combos above
+      // have had their chance.
+      if (inField) return;
+
+      // Skip list/reader shortcuts while any overlay owns the keyboard.
+      // `.hl-popover` is the highlight edit dialog inside the reader and
+      // `.hl-toolbar` is the floating colour toolbar shown when text is
+      // selected: without them here, j/k would navigate away (destroying the
+      // overlay — and, for the toolbar, the live selection the user was about
+      // to highlight), s/u/b would act on the article, and Escape would close
+      // the AI drawer instead of just the overlay.
+      if (
+        document.querySelector(
+          ".cp-backdrop, .settings-backdrop, .modal-backdrop, .ctx-menu, .tag-picker, .hl-popover, .hl-toolbar",
+        )
+      )
+        return;
+
+      const st = useUi.getState();
+
+      const items = readCurrentItems(qc);
+      const idx = items.findIndex((a) => a.id === st.selectedArticleId);
+      const sel = idx >= 0 ? items[idx] : undefined;
+      const go = (delta: number) => {
+        if (items.length === 0) return;
+        const next = items[Math.min(items.length - 1, Math.max(0, idx + delta))];
+        if (next) st.openArticle(next.id);
+      };
+
+      switch (e.key.toLowerCase()) {
+        case "j": e.preventDefault(); go(idx < 0 ? 0 : 1); break;
+        case "k": e.preventDefault(); go(-1); break;
+        case "o":
+          if (sel?.url) { e.preventDefault(); openUrl(sel.url); }
+          break;
+        case "s":
+          if (sel) {
+            e.preventDefault();
+            actions.setStarred(sel.id, !sel.isStarred);
+            showToast(sel.isStarred ? t("app.starRemoved") : t("app.starred"), "S");
+          }
+          break;
+        case "b":
+          if (sel) {
+            e.preventDefault();
+            actions.setReadLater(sel.id, !sel.readLater);
+            showToast(sel.readLater ? t("app.readLaterRemoved") : t("app.readLaterAdded"), "B");
+          }
+          break;
+        case "u":
+          if (sel) { e.preventDefault(); actions.setRead(sel.id, !sel.isRead); }
+          break;
+        case "i":
+          if (st.selectedArticleId != null) {
+            e.preventDefault();
+            st.setAiOpen(!st.aiOpen);
+          }
+          break;
+        case "f": e.preventDefault(); st.setFocusMode(!st.focusMode); break;
+        case "v": e.preventDefault(); st.toggleUnreadOnly(); break;
+        case "a":
+          if (e.shiftKey) { e.preventDefault(); markAllRead(); }
+          else if (isAdmin) { e.preventDefault(); setAddFeed(true); }
+          break;
+        case "d":
+          if (e.shiftKey) {
+            e.preventDefault();
+            st.setMode(resolveMode(st.mode) === "dark" ? "light" : "dark");
+          }
+          break;
+        case "escape":
+          st.setFocusMode(false);
+          st.setAiOpen(false);
+          break;
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // `t` is listed so the shortcut toasts re-bind after a language change.
+    // `cpOpen` is intentionally absent — the handler only ever calls
+    // setCpOpen (a functional update), so it doesn't depend on the value;
+    // listing it would needlessly re-bind the listener on every ⌘K.
+  }, [qc, actions, doRefresh, markAllRead, showToast, t, isAdmin]);
+
+  if (user === undefined) {
+    return <div className="login-page" aria-busy="true" />;
+  }
+  if (!user) {
+    return <LoginPage />;
+  }
+
+  return (
+    <>
+      <div className="app-shell">
+        <div className={`window ${focusMode ? "focus" : ""}`}>
+          <Sidebar
+            onAddFeed={() => setAddFeed(true)}
+            onExplore={() => setExplore(true)}
+            onOpenSettings={openSettings}
+            onSearchClick={() => setCpOpen(true)}
+            onRefresh={doRefresh}
+            refreshing={refreshing}
+            onToast={showToast}
+          />
+          <ArticleList onToast={showToast} />
+          <Reader onToast={showToast} />
+          {/* Pane resize handles. Hidden in focus mode (the sidebar + list are
+              hidden then, collapsing the grid to a single reader column). They
+              sit at the column boundaries via the `left` offset below. */}
+          {!focusMode && (
+            <>
+              <div
+                className="resize-handle-slot"
+                style={{ left: "var(--col-sidebar)" }}
+              >
+                <ResizeHandle
+                  width={sidebarWidth}
+                  side="right"
+                  min={PANEL_BOUNDS.sidebar.min}
+                  max={PANEL_BOUNDS.sidebar.max}
+                  onResize={(w) => useUi.getState().setPanel({ sidebarWidth: w })}
+                  label={t("app.resizeSidebar")}
+                />
+              </div>
+              <div
+                className="resize-handle-slot"
+                style={{ left: "calc(var(--col-sidebar) + var(--col-list))" }}
+              >
+                <ResizeHandle
+                  width={listWidth}
+                  side="right"
+                  min={PANEL_BOUNDS.list.min}
+                  max={PANEL_BOUNDS.list.max}
+                  onResize={(w) => useUi.getState().setPanel({ listWidth: w })}
+                  label={t("app.resizeList")}
+                />
+              </div>
+            </>
+          )}
+        </div>
+        <PlayerBar />
+      </div>
+
+      <CommandPalette
+        open={cpOpen}
+        onClose={() => setCpOpen(false)}
+        onAction={handleCommand}
+        onNavigateFeed={navigateFeed}
+        onNavigateArticle={navigateArticle}
+      />
+
+      {settings.open && (
+        <SettingsDialog
+          onClose={() => setSettings({ open: false })}
+          onToast={showToast}
+          initialSection={settings.section}
+          onAddFeed={() => {
+            setSettings({ open: false });
+            setAddFeed(true);
+          }}
+        />
+      )}
+
+      {addFeed && isAdmin && (
+        <AddFeedDialog
+          onClose={() => {
+            setAddFeed(false);
+            setAddFeedUrl(undefined);
+          }}
+          onToast={showToast}
+          initialUrl={addFeedUrl}
+        />
+      )}
+
+      {explore && isAdmin && (
+        <ExploreDialog
+          onClose={() => setExplore(false)}
+          onToast={showToast}
+        />
+      )}
+
+      {newFolder && isAdmin && (
+        <PromptDialog
+          title={t("app.newFolderTitle")}
+          placeholder={t("app.folderNamePlaceholder")}
+          onSubmit={(v) =>
+            api
+              .createFolder(v)
+              .then(() => {
+                qc.invalidateQueries({ queryKey: ["folders"] });
+                showToast(t("app.folderCreated"));
+              })
+              .catch(reportError)
+          }
+          onClose={() => setNewFolder(false)}
+        />
+      )}
+
+      {/* A live region so screen readers announce each toast; the toast
+          itself is position: fixed, so the wrapper adds no layout. */}
+      <div role="status" aria-live="polite">
+        {activeToast && (
+          <div
+            className={`toast${activeToast.tone === "error" ? " toast-error" : ""}`}
+            key={activeToast.id}
+          >
+            {activeToast.tone === "error" && (
+              <span className="toast-ico" aria-hidden="true">
+                <Icon name="alert" size={14} />
+              </span>
+            )}
+            <span className="toast-text">{activeToast.text}</span>
+            {activeToast.kbd && <kbd aria-hidden="true">{activeToast.kbd}</kbd>}
+            {activeToast.action && (
+              <button
+                className="toast-action"
+                onClick={() => {
+                  activeToast.action!.run();
+                  dismissToast(activeToast.id);
+                }}
+              >
+                {activeToast.action.label}
+              </button>
+            )}
+            {(activeToast.tone === "error" || activeToast.action) && (
+              <button
+                className="toast-dismiss"
+                aria-label={t("common.close")}
+                onClick={() => dismissToast(activeToast.id)}
+              >
+                <Icon name="x" size={13} />
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+    </>
+  );
+}

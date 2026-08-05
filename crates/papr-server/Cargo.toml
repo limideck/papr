@@ -1,0 +1,30 @@
+[package]
+name = "papr-server"
+version = "0.15.0"
+edition = "2021"
+description = "Papr Web server: Axum REST API, session auth, background feed refresh, static frontend hosting."
+
+[[bin]]
+name = "papr-server"
+path = "src/main.rs"
+
+[dependencies]
+papr-core = { path = "../papr-core" }
+rusqlite.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+log.workspace = true
+url.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+mime_guess.workspace = true
+scraper.workspace = true
+tokio-stream = "0.1"

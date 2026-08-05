@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/papr.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>知微海纳</title>
+
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400&family=Inter+Tight:wght@400;450;500;550;600;650;700&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,650;1,6..72,400&family=JetBrains+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+
+    <!-- Apply the saved theme before the first paint so startup never
+         flashes the wrong colours while the app bundle loads. -->
+    <script>
+      (function () {
+        try {
+          var d = document.documentElement;
+          // Resolve the boot-splash light/dark. Prefer the current `mode`
+          // (light | dark | system), falling back to the legacy `theme` key,
+          // and default to "system" for a fresh install. "system" follows the
+          // OS via prefers-color-scheme so a dark-OS user never flashes light.
+          var mode =
+            localStorage.getItem("mode") ||
+            localStorage.getItem("theme") ||
+            "system";
+          var dark =
+            mode === "dark" ||
+            (mode === "system" &&
+              !!window.matchMedia &&
+              window.matchMedia("(prefers-color-scheme: dark)").matches);
+          d.dataset.theme = dark ? "dark" : "light";
+          d.dataset.density = localStorage.getItem("density") || "cozy";
+          var lng = localStorage.getItem("language");
+          if (lng) d.lang = lng;
+        } catch (e) {}
+      })();
+    </script>
+    <!-- Boot styles: a themed splash shown until React has mounted. They
+         exist before the app stylesheet loads, so there is no FOUC. -->
+    <style>
+      html, body { height: 100%; margin: 0; }
+      #app-loading {
+        position: fixed;
+        inset: 0;
+        z-index: 9999;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 18px;
+        background: #f6f3ec;
+        transition: opacity 0.32s ease;
+        font-family: "Inter Tight", -apple-system, BlinkMacSystemFont, sans-serif;
+      }
+      html[data-theme="dark"] #app-loading { background: #16140f; }
+      #app-loading.hide { opacity: 0; pointer-events: none; }
+      #app-loading .brand {
+        font-size: 15px;
+        font-weight: 600;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: #a8a39a;
+      }
+      #app-loading .spinner {
+        width: 24px;
+        height: 24px;
+        border-radius: 50%;
+        border: 2.5px solid rgba(128, 122, 112, 0.22);
+        border-top-color: rgba(128, 122, 112, 0.85);
+        animation: app-spin 0.7s linear infinite;
+      }
+      @keyframes app-spin { to { transform: rotate(360deg); } }
+    </style>
+  </head>
+
+  <body>
+    <div id="root"></div>
+    <div id="app-loading">
+      <div class="brand">知微海纳</div>
+      <div class="spinner"></div>
+    </div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

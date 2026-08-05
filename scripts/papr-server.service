@@ -1,0 +1,20 @@
+[Unit]
+Description=Papr Web (papr-server)
+After=network.target
+Documentation=file:///product/papr
+
+[Service]
+Type=simple
+WorkingDirectory=/product/papr
+ExecStart=/product/papr/bin/run-papr-server.sh
+Restart=on-failure
+RestartSec=3
+# Optional hardening (uncomment if you create a dedicated user):
+# User=papr
+# Group=papr
+
+# EnvironmentFile is optional — run-papr-server.sh already sources /product/papr/.env
+# EnvironmentFile=-/product/papr/.env
+
+[Install]
+WantedBy=multi-user.target

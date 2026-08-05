@@ -1,0 +1,135 @@
+# Build Linux amd64 papr-server + frontend and attach to a GitHub Release.
+# Desktop/Tauri assets stay in release.yml; this workflow only ships the web stack.
+#
+# Triggers: push tags v* , or workflow_dispatch with optional tag.
+# Permissions: contents: write (GITHUB_TOKEN) is enough to create/update the release.
+
+name: Release Server
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.15.0). Empty = current ref name."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  linux-amd64:
+    name: papr-server linux amd64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag
+        id: meta
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] \
+            && [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          case "$TAG" in
+            v*) ;;
+            *)
+              echo "error: tag must look like vX.Y.Z (got: $TAG)" >&2
+              exit 1
+              ;;
+          esac
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "asset=papr-linux-amd64-${TAG}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.meta.outputs.tag }}
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: .
+
+      - name: Install frontend deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend
+        run: pnpm build
+
+      - name: Build papr-server (release, stripped)
+        run: cargo build --release -p papr-server
+
+      - name: Package tarball
+        env:
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+          ASSET_NAME: ${{ steps.meta.outputs.asset }}
+        run: |
+          set -euo pipefail
+          STAGE="${RUNNER_TEMP}/papr-release"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE"
+
+          # Reuse package helpers (runner + ctl + .env.example); never ship a real .env.
+          export PAPR_DEPLOY_ROOT="$STAGE"
+          # shellcheck source=scripts/lib.sh
+          source scripts/lib.sh
+          ensure_deploy_dirs
+          write_runner
+          write_ctl
+          install_env_example
+          rm -f "$ENV_FILE"
+
+          install -m 755 target/release/papr-server "$BIN"
+          rsync -a --delete dist/ "$STATIC_DIR/"
+          cp -f scripts/papr-server.service "$STAGE/papr-server.service"
+
+          # Layout inside the archive (no data/logs/run — created on the host).
+          tar -czf "$ASSET_NAME" \
+            -C "$STAGE" \
+            bin \
+            dist \
+            .env.example \
+            papr-server.service
+
+          ls -lh "$ASSET_NAME"
+          file target/release/papr-server
+          # Confirm release profile was used (stripped ELF).
+          if command -v readelf >/dev/null 2>&1; then
+            if readelf -S target/release/papr-server 2>/dev/null | grep -q '\.symtab'; then
+              echo "warning: binary still has .symtab (strip may not have run)" >&2
+            else
+              echo "OK: release binary appears stripped"
+            fi
+          fi
+
+      - name: Upload GitHub Release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: Papr ${{ steps.meta.outputs.tag }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: ${{ steps.meta.outputs.asset }}
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

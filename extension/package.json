@@ -1,0 +1,6 @@
+{
+  "//": "Not an npm package — this file only marks the extension's plain .js scripts as CommonJS so Node/vitest can require() src/detect.js. The browser extension itself is configured by manifest.json and ignores this file.",
+  "name": "papr-extension-internal",
+  "private": true,
+  "type": "commonjs"
+}
