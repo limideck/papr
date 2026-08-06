@@ -1,12 +1,11 @@
-import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import * as api from "../api";
 import { useUi } from "../store";
 import { useArticleActions } from "../hooks/articleActions";
-import { listTranslationKey, useListTranslation } from "../listTranslation";
-import { resolveRowTranslation } from "../lib/rowTranslation";
+import { copyText } from "../lib/clipboard";
 import { relTime } from "../lib/feedMeta";
 import { openUrl } from "../lib/openUrl";
 import { modCombo } from "../lib/platform";
@@ -29,8 +28,7 @@ interface Hover {
 }
 
 export default function ArticleList({ onToast }: Props) {
-  const { t, i18n } = useTranslation();
-  const qc = useQueryClient();
+  const { t } = useTranslation();
   const actions = useArticleActions(toast.error);
   const query = useUi((s) => s.query);
   const queryLabel = useUi((s) => s.queryLabel);
@@ -46,27 +44,6 @@ export default function ArticleList({ onToast }: Props) {
   const showCardThumbs = useUi((s) => s.prefs.showCardThumbs);
   const selectedId = useUi((s) => s.selectedArticleId);
   const openArticle = useUi((s) => s.openArticle);
-
-  const translateSetting = useQuery({
-    queryKey: ["setting", "translate_target_lang"],
-    queryFn: () => api.getSetting("translate_target_lang"),
-  });
-  const translateEngineSetting = useQuery({
-    queryKey: ["setting", "translate_engine"],
-    queryFn: () => api.getSetting("translate_engine"),
-  });
-  const listTranslateModeSetting = useQuery({
-    queryKey: ["setting", "list_translate_mode"],
-    queryFn: () => api.getSetting("list_translate_mode"),
-  });
-  const targetLang = translateSetting.data || i18n.language;
-  const translateEngine = translateEngineSetting.data || "llm";
-  const translationSettingsReady =
-    translateSetting.isFetched && translateEngineSetting.isFetched;
-  const listTranslateMode =
-    listTranslateModeSetting.data === "auto" ? "auto" : "off";
-  const listTranslationJobs = useListTranslation((s) => s.jobs);
-  const enqueueVisibleTranslations = useListTranslation((s) => s.enqueueVisible);
 
   const feeds = useQuery({ queryKey: ["feeds"], queryFn: api.listFeeds });
   const feedById = useMemo(() => {
@@ -397,36 +374,21 @@ export default function ArticleList({ onToast }: Props) {
           {
             icon: "copy",
             label: t("articleList.menuCopyLink"),
-            onClick: () =>
-              navigator.clipboard
-                .writeText(a.url!)
-                .then(() => onToast(t("articleList.linkCopied")), () => {}),
+            onClick: () => {
+              void copyText(a.url!).then((ok) =>
+                onToast(
+                  ok
+                    ? t("articleList.linkCopied")
+                    : t("articleList.linkCopyFailed"),
+                ),
+              );
+            },
           },
         ] as MenuEntry[])
       : []),
   ];
 
   const vItems = virt.getVirtualItems();
-
-  useEffect(() => {
-    if (listTranslateMode !== "auto") return;
-    if (!translationSettingsReady) return;
-    const visible = vItems
-      .filter((vi) => vi.index >= 0 && vi.index < items.length)
-      .slice(0, 16)
-      .map((vi) => items[vi.index])
-      .filter(Boolean);
-    enqueueVisibleTranslations(visible, targetLang, translateEngine);
-  }, [
-    enqueueVisibleTranslations,
-    items,
-    listTranslateMode,
-    translationSettingsReady,
-    targetLang,
-    translateEngine,
-    virt.range?.startIndex,
-    virt.range?.endIndex,
-  ]);
   const showCount = t("articleList.countArticles", {
     count: items.length,
     suffix: browse.hasNextPage ? "+" : "",
@@ -449,15 +411,6 @@ export default function ArticleList({ onToast }: Props) {
     openArticle(items[next].id);
   };
 
-  const setListTranslateMode = (mode: "off" | "auto") => {
-    api
-      .setSetting("list_translate_mode", mode)
-      .then(() => {
-        qc.setQueryData(["setting", "list_translate_mode"], mode);
-      })
-      .catch((e) => reportError(e));
-  };
-
   return (
     <div className="list" role="region" aria-labelledby="article-list-title">
       <div className="list-header">
@@ -472,47 +425,31 @@ export default function ArticleList({ onToast }: Props) {
             <span className="count">
               {browse.isLoading ? t("common.loading") : showCount}
             </span>
-            {listSearch && (
-              <button
-                type="button"
-                className="list-search-chip"
-                onClick={() => setListSearch(null)}
-                title={t("articleList.clearSearch")}
-              >
-                “{listSearch}”
-                <Icon name="x" size={11} />
-              </button>
-            )}
-            <span
-              className="list-translate-toggle"
-              role="group"
-              aria-label={t("articleList.translateMode")}
-            >
-              <button
-                className={`list-translate-btn ${
-                  listTranslateMode === "off" ? "on" : ""
-                }`}
-                type="button"
-                title={t("articleList.translateOff")}
-                aria-pressed={listTranslateMode === "off"}
-                onClick={() => setListTranslateMode("off")}
-              >
-                <Icon name="text" size={11} />
-                {t("articleList.translateOffShort")}
-              </button>
-              <button
-                className={`list-translate-btn ${
-                  listTranslateMode === "auto" ? "on" : ""
-                }`}
-                type="button"
-                title={t("articleList.translateAuto")}
-                aria-pressed={listTranslateMode === "auto"}
-                onClick={() => setListTranslateMode("auto")}
-              >
-                <Icon name="sparkle" size={11} />
-                {t("articleList.translateAutoShort")}
-              </button>
-            </span>
+            {listSearch &&
+              listSearch
+                .trim()
+                .split(/\s+/)
+                .filter(Boolean)
+                .map((term) => (
+                  <button
+                    key={term}
+                    type="button"
+                    className="list-search-chip"
+                    onClick={() => {
+                      const parts = listSearch
+                        .trim()
+                        .split(/\s+/)
+                        .filter(Boolean);
+                      setListSearch(
+                        parts.filter((p) => p !== term).join(" ") || null,
+                      );
+                    }}
+                    title={t("articleList.clearSearch")}
+                  >
+                    “{term}”
+                    <Icon name="x" size={11} />
+                  </button>
+                ))}
           </span>
         </h1>
         <div className="list-meta">
@@ -602,14 +539,6 @@ export default function ArticleList({ onToast }: Props) {
             {vItems.map((vi) => {
               const a = items[vi.index];
               const feed = feedById[a.feedId];
-              const liveTranslation =
-                listTranslationJobs[listTranslationKey(a.id, targetLang, translateEngine)];
-              const rt = resolveRowTranslation(
-                a,
-                liveTranslation,
-                listTranslateMode,
-                t("error.unknown"),
-              );
               return (
                 // Key by the virtual slot, not the article id. The window of
                 // rendered rows is a fixed band that slides as you scroll, so
@@ -659,27 +588,6 @@ export default function ArticleList({ onToast }: Props) {
                       )}
                       <span className="art-sep">·</span>
                       <span className="art-time">{relTime(a.publishedAt)}</span>
-                      {(rt.isTranslating || rt.error) && (
-                        <span
-                          className={`art-translate-status ${
-                            rt.error ? "error" : "loading"
-                          }`}
-                          data-no-hover-preview
-                          title={
-                            rt.error || t("articleList.translateStatusLoading")
-                          }
-                          aria-label={
-                            rt.error || t("articleList.translateStatusLoading")
-                          }
-                          onMouseEnter={leaveHover}
-                        >
-                          <Icon
-                            name={rt.error ? "alert" : "refresh"}
-                            size={11}
-                            className={rt.error ? undefined : "spinning"}
-                          />
-                        </span>
-                      )}
                       {a.isStarred && (
                         <span className="art-star">
                           <Icon name="star-fill" size={12} />
@@ -691,17 +599,8 @@ export default function ArticleList({ onToast }: Props) {
                         </span>
                       )}
                     </div>
-                    <h3 className="art-title" title={rt.hasTranslation ? a.title : undefined}>
-                      {rt.title}
-                    </h3>
-                    {rt.snippet && (
-                      <p
-                        className="art-snippet"
-                        title={rt.hasTranslation ? (a.snippet ?? undefined) : undefined}
-                      >
-                        {rt.snippet}
-                      </p>
-                    )}
+                    <h3 className="art-title">{a.title}</h3>
+                    {a.snippet && <p className="art-snippet">{a.snippet}</p>}
                   </div>
                 </div>
               );

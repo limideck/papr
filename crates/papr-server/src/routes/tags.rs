@@ -1,19 +1,41 @@
 use crate::error::{ApiError, ApiResult};
 use crate::state::{AppState, AuthUser};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::Json;
 use papr_core::db;
+use papr_core::models::TAG_KIND_INTEREST;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-pub async fn list(State(state): State<AppState>, _user: AuthUser) -> ApiResult<Json<Value>> {
+#[derive(Deserialize)]
+pub struct ListQuery {
+    /// Optional `interest` | `ai` filter.
+    pub kind: Option<String>,
+}
+
+pub async fn list(
+    State(state): State<AppState>,
+    _user: AuthUser,
+    Query(q): Query<ListQuery>,
+) -> ApiResult<Json<Value>> {
     let conn = state.db.lock().await;
-    Ok(Json(json!(db::list_tags(&conn).map_err(ApiError::from)?)))
+    let kind = q.kind.as_deref();
+    Ok(Json(json!(
+        db::list_tags(&conn, kind).map_err(ApiError::from)?
+    )))
 }
 
 #[derive(Deserialize)]
 pub struct CreateBody {
     pub name: String,
+    /// Defaults to `interest` (admin vocabulary). AI tags are normally
+    /// created by the worker; admins may still create them explicitly.
+    #[serde(default = "default_kind")]
+    pub kind: String,
+}
+
+fn default_kind() -> String {
+    TAG_KIND_INTEREST.to_string()
 }
 
 pub async fn create(
@@ -23,7 +45,7 @@ pub async fn create(
 ) -> ApiResult<Json<Value>> {
     user.require_admin()?;
     let conn = state.db.lock().await;
-    let id = db::create_tag(&conn, &body.name).map_err(ApiError::from)?;
+    let id = db::create_tag(&conn, &body.name, &body.kind).map_err(ApiError::from)?;
     Ok(Json(json!({ "id": id })))
 }
 

@@ -8,7 +8,7 @@
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::{AppState, AuthUser};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -28,6 +28,16 @@ use tokio_stream::wrappers::ReceiverStream;
 /// and emits no content. A larger budget lets the reasoning phase finish and
 /// the briefing actually stream out.
 const DIGEST_MAX_TOKENS: u32 = 4096;
+
+/// The provider/model to attribute in the ledger for an already-resolved
+/// translation backend — empty for keyless machine-translation engines (which
+/// report zero usage and are skipped by the db layer anyway).
+fn backend_identity(backend: &translate::Backend) -> (&'static str, String) {
+    match backend {
+        translate::Backend::Llm(cfg) => (cfg.provider_name(), cfg.model().to_string()),
+        _ => ("", String::new()),
+    }
+}
 
 /// Build an SSE `data:` frame carrying `value` as JSON.
 fn sse_frame<T: serde::Serialize>(value: &T) -> Event {
@@ -184,12 +194,24 @@ pub async fn summarize(
          section headers, no extra prose.{lang}"
     );
     let user = format!("Title: {title}\n\n{}", truncate(&article_body, 8000));
+    let (provider, model) = (cfg.provider_name(), cfg.model().to_string());
     stream_chat_sse(&state.http, cfg, system, user, ai::MAX_TOKENS, move |outcome| {
-        // Persist only a summary that streamed to completion, so a dropped
-        // client (closed drawer) never caches a truncated half-summary.
-        if outcome.completed && !outcome.text.trim().is_empty() {
+        if outcome.completed {
             let conn = blocking_lock(&db);
-            let _ = db::set_ai_summary(&conn, article_id, outcome.text.trim());
+            // Persist only a summary that streamed to completion, so a dropped
+            // client (closed drawer) never caches a truncated half-summary.
+            if !outcome.text.trim().is_empty() {
+                let _ = db::set_ai_summary(&conn, article_id, outcome.text.trim());
+            }
+            let _ = db::record_ai_usage(
+                &conn,
+                "summarize",
+                provider,
+                &model,
+                outcome.usage.prompt_tokens,
+                outcome.usage.completion_tokens,
+                outcome.usage.reasoning_tokens,
+            );
         }
     })
     .await
@@ -246,7 +268,23 @@ pub async fn ask(
             body.question
         )
     };
-    stream_chat_sse(&state.http, cfg, system, user, ai::MAX_TOKENS, |_| {}).await
+    let (provider, model) = (cfg.provider_name(), cfg.model().to_string());
+    let db = state.db.clone();
+    stream_chat_sse(&state.http, cfg, system, user, ai::MAX_TOKENS, move |outcome| {
+        if outcome.completed {
+            let conn = blocking_lock(&db);
+            let _ = db::record_ai_usage(
+                &conn,
+                "ask",
+                provider,
+                &model,
+                outcome.usage.prompt_tokens,
+                outcome.usage.completion_tokens,
+                outcome.usage.reasoning_tokens,
+            );
+        }
+    })
+    .await
 }
 
 /// `POST /api/ai/digest` — synthesize a briefing of the most recent articles.
@@ -277,7 +315,23 @@ pub async fn digest(
          matters most, and keep it skimmable. Plain prose, no preamble.{lang}"
     );
     let user = format!("Recent articles from my feeds:\n\n{corpus}");
-    stream_chat_sse(&state.http, cfg, system, user, DIGEST_MAX_TOKENS, |_| {}).await
+    let (provider, model) = (cfg.provider_name(), cfg.model().to_string());
+    let db = state.db.clone();
+    stream_chat_sse(&state.http, cfg, system, user, DIGEST_MAX_TOKENS, move |outcome| {
+        if outcome.completed {
+            let conn = blocking_lock(&db);
+            let _ = db::record_ai_usage(
+                &conn,
+                "digest",
+                provider,
+                &model,
+                outcome.usage.prompt_tokens,
+                outcome.usage.completion_tokens,
+                outcome.usage.reasoning_tokens,
+            );
+        }
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -338,6 +392,7 @@ pub async fn translate(
     tokio::spawn(async move {
         let result: Result<String, AppError> = async {
             let backend = translate::ready(&http, sel).await?;
+            let (provider, model) = backend_identity(&backend);
             let batches = translate::chunk_blocks(&source_html, translate::chunk_budget(&engine));
             let total = batches.len();
             let _ = tx
@@ -345,9 +400,10 @@ pub async fn translate(
                 .await;
             let system = translate::translate_system_prompt(translate::language_name(&target));
             let mut full = String::new();
+            let mut usage = ai::TokenUsage::default();
             for (i, batch) in batches.iter().enumerate() {
                 let raw = backend
-                    .translate_batch(&http, &system, batch, &target)
+                    .translate_batch(&http, &system, batch, &target, &mut usage)
                     .await?;
                 let clean = sanitize::sanitize(raw.trim(), None);
                 full.push_str(&clean);
@@ -363,6 +419,15 @@ pub async fn translate(
             if !final_html.is_empty() {
                 let conn = db.lock().await;
                 let _ = db::set_translation(&conn, article_id, &final_html, &target);
+                let _ = db::record_ai_usage(
+                    &conn,
+                    "translate",
+                    provider,
+                    &model,
+                    usage.prompt_tokens,
+                    usage.completion_tokens,
+                    usage.reasoning_tokens,
+                );
             }
             Ok(final_html)
         }
@@ -476,10 +541,12 @@ pub async fn translate_preview(
     let backend = translate::ready(&state.http, sel)
         .await
         .map_err(ApiError::from)?;
+    let (provider, model) = backend_identity(&backend);
     let system = translate::translate_system_prompt(translate::language_name(&target));
     let source = preview_translation_html(&title, &snippet);
+    let mut usage = ai::TokenUsage::default();
     let raw = backend
-        .translate_batch(&state.http, &system, &source, &target)
+        .translate_batch(&state.http, &system, &source, &target, &mut usage)
         .await
         .map_err(ApiError::from)?;
     let clean = sanitize::sanitize(raw.trim(), None);
@@ -505,6 +572,15 @@ pub async fn translate_preview(
             &engine,
         )
         .map_err(ApiError::from)?;
+        let _ = db::record_ai_usage(
+            &conn,
+            "translate-preview",
+            provider,
+            &model,
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.reasoning_tokens,
+        );
     }
     Ok(Json(ArticlePreviewTranslation {
         article_id,
@@ -513,4 +589,47 @@ pub async fn translate_preview(
         lang: target,
         engine,
     }))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageQuery {
+    #[serde(default = "default_usage_days")]
+    pub days: i64,
+}
+
+fn default_usage_days() -> i64 {
+    30
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiUsageReport {
+    #[serde(flatten)]
+    stats: db::AiUsageStats,
+    /// Estimated cost in USD over the window, from the configured
+    /// per-million-token prices (all default to 0 — a local or free endpoint).
+    estimated_cost: f64,
+}
+
+/// `GET /api/ai/usage?days=30` — AI token usage aggregated over a trailing
+/// window, bucketed by feature, with a cost estimate from the current prices.
+pub async fn usage(
+    State(state): State<AppState>,
+    _user: AuthUser,
+    Query(q): Query<UsageQuery>,
+) -> ApiResult<Json<AiUsageReport>> {
+    let conn = state.db.lock().await;
+    let stats = db::ai_usage_stats(&conn, q.days).map_err(ApiError::from)?;
+    // Per-million-token prices, in USD. Defaults to zero so a free / local
+    // provider reports $0 without any configuration.
+    let input_per_m: f64 = db::setting_parsed(&conn, "ai_price_input_per_m", 0.0);
+    let output_per_m: f64 = db::setting_parsed(&conn, "ai_price_output_per_m", 0.0);
+    let reasoning_per_m: f64 = db::setting_parsed(&conn, "ai_price_reasoning_per_m", 0.0);
+    let t = &stats.total;
+    let non_reasoning = (t.completion_tokens - t.reasoning_tokens).max(0) as f64;
+    let estimated_cost = t.prompt_tokens as f64 / 1e6 * input_per_m
+        + non_reasoning / 1e6 * output_per_m
+        + t.reasoning_tokens as f64 / 1e6 * reasoning_per_m;
+    Ok(Json(AiUsageReport { stats, estimated_cost }))
 }

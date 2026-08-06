@@ -1,7 +1,8 @@
-//! Shared server state: SQLite writer mutex + HTTP client.
+//! Shared server state: SQLite writer mutex + HTTP client + word-cloud dict.
 
 use papr_core::auth::User;
 use papr_core::db;
+use papr_core::wordcloud_dict::SharedWordCloudDict;
 use rusqlite::Connection;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -10,6 +11,7 @@ use tokio::sync::Mutex;
 pub struct AppState {
     pub db: Arc<Mutex<Connection>>,
     pub http: reqwest::Client,
+    pub wordcloud: Arc<SharedWordCloudDict>,
 }
 
 impl AppState {
@@ -19,9 +21,18 @@ impl AppState {
             .user_agent(concat!("papr-server/", env!("CARGO_PKG_VERSION")))
             .timeout(std::time::Duration::from_secs(60))
             .build()?;
+        let wordcloud = Arc::new(SharedWordCloudDict::load_default());
+        papr_core::wordcloud_dict::install_process_dict(wordcloud.clone());
+        // Seed dict version + file fingerprint so ingest/backfill stay aligned.
+        {
+            use papr_core::wordcloud;
+            let _ = wordcloud::ensure_dict_version(&conn);
+            let _ = wordcloud.with_dict(|dict| wordcloud::sync_dict_file_version(&conn, dict));
+        }
         Ok(Self {
             db: Arc::new(Mutex::new(conn)),
             http,
+            wordcloud,
         })
     }
 }

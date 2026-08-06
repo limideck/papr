@@ -14,7 +14,6 @@ import ContextMenu, { type MenuEntry } from "./ContextMenu";
 import FeedAvatar from "./FeedAvatar";
 import PromptDialog from "./PromptDialog";
 import WordCloudPanel from "./WordCloudPanel";
-import ActivityHeatmap from "./ActivityHeatmap";
 
 interface Props {
   onAddFeed: () => void;
@@ -109,7 +108,7 @@ export default function Sidebar({
   const feeds = useQuery({ queryKey: ["feeds"], queryFn: api.listFeeds });
   const folders = useQuery({ queryKey: ["folders"], queryFn: api.listFolders });
   const counts = useQuery({ queryKey: ["counts"], queryFn: api.smartCounts });
-  const tags = useQuery({ queryKey: ["tags"], queryFn: api.listTags });
+  const tags = useQuery({ queryKey: ["tags"], queryFn: () => api.listTags() });
 
   const [collapsed, setCollapsed] = useState<Record<number, boolean>>(() => {
     try {
@@ -178,6 +177,65 @@ export default function Sidebar({
         const byUnread = (a.unreadCount - b.unreadCount) * mul;
         if (byUnread !== 0) return byUnread;
         return a.title.localeCompare(b.title, undefined, {
+          sensitivity: "base",
+        });
+      });
+    }
+    return sorted;
+  };
+
+  // Tag list sort: alpha by name, or by article count. Same persistence
+  // pattern as feed sort so the Tags tab keeps the preferred order.
+  type TagSortMode = "alpha" | "count";
+  type TagSortDir = "asc" | "desc";
+  const TAG_SORT_KEY = "papr.tagSort";
+  const defaultTagDir = (mode: TagSortMode): TagSortDir =>
+    mode === "count" ? "desc" : "asc";
+  const [tagSort, setTagSort] = useState<{
+    mode: TagSortMode;
+    dir: TagSortDir;
+  }>(() => {
+    try {
+      const raw = localStorage.getItem(TAG_SORT_KEY);
+      if (!raw) return { mode: "count", dir: "desc" };
+      const [modePart, dirPart] = raw.split(":");
+      const mode: TagSortMode =
+        modePart === "alpha" || modePart === "count" ? modePart : "count";
+      const dir: TagSortDir =
+        dirPart === "asc" || dirPart === "desc"
+          ? dirPart
+          : defaultTagDir(mode);
+      return { mode, dir };
+    } catch {
+      return { mode: "count", dir: "desc" };
+    }
+  });
+  useEffect(() => {
+    localStorage.setItem(TAG_SORT_KEY, `${tagSort.mode}:${tagSort.dir}`);
+  }, [tagSort]);
+
+  const setTagSortMode = (mode: TagSortMode) => {
+    setTagSort((prev) =>
+      prev.mode === mode
+        ? { mode, dir: prev.dir === "asc" ? "desc" : "asc" }
+        : { mode, dir: defaultTagDir(mode) },
+    );
+  };
+
+  const sortTags = (list: Tag[]): Tag[] => {
+    const sorted = [...list];
+    const mul = tagSort.dir === "asc" ? 1 : -1;
+    if (tagSort.mode === "alpha") {
+      sorted.sort(
+        (a, b) =>
+          mul *
+          a.name.localeCompare(b.name, undefined, { sensitivity: "base" }),
+      );
+    } else {
+      sorted.sort((a, b) => {
+        const byCount = (a.articleCount - b.articleCount) * mul;
+        if (byCount !== 0) return byCount;
+        return a.name.localeCompare(b.name, undefined, {
           sensitivity: "base",
         });
       });
@@ -272,8 +330,13 @@ export default function Sidebar({
   const allFeeds = feeds.data ?? [];
   const allFolders = folders.data ?? [];
   const allTags = tags.data ?? [];
-  // Preview on the Feeds tab: top 10 by article count. Full list lives on Tags.
-  const topTags = [...allTags]
+  // Feeds section: interest vocabulary. Tags tab: AI-generated tags.
+  const interestTags = allTags.filter(
+    (tg) => (tg.kind ?? "interest") === "interest",
+  );
+  const aiTags = allTags.filter((tg) => tg.kind === "ai");
+  // Preview on the Feeds tab: top 10 interest tags by article count.
+  const topTags = [...interestTags]
     .sort(
       (a, b) =>
         b.articleCount - a.articleCount ||
@@ -462,28 +525,7 @@ export default function Sidebar({
 
   const tagMenu = (tag: Tag): MenuEntry[] => {
     if (!isAdmin) return [];
-    const idx = allTags.findIndex((tg) => tg.id === tag.id);
     return [
-    // Drag-reorder isn't reachable by keyboard — these give it parity.
-    ...(idx > 0
-      ? ([
-          {
-            icon: "arrow-up",
-            label: t("sidebar.moveTagUp"),
-            onClick: () => moveTag(tag.id, -1),
-          },
-        ] as MenuEntry[])
-      : []),
-    ...(idx >= 0 && idx < allTags.length - 1
-      ? ([
-          {
-            icon: "arrow-down",
-            label: t("sidebar.moveTagDown"),
-            onClick: () => moveTag(tag.id, 1),
-          },
-        ] as MenuEntry[])
-      : []),
-    ...(allTags.length > 1 ? [{ separator: true } as MenuEntry] : []),
     {
       icon: "settings",
       label: t("sidebar.renameMenu"),
@@ -526,14 +568,6 @@ export default function Sidebar({
     ];
   };
 
-  const createTag = () =>
-    setPrompt({
-      title: t("sidebar.newTagTitle"),
-      initial: "",
-      placeholder: t("sidebar.tagNamePlaceholder"),
-      onSubmit: (v) => guard(api.createTag(v), t("sidebar.toastTagCreated")),
-    });
-
   // Creating a folder only touches the folders list, which `refreshAfterBulk`
   // (and thus `guard`) doesn't cover — invalidate it explicitly.
   const createFolder = () =>
@@ -553,22 +587,26 @@ export default function Sidebar({
 
   // Optimistically apply a new tag order, then persist; reconcile on either
   // outcome. Shared by the drag-reorder and the menu's move up/down.
-  const persistTagOrder = (next: Tag[]) => {
-    qc.setQueryData(["tags"], next);
+  const persistTagOrder = (ordered: Tag[]) => {
+    // Keep the other taxonomy's rows in the cache so a reorder of AI tags
+    // doesn't briefly wipe interest tags from the Feeds section.
+    const other = allTags.filter((tg) => !ordered.some((o) => o.id === tg.id));
+    qc.setQueryData(["tags"], [...ordered, ...other]);
     api
-      .reorderTags(next.map((tg) => tg.id))
+      .reorderTags(ordered.map((tg) => tg.id))
       .catch((e) => reportError(e))
       .finally(() => qc.invalidateQueries({ queryKey: ["tags"] }));
   };
 
   // ── drag to reorder tags ──
   const dropTag = (targetId: number) => {
-    const from = allTags.findIndex((tg) => tg.id === tagDragId);
-    const to = allTags.findIndex((tg) => tg.id === targetId);
+    const list = aiTags;
+    const from = list.findIndex((tg) => tg.id === tagDragId);
+    const to = list.findIndex((tg) => tg.id === targetId);
     setTagDragId(null);
     setTagOverId(null);
     if (from < 0 || to < 0 || from === to) return;
-    const next = [...allTags];
+    const next = [...list];
     const [moved] = next.splice(from, 1);
     // The `drop-above` indicator marks an insertion point *before* the target
     // tag. After removing the dragged item, every index past `from` shifts
@@ -576,17 +614,6 @@ export default function Sidebar({
     // tag above the target, not below it.
     const insertAt = from < to ? to - 1 : to;
     next.splice(insertAt, 0, moved);
-    persistTagOrder(next);
-  };
-
-  // Keyboard-reachable counterpart to the drag-reorder: swap a tag with its
-  // neighbour. `dir` is -1 (up) or 1 (down).
-  const moveTag = (tagId: number, dir: -1 | 1) => {
-    const i = allTags.findIndex((tg) => tg.id === tagId);
-    const j = i + dir;
-    if (i < 0 || j < 0 || j >= allTags.length) return;
-    const next = [...allTags];
-    [next[i], next[j]] = [next[j], next[i]];
     persistTagOrder(next);
   };
 
@@ -630,10 +657,26 @@ export default function Sidebar({
     </div>
   );
 
-  const onCloudTerm = (term: string) => {
-    // Apply the term as the article list filter, but stay on the word-cloud tab.
+  const onCloudTerm = (term: string, additive?: boolean) => {
+    // Snapshot search before `select`, which clears listSearch on every browse
+    // change — otherwise Shift+click would always see an empty set.
+    const cur = useUi.getState().listSearch?.trim() ?? "";
+    const parts = cur.split(/\s+/).filter(Boolean);
+    let next: string | null;
+    if (additive) {
+      if (!cur) {
+        next = term;
+      } else if (parts.includes(term)) {
+        next = parts.filter((p) => p !== term).join(" ") || null;
+      } else {
+        next = `${cur} ${term}`;
+      }
+    } else {
+      next = term;
+    }
+    // Apply as the article-list filter, but stay on the word-cloud tab.
     select({ kind: "all" }, t("smart.all"));
-    setListSearch(term);
+    setListSearch(next);
   };
 
   /** Tag row used on Feeds (preview) and Tags (full list, reorderable). */
@@ -738,27 +781,52 @@ export default function Sidebar({
         <WordCloudPanel onSelectTerm={onCloudTerm} />
       ) : sideTab === "tags" ? (
         <div className="sidebar-scroll sb-tags-tab">
-          <ActivityHeatmap />
           <div className="sb-tags-card">
             <div className="sb-tags-card-head">
-              <span>{t("sidebar.tags")}</span>
-              {isAdmin && (
-                <button
-                  type="button"
-                  onClick={createTag}
-                  title={t("sidebar.newTagTitle")}
-                  aria-label={t("sidebar.newTagTitle")}
+              <span>{t("sidebar.tabTags")}</span>
+              <span className="sb-section-actions">
+                <span
+                  className="sb-feed-sort"
+                  role="group"
+                  aria-label={t("sidebar.sortTagsBy")}
                 >
-                  <Icon name="plus" size={14} />
-                </button>
-              )}
+                  <button
+                    type="button"
+                    className={tagSort.mode === "alpha" ? "active" : ""}
+                    onClick={() => setTagSortMode("alpha")}
+                    aria-pressed={tagSort.mode === "alpha"}
+                    title={t("sidebar.sortAlphaHint")}
+                  >
+                    {tagSort.mode === "alpha" && tagSort.dir === "desc"
+                      ? "Z-A ↓"
+                      : "A-Z ↑"}
+                  </button>
+                  <span className="sb-feed-sort-sep" aria-hidden="true">
+                    ·
+                  </span>
+                  <button
+                    type="button"
+                    className={tagSort.mode === "count" ? "active" : ""}
+                    onClick={() => setTagSortMode("count")}
+                    aria-pressed={tagSort.mode === "count"}
+                    title={t("sidebar.sortCountHint")}
+                  >
+                    {t("sidebar.sortCount")}{" "}
+                    {tagSort.mode === "count" && tagSort.dir === "asc"
+                      ? "↑"
+                      : "↓"}
+                  </button>
+                </span>
+              </span>
             </div>
-            {allTags.length === 0 ? (
-              <div className="sb-tags-empty">{t("sidebar.tagsEmptyHint")}</div>
+            {aiTags.length === 0 ? (
+              <div className="sb-tags-empty">{t("sidebar.aiTagsEmptyHint")}</div>
             ) : (
-              allTags.map((tag) =>
+              sortTags(aiTags).map((tag) =>
                 tagRow(tag, {
-                  reorderable: isAdmin,
+                  // Client-side sort owns display order; drag-reorder would
+                  // fight the selected mode (same idea as the Feeds list).
+                  reorderable: false,
                   alwaysCount: true,
                 }),
               )
@@ -969,35 +1037,54 @@ export default function Sidebar({
                 }`}
                 role="button"
                 tabIndex={0}
+                aria-expanded={!isCollapsed}
                 aria-current={folderActive || undefined}
-                onClick={() => select({ kind: "folder", value: folder.id }, folder.name)}
+                aria-label={`${folder.name}, ${t(
+                  isCollapsed ? "sidebar.expandFolder" : "sidebar.collapseFolder",
+                )}`}
+                onClick={() =>
+                  setCollapsed((s) => ({ ...s, [folder.id]: !isCollapsed }))
+                }
                 onKeyDown={onActivate(() =>
-                  select({ kind: "folder", value: folder.id }, folder.name),
+                  setCollapsed((s) => ({ ...s, [folder.id]: !isCollapsed })),
                 )}
                 onContextMenu={(e) => {
                   e.preventDefault();
                   setMenu({ x: e.clientX, y: e.clientY, kind: "folder", folder });
                 }}
               >
-                {/* The chevron is the expand/collapse affordance; clicking the
-                    folder name selects the folder's combined article view. */}
-                <button
-                  type="button"
-                  className="sb-folder-toggle"
-                  aria-label={t(
-                    isCollapsed ? "sidebar.expandFolder" : "sidebar.collapseFolder",
-                  )}
-                  aria-expanded={!isCollapsed}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setCollapsed((s) => ({ ...s, [folder.id]: !isCollapsed }));
-                  }}
-                >
+                {/* Chevron, name, and the row body toggle expand/collapse.
+                    The unread count (below) selects the folder's article view. */}
+                <span className="sb-folder-toggle" aria-hidden>
                   <Icon name="chevron-down" size={11} />
-                </button>
+                </span>
                 <span className="sb-folder-name">{folder.name}</span>
                 {showCounts && (isCollapsed || folderActive) && folderUnread > 0 && (
-                  <span className="sb-count">{folderUnread}</span>
+                  <span
+                    className="sb-count"
+                    role="button"
+                    tabIndex={0}
+                    aria-label={folder.name}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      select(
+                        { kind: "folder", value: folder.id },
+                        folder.name,
+                      );
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        select(
+                          { kind: "folder", value: folder.id },
+                          folder.name,
+                        );
+                      }
+                    }}
+                  >
+                    {folderUnread}
+                  </span>
                 )}
               </div>
               {!isCollapsed && inFolder.map(feedRow)}
@@ -1008,7 +1095,7 @@ export default function Sidebar({
         {topTags.length > 0 && (
           <>
             <div className="sb-section-title">
-              <span>{t("sidebar.tags")}</span>
+              <span>{t("sidebar.interestTags")}</span>
             </div>
             {topTags.map((tag) =>
               tagRow(tag, { reorderable: false, alwaysCount: false }),

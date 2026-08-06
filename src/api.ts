@@ -29,11 +29,13 @@ import type {
   RuleField,
   RulePreview,
   SessionUser,
-  DailyCount,
   SmartCounts,
   Tag,
+  TagKind,
   TranslateEvent,
+  WordCloudEntities,
   WordCloudResult,
+  WordCloudStopwords,
 } from "./types";
 
 const API = "/api";
@@ -328,10 +330,6 @@ export const markAllRead = (query: ArticleQuery) =>
 export const smartCounts = () =>
   apiJson<SmartCounts>(`${API}/smart-counts`);
 
-/** Daily article counts for the sidebar heatmap (last N calendar days). */
-export const dailyArticleCounts = (days = 30) =>
-  apiJson<DailyCount[]>(`${API}/stats/daily${qs({ days })}`);
-
 // ── full-text extraction ──
 export const extractFulltext = (articleId: number) =>
   apiJson<string | { html: string }>(
@@ -442,6 +440,22 @@ export interface StorageStats {
 }
 export const storageStats = () =>
   apiJson<StorageStats>(`${API}/storage/stats`);
+
+// ── ai usage ──
+export interface AiUsageRow {
+  feature: string;
+  calls: number;
+  promptTokens: number;
+  completionTokens: number;
+  reasoningTokens: number;
+}
+export interface AiUsageReport {
+  total: AiUsageRow;
+  byFeature: AiUsageRow[];
+  estimatedCost: number;
+}
+export const aiUsage = (days: number = 30) =>
+  apiJson<AiUsageReport>(`${API}/ai/usage${qs({ days })}`);
 export const cleanupArticles = (days: number) =>
   apiJson<number | { count: number }>(`${API}/storage/cleanup`, {
     method: "POST",
@@ -449,10 +463,10 @@ export const cleanupArticles = (days: number) =>
   }).then(unwrapCount);
 export const vacuumDb = () =>
   apiJson<void>(`${API}/storage/vacuum`, { method: "POST" });
-/** Not implemented on papr-server yet — no-op so Settings UI does not crash. */
-export const resetSettings = () => Promise.resolve();
-/** Not implemented on papr-server yet — no-op so Settings UI does not crash. */
-export const clearAllData = () => Promise.resolve();
+export const resetSettings = () =>
+  apiJson<void>(`${API}/storage/reset-settings`, { method: "POST" });
+export const clearAllData = () =>
+  apiJson<void>(`${API}/storage/clear`, { method: "POST" });
 
 // ── network ──
 export const applyNetworkSettings = () =>
@@ -489,11 +503,12 @@ export const refreshTray = () => Promise.resolve();
 export const takePendingDeepLink = () => Promise.resolve<string | null>(null);
 
 // ── tags ──
-export const listTags = () => apiJson<Tag[]>(`${API}/tags`);
-export const createTag = (name: string) =>
+export const listTags = (kind?: TagKind) =>
+  apiJson<Tag[]>(`${API}/tags${kind ? qs({ kind }) : ""}`);
+export const createTag = (name: string, kind: TagKind = "interest") =>
   apiJson<number | { id: number }>(`${API}/tags`, {
     method: "POST",
-    body: JSON.stringify({ name }),
+    body: JSON.stringify({ name, kind }),
   }).then(unwrapId);
 export const renameTag = (id: number, name: string) =>
   apiJson<void>(`${API}/tags/${id}`, {
@@ -629,12 +644,14 @@ export async function getWordCloud(params: {
   days?: number;
   from?: string;
   to?: string;
+  refresh?: boolean;
 }): Promise<WordCloudResult> {
   const raw = await apiJson<WordCloudResult>(
     `${API}/wordcloud${qs({
       days: params.days,
       from: params.from,
       to: params.to,
+      refresh: params.refresh ? 1 : undefined,
     })}`,
   );
   const terms = raw.terms ?? [];
@@ -645,6 +662,65 @@ export async function getWordCloud(params: {
     scanned: typeof raw.scanned === "number" ? raw.scanned : 0,
     from: raw.from,
     to: raw.to,
+  };
+}
+
+export async function getWordCloudStopwords(): Promise<WordCloudStopwords> {
+  return apiJson(`${API}/wordcloud/stopwords`);
+}
+
+export async function getWordCloudEntities(): Promise<WordCloudEntities> {
+  return apiJson(`${API}/wordcloud/entities`);
+}
+
+export type WordCloudIndexStatus = {
+  dictVersion: number;
+  indexed: number;
+  stale: number;
+  missing: number;
+  totalArticles: number;
+};
+
+export async function getWordCloudStatus(): Promise<WordCloudIndexStatus> {
+  const raw = await apiJson<Record<string, number>>(`${API}/wordcloud/status`);
+  return {
+    dictVersion: raw.dictVersion ?? raw.dict_version ?? 0,
+    indexed: raw.indexed ?? 0,
+    stale: raw.stale ?? 0,
+    missing: raw.missing ?? 0,
+    totalArticles: raw.totalArticles ?? raw.total_articles ?? 0,
+  };
+}
+
+/** Run one sync backfill batch (or just report status when sync=false). */
+export async function backfillWordCloud(opts?: {
+  sync?: boolean;
+  limit?: number;
+}): Promise<
+  WordCloudIndexStatus & {
+    ok: boolean;
+    sync: boolean;
+    processed?: number;
+    remaining?: number;
+  }
+> {
+  const raw = await apiJson<Record<string, unknown>>(`${API}/wordcloud/backfill`, {
+    method: "POST",
+    body: JSON.stringify({
+      sync: opts?.sync ?? true,
+      limit: opts?.limit,
+    }),
+  });
+  return {
+    ok: Boolean(raw.ok),
+    sync: Boolean(raw.sync),
+    processed: typeof raw.processed === "number" ? raw.processed : undefined,
+    remaining: typeof raw.remaining === "number" ? raw.remaining : undefined,
+    dictVersion: Number(raw.dictVersion ?? raw.dict_version ?? 0),
+    indexed: Number(raw.indexed ?? 0),
+    stale: Number(raw.stale ?? 0),
+    missing: Number(raw.missing ?? 0),
+    totalArticles: Number(raw.totalArticles ?? raw.total_articles ?? 0),
   };
 }
 

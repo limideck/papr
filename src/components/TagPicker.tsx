@@ -39,7 +39,12 @@ export default function TagPicker({
   const ref = useRef<HTMLDivElement>(null);
   const [draft, setDraft] = useState("");
 
-  const tags = useQuery({ queryKey: ["tags"], queryFn: api.listTags });
+  // Admin attach uses the closed interest vocabulary; AI tags are shown on
+  // the article but managed by the auto-tag worker / Settings.
+  const tags = useQuery({
+    queryKey: ["tags", "interest"],
+    queryFn: () => api.listTags("interest"),
+  });
   const attachedSet = new Set(attached);
 
   // Tabbing past the popover's last control dismisses it, the way a click
@@ -75,7 +80,7 @@ export default function TagPicker({
     const name = draft.trim();
     if (!name) return;
     try {
-      const id = await api.createTag(name);
+      const id = await api.createTag(name, "interest");
       await api.setArticleTag(articleId, id, true);
       setDraft("");
       sync();

@@ -101,8 +101,15 @@ pub async fn change_password(
     user: AuthUser,
     Json(body): Json<ChangePasswordBody>,
 ) -> ApiResult<Json<Value>> {
+    if body.new_password.len() < 6 {
+        return Err(ApiError::bad_request("passwordTooShort"));
+    }
+    if body.new_password == body.old_password {
+        return Err(ApiError::bad_request("passwordUnchanged"));
+    }
     let conn = state.db.lock().await;
-    let Some((_, hash)) = auth::find_user_by_username(&conn, &user.0.username).map_err(ApiError::from)?
+    let Some((_, hash)) =
+        auth::find_user_by_username(&conn, &user.0.username).map_err(ApiError::from)?
     else {
         return Err(ApiError::unauthorized());
     };

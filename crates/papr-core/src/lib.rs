@@ -23,3 +23,4 @@ pub mod sync;
 pub mod translate;
 pub mod user_db;
 pub mod wordcloud;
+pub mod wordcloud_dict;

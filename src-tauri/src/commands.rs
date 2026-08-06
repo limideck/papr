@@ -705,6 +705,16 @@ fn build_translate_selection(
     })
 }
 
+/// The provider/model to attribute in the usage ledger for an already-resolved
+/// translation backend — empty for keyless machine-translation engines (which
+/// report zero usage and are skipped by the db layer anyway).
+fn backend_identity(backend: &translate::Backend) -> (&'static str, String) {
+    match backend {
+        translate::Backend::Llm(cfg) => (cfg.provider_name(), cfg.model().to_string()),
+        _ => ("", String::new()),
+    }
+}
+
 /// Truncate to at most `max` characters without splitting a UTF-8 boundary.
 fn truncate(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
@@ -774,10 +784,22 @@ pub async fn ai_summarize(
     // Persist only a summary that streamed to completion. If the user closed
     // the AI panel mid-stream the channel was dropped and `outcome.text` holds
     // just a truncated fragment — caching that would make the next open show a
-    // broken half-summary with no way to regenerate it.
-    if outcome.completed && !outcome.text.trim().is_empty() {
+    // broken half-summary with no way to regenerate it. Usage is still recorded
+    // for a completed run (tokens were spent either way).
+    if outcome.completed {
         let conn = state.db.lock().await;
-        db::set_ai_summary(&conn, article_id, outcome.text.trim())?;
+        if !outcome.text.trim().is_empty() {
+            db::set_ai_summary(&conn, article_id, outcome.text.trim())?;
+        }
+        db::record_ai_usage(
+            &conn,
+            "summarize",
+            cfg.provider_name(),
+            cfg.model(),
+            outcome.usage.prompt_tokens,
+            outcome.usage.completion_tokens,
+            outcome.usage.reasoning_tokens,
+        )?;
     }
     Ok(())
 }
@@ -823,7 +845,19 @@ pub async fn ai_ask(
     };
 
     let http = state.http();
-    stream_to_channel(&http, &cfg, &system, &user, &on_token, ai::MAX_TOKENS).await?;
+    let outcome = stream_to_channel(&http, &cfg, &system, &user, &on_token, ai::MAX_TOKENS).await?;
+    if outcome.completed {
+        let conn = state.db.lock().await;
+        db::record_ai_usage(
+            &conn,
+            "ask",
+            cfg.provider_name(),
+            cfg.model(),
+            outcome.usage.prompt_tokens,
+            outcome.usage.completion_tokens,
+            outcome.usage.reasoning_tokens,
+        )?;
+    }
     Ok(())
 }
 
@@ -859,7 +893,19 @@ pub async fn ai_digest(
     let user = format!("Recent articles from my feeds:\n\n{corpus}");
 
     let http = state.http();
-    stream_to_channel(&http, &cfg, &system, &user, &on_token, ai::MAX_TOKENS).await?;
+    let outcome = stream_to_channel(&http, &cfg, &system, &user, &on_token, ai::MAX_TOKENS).await?;
+    if outcome.completed {
+        let conn = state.db.lock().await;
+        db::record_ai_usage(
+            &conn,
+            "digest",
+            cfg.provider_name(),
+            cfg.model(),
+            outcome.usage.prompt_tokens,
+            outcome.usage.completion_tokens,
+            outcome.usage.reasoning_tokens,
+        )?;
+    }
     Ok(())
 }
 
@@ -952,12 +998,16 @@ pub async fn translate_article_preview(
 
     let http = state.http();
     let backend = translate::ready(&http, sel).await?;
+    let (provider, model) = backend_identity(&backend);
     // Reuse the reader's canonical translation prompt rather than a second copy:
     // the preview fragment is just an `<h1>`/`<p>` pair, so "preserve every HTML
     // tag" covers it, and a single prompt can never drift between the two paths.
     let system = translate::translate_system_prompt(translate::language_name(&target));
     let source = preview_translation_html(&title, &snippet);
-    let raw = backend.translate_batch(&http, &system, &source, &target).await?;
+    let mut usage = ai::TokenUsage::default();
+    let raw = backend
+        .translate_batch(&http, &system, &source, &target, &mut usage)
+        .await?;
     let clean = sanitize::sanitize(raw.trim(), None);
     let translated_title = text_for_selector(&clean, "h1");
     let translated_snippet = text_for_selector(&clean, "p");
@@ -979,6 +1029,15 @@ pub async fn translate_article_preview(
             &translated_snippet,
             &target,
             &engine,
+        )?;
+        db::record_ai_usage(
+            &conn,
+            "translate-preview",
+            provider,
+            &model,
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.reasoning_tokens,
         )?;
     }
 
@@ -1036,6 +1095,7 @@ pub async fn ai_translate(
     // the loop, so a credential or network failure surfaces before any progress
     // is reported rather than mid-stream.
     let backend = translate::ready(&http, sel).await?;
+    let (provider, model) = backend_identity(&backend);
 
     // Split by an engine-specific budget so a short article translates in one
     // request and a long one is chunked to fit the engine's per-call limits.
@@ -1045,8 +1105,11 @@ pub async fn ai_translate(
 
     let system = translate::translate_system_prompt(translate::language_name(&target));
     let mut full = String::new();
+    let mut usage = ai::TokenUsage::default();
     for (i, batch) in batches.iter().enumerate() {
-        let raw = backend.translate_batch(&http, &system, batch, &target).await?;
+        let raw = backend
+            .translate_batch(&http, &system, batch, &target, &mut usage)
+            .await?;
         // Engine output (LLM or machine translation) is untrusted, so each batch
         // passes through the same sanitizer as feed HTML before it reaches the
         // webview or the database. Source URLs are already absolute (sanitized at
@@ -1061,6 +1124,15 @@ pub async fn ai_translate(
     if !final_html.is_empty() {
         let conn = state.db.lock().await;
         db::set_translation(&conn, article_id, &final_html, &target)?;
+        db::record_ai_usage(
+            &conn,
+            "translate",
+            provider,
+            &model,
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.reasoning_tokens,
+        )?;
     }
     let _ = on_event.send(TranslateEvent::Done { html: final_html });
     Ok(())
@@ -1216,19 +1288,29 @@ pub async fn take_pending_deep_link(state: State<'_, AppState>) -> AppResult<Opt
 // ─────────────────────────── tags ───────────────────────────
 
 #[tauri::command]
-pub async fn list_tags(state: State<'_, AppState>) -> AppResult<Vec<Tag>> {
+pub async fn list_tags(
+    state: State<'_, AppState>,
+    kind: Option<String>,
+) -> AppResult<Vec<Tag>> {
     let conn = state.read().await;
-    db::list_tags(&conn)
+    db::list_tags(&conn, kind.as_deref())
 }
 
 #[tauri::command]
-pub async fn create_tag(state: State<'_, AppState>, name: String) -> AppResult<i64> {
+pub async fn create_tag(
+    state: State<'_, AppState>,
+    name: String,
+    kind: Option<String>,
+) -> AppResult<i64> {
     let name = name.trim();
     if name.is_empty() {
         return Err(AppError::code("emptyTagName"));
     }
+    let kind = kind
+        .as_deref()
+        .unwrap_or(papr_core::models::TAG_KIND_INTEREST);
     let conn = state.db.lock().await;
-    db::create_tag(&conn, name)
+    db::create_tag(&conn, name, kind)
 }
 
 #[tauri::command]

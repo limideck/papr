@@ -6,6 +6,7 @@ use crate::models::*;
 use rusqlite::functions::FunctionFlags;
 use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
 use rusqlite_migration::{Migrations, M};
+use serde::Serialize;
 use std::path::Path;
 use std::sync::LazyLock;
 
@@ -361,6 +362,95 @@ static MIGRATIONS: LazyLock<Migrations> = LazyLock::new(|| {
             );
             CREATE INDEX idx_auto_tag_queue_status
                 ON auto_tag_queue(status, created_at);
+            "#,
+        ),
+        // v23 — AI usage accounting: one row per completed AI call (summarize /
+        // Q&A / digest / translate / auto-tag), carrying the provider-reported
+        // token counts so the app can show usage and estimated cost.
+        M::up(
+            r#"
+            CREATE TABLE ai_usage (
+                id                INTEGER PRIMARY KEY,
+                feature           TEXT NOT NULL,
+                provider          TEXT NOT NULL DEFAULT '',
+                model             TEXT NOT NULL DEFAULT '',
+                prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+                completion_tokens INTEGER NOT NULL DEFAULT 0,
+                reasoning_tokens  INTEGER NOT NULL DEFAULT 0,
+                created_at        TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX idx_ai_usage_created
+                ON ai_usage(created_at);
+            "#,
+        ),
+        // v24 — two tag taxonomies on one table: `interest` (admin closed
+        // vocabulary, starts empty) and `ai` (free-form / legacy tags).
+        // Pre-existing rows become AI tags so interest stays empty until the
+        // admin curates it. Uniqueness is per (kind, name) so the same label
+        // can exist in both taxonomies without colliding.
+        M::up(
+            r#"
+            CREATE TABLE tags_new (
+                id        INTEGER PRIMARY KEY,
+                name      TEXT NOT NULL,
+                color     TEXT NOT NULL DEFAULT 'clay',
+                position  INTEGER NOT NULL DEFAULT 0,
+                kind      TEXT NOT NULL DEFAULT 'interest',
+                UNIQUE(kind, name)
+            );
+            INSERT INTO tags_new(id, name, color, position, kind)
+                SELECT id, name, color, position, 'ai' FROM tags;
+            DROP TABLE tags;
+            ALTER TABLE tags_new RENAME TO tags;
+            CREATE INDEX idx_tags_kind ON tags(kind);
+            "#,
+        ),
+        // v25 — fixup for DBs that already applied an earlier v24 which
+        // classified every legacy tag as `interest`. Interest should be empty
+        // by default (admin-curated); move those rows to `ai`. When an AI tag
+        // with the same name already exists, merge article links onto it and
+        // drop the interest duplicate so UNIQUE(kind, name) is preserved.
+        M::up(
+            r#"
+            INSERT OR IGNORE INTO article_tags(article_id, tag_id)
+            SELECT at.article_id, a.id
+            FROM article_tags at
+            JOIN tags i ON i.id = at.tag_id AND i.kind = 'interest'
+            JOIN tags a ON a.kind = 'ai' AND a.name = i.name;
+
+            DELETE FROM tags
+            WHERE kind = 'interest'
+              AND name IN (SELECT name FROM tags WHERE kind = 'ai');
+
+            UPDATE tags SET kind = 'ai' WHERE kind = 'interest';
+            "#,
+        ),
+        // v26 — word-cloud term pre-aggregation. Tokenize title+summary once at
+        // ingest (and via admin/startup backfill); the wordcloud API aggregates
+        // from `article_terms` over a calendar-day window instead of re-scanning
+        // full text on every request.
+        M::up(
+            r#"
+            CREATE TABLE article_terms (
+                article_id INTEGER NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
+                term       TEXT NOT NULL,
+                group_key  TEXT NOT NULL DEFAULT 'general',
+                weight     REAL NOT NULL DEFAULT 1,
+                day        TEXT NOT NULL,
+                PRIMARY KEY (article_id, term)
+            );
+            CREATE INDEX idx_article_terms_day_term
+                ON article_terms(day, term);
+            CREATE INDEX idx_article_terms_day
+                ON article_terms(day);
+
+            CREATE TABLE article_term_index (
+                article_id   INTEGER PRIMARY KEY REFERENCES articles(id) ON DELETE CASCADE,
+                dict_version INTEGER NOT NULL DEFAULT 0,
+                updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX idx_article_term_index_dict
+                ON article_term_index(dict_version);
             "#,
         ),
     ])
@@ -1220,6 +1310,26 @@ pub fn upsert_article(
              updated_at = datetime('now')",
         params![id],
     )?;
+    // Word-cloud terms: tokenize title+summary once so the cloud API can
+    // aggregate from `article_terms` instead of re-scanning text per request.
+    // Failures are logged inside the helper and must not roll back ingest.
+    let summary = a.summary.as_deref().unwrap_or("");
+    let body_snip: String = a.body_text.chars().take(400).collect();
+    let snippet = if summary.is_empty() {
+        body_snip.as_str()
+    } else {
+        summary
+    };
+    if let Err(e) = crate::wordcloud::index_article_snippet(
+        &*tx,
+        id,
+        &a.title,
+        snippet,
+        a.published_at.as_deref(),
+        None,
+    ) {
+        log::warn!("wordcloud index failed (article {id}): {e}");
+    }
     tx.commit()?;
     // A row inserted but pre-marked read by a `read` rule is not "new" from
     // the user's point of view — report it as not-inserted so it is excluded
@@ -1738,92 +1848,123 @@ const TAG_COLORS: &[&str] = &[
     "clay", "amber", "pine", "teal", "indigo", "violet", "rose", "slate",
 ];
 
-/// Every tag, ordered for the sidebar, with a live article count.
-pub fn list_tags(conn: &Connection) -> AppResult<Vec<Tag>> {
-    let mut stmt = conn.prepare(
-        "SELECT t.id, t.name, t.color, t.position,
+/// Accept `interest` | `ai`; reject anything else.
+pub fn normalize_tag_kind(kind: &str) -> AppResult<&'static str> {
+    match kind.trim() {
+        TAG_KIND_INTEREST => Ok(TAG_KIND_INTEREST),
+        TAG_KIND_AI => Ok(TAG_KIND_AI),
+        _ => Err(AppError::code("invalidTagKind")),
+    }
+}
+
+fn map_tag_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Tag> {
+    Ok(Tag {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        color: r.get(2)?,
+        position: r.get(3)?,
+        kind: r.get(4)?,
+        article_count: r.get(5)?,
+    })
+}
+
+/// Every tag (optionally filtered by kind), ordered for the sidebar, with a
+/// live article count.
+pub fn list_tags(conn: &Connection, kind: Option<&str>) -> AppResult<Vec<Tag>> {
+    let kind = match kind {
+        Some(k) => Some(normalize_tag_kind(k)?),
+        None => None,
+    };
+    let sql = if kind.is_some() {
+        "SELECT t.id, t.name, t.color, t.position, t.kind,
                 (SELECT COUNT(*) FROM article_tags at WHERE at.tag_id = t.id)
-         FROM tags t ORDER BY t.position, t.name COLLATE NOCASE",
-    )?;
-    let rows = stmt
-        .query_map([], |r| {
-            Ok(Tag {
-                id: r.get(0)?,
-                name: r.get(1)?,
-                color: r.get(2)?,
-                position: r.get(3)?,
-                article_count: r.get(4)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+         FROM tags t WHERE t.kind = ?1
+         ORDER BY t.position, t.name COLLATE NOCASE"
+    } else {
+        "SELECT t.id, t.name, t.color, t.position, t.kind,
+                (SELECT COUNT(*) FROM article_tags at WHERE at.tag_id = t.id)
+         FROM tags t ORDER BY t.position, t.name COLLATE NOCASE"
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let rows = if let Some(k) = kind {
+        stmt.query_map(params![k], map_tag_row)?
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        stmt.query_map([], map_tag_row)?
+            .collect::<Result<Vec<_>, _>>()?
+    };
     Ok(rows)
 }
 
-/// Create a tag, auto-assigning the next palette colour and list position.
+/// Create a tag of the given kind, auto-assigning colour and list position.
 ///
-/// Idempotent on name: `tags.name` is `UNIQUE`, so a plain `INSERT` of an
-/// existing name would fail the constraint. Both call sites — the sidebar's
-/// "new tag" prompt and the reader's create-and-attach picker — treat a name
-/// the user typed, which may already exist (the picker even lists every tag
-/// right above the input). Matching is case-insensitive, consistent with how
-/// `list_tags` orders names, so "Rust" and "rust" resolve to one tag rather
-/// than silently diverging. An existing name returns that tag's id instead of
-/// erroring.
-pub fn create_tag(conn: &Connection, name: &str) -> AppResult<i64> {
+/// Idempotent on `(kind, name)`: matching is case-insensitive within the kind,
+/// so "Rust" and "rust" resolve to one tag. The same display name may exist in
+/// both `interest` and `ai` taxonomies as separate rows.
+pub fn create_tag(conn: &Connection, name: &str, kind: &str) -> AppResult<i64> {
+    let kind = normalize_tag_kind(kind)?;
     // Trim before the dedup lookup and the insert: a name with surrounding
     // whitespace is a distinct string from its trimmed twin, so the
     // `COLLATE NOCASE` lookup would miss the existing tag and spawn a
     // near-duplicate. Normalise at this one chokepoint so the invariant holds
     // regardless of caller-side trimming. Mirrors `create_folder`.
     let name = name.trim();
+    if name.is_empty() {
+        return Err(AppError::code("emptyTagName"));
+    }
     if let Some(id) = conn
         .query_row(
-            "SELECT id FROM tags WHERE name = ?1 COLLATE NOCASE",
-            params![name],
+            "SELECT id FROM tags WHERE kind = ?1 AND name = ?2 COLLATE NOCASE",
+            params![kind, name],
             |r| r.get::<_, i64>(0),
         )
         .optional()?
     {
         return Ok(id);
     }
-    // Position the new tag at the end of the list. `MAX(position)+1` — not
+    // Position the new tag at the end of its kind. `MAX(position)+1` — not
     // `COUNT(*)` — is required: deleting a tag from the middle leaves a gap,
     // so a fresh `COUNT(*)` would collide with an existing tag's position and
     // the new tag would not sort last (only the name tiebreaker would save
     // it). The colour cycles off the same index so the palette stays varied.
     let next: i64 = conn.query_row(
-        "SELECT COALESCE(MAX(position), -1) + 1 FROM tags",
-        [],
+        "SELECT COALESCE(MAX(position), -1) + 1 FROM tags WHERE kind = ?1",
+        params![kind],
         |r| r.get(0),
     )?;
     let color = TAG_COLORS[(next as usize) % TAG_COLORS.len()];
     conn.execute(
-        "INSERT INTO tags(name, color, position) VALUES (?1, ?2, ?3)",
-        params![name, color, next],
+        "INSERT INTO tags(name, color, position, kind) VALUES (?1, ?2, ?3, ?4)",
+        params![name, color, next, kind],
     )?;
     Ok(conn.last_insert_rowid())
 }
 
 /// Rename a tag, rejecting a name that collides with a *different* existing
-/// tag.
+/// tag of the same kind.
 ///
-/// `tags.name` is `UNIQUE` (case-sensitively). Without this guard a rename to a
-/// name that exactly matches another tag would fail the constraint and surface
-/// the raw SQLite message to the user; and a rename to a *case variant* of
-/// another tag ("rust" → "Rust") would succeed and create the near-duplicate
-/// that `create_tag` deliberately collapses — leaving the two functions
-/// inconsistent. Match case-insensitively, the same basis `create_tag` and
-/// `list_tags`'s ordering use, and return a localisable `tagNameExists` code.
-/// Renaming a tag to its own current name (or a case change of it) is allowed.
+/// Uniqueness is per `(kind, name)`. Match case-insensitively within the kind
+/// and return a localisable `tagNameExists` code on clash. Renaming a tag to
+/// its own current name (or a case change of it) is allowed.
 pub fn rename_tag(conn: &Connection, id: i64, name: &str) -> AppResult<()> {
     // Trim so the collision check and the stored value match what `create_tag`
     // would produce — otherwise a rename to a whitespace-padded variant slips
     // past the clash test and recreates the near-duplicate.
     let name = name.trim();
+    if name.is_empty() {
+        return Err(AppError::code("emptyTagName"));
+    }
+    let kind: String = conn
+        .query_row("SELECT kind FROM tags WHERE id = ?1", params![id], |r| {
+            r.get(0)
+        })
+        .optional()?
+        .ok_or_else(|| AppError::code("tagNotFound"))?;
     let clash: Option<i64> = conn
         .query_row(
-            "SELECT id FROM tags WHERE name = ?1 COLLATE NOCASE AND id != ?2",
-            params![name, id],
+            "SELECT id FROM tags
+             WHERE kind = ?1 AND name = ?2 COLLATE NOCASE AND id != ?3",
+            params![kind, name, id],
             |r| r.get(0),
         )
         .optional()?;
@@ -1876,11 +2017,14 @@ pub fn set_article_tag(conn: &Connection, article_id: i64, tag_id: i64, on: bool
     Ok(())
 }
 
-/// How many tags are currently attached to an article.
-pub fn article_tag_count(conn: &Connection, article_id: i64) -> AppResult<i64> {
+/// How many tags of `kind` are currently attached to an article.
+pub fn article_tag_count(conn: &Connection, article_id: i64, kind: &str) -> AppResult<i64> {
+    let kind = normalize_tag_kind(kind)?;
     Ok(conn.query_row(
-        "SELECT COUNT(*) FROM article_tags WHERE article_id = ?1",
-        params![article_id],
+        "SELECT COUNT(*) FROM article_tags at
+         JOIN tags t ON t.id = at.tag_id
+         WHERE at.article_id = ?1 AND t.kind = ?2",
+        params![article_id, kind],
         |r| r.get(0),
     )?)
 }
@@ -2024,20 +2168,13 @@ pub fn auto_tag_queue_status(conn: &Connection) -> AppResult<AutoTagQueueStatus>
 /// Tags attached to one article (article_count left at 0 — unused per-article).
 pub fn tags_for_article(conn: &Connection, article_id: i64) -> AppResult<Vec<Tag>> {
     let mut stmt = conn.prepare(
-        "SELECT t.id, t.name, t.color, t.position
+        "SELECT t.id, t.name, t.color, t.position, t.kind, 0
          FROM tags t JOIN article_tags at ON at.tag_id = t.id
-         WHERE at.article_id = ?1 ORDER BY t.position, t.name COLLATE NOCASE",
+         WHERE at.article_id = ?1
+         ORDER BY t.kind, t.position, t.name COLLATE NOCASE",
     )?;
     let rows = stmt
-        .query_map(params![article_id], |r| {
-            Ok(Tag {
-                id: r.get(0)?,
-                name: r.get(1)?,
-                color: r.get(2)?,
-                position: r.get(3)?,
-                article_count: 0,
-            })
-        })?
+        .query_map(params![article_id], map_tag_row)?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
 }
@@ -2420,10 +2557,113 @@ pub fn storage_stats(conn: &Connection) -> AppResult<(i64, i64, i64)> {
     Ok((page_count * page_size, articles, feeds))
 }
 
+// ─────────────────────────── ai usage ───────────────────────────
+
+/// One aggregate bucket of AI token usage.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AiUsageRow {
+    /// `"total"` for the grand totals; otherwise the feature name
+    /// (`summarize`, `ask`, `digest`, `translate`, `translate-preview`,
+    /// `auto-tag`).
+    pub feature: String,
+    /// Number of completed AI calls in this bucket.
+    pub calls: i64,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    /// Portion of `completion_tokens` spent on chain-of-thought reasoning.
+    pub reasoning_tokens: i64,
+}
+
+/// AI usage aggregated over a trailing window.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiUsageStats {
+    pub total: AiUsageRow,
+    pub by_feature: Vec<AiUsageRow>,
+}
+
+/// Persist one completed AI call. Rows that report no tokens at all (a
+/// machine-translation engine, or a provider that never surfaces usage) are
+/// skipped so the table stays a meaningful LLM ledger.
+pub fn record_ai_usage(
+    conn: &Connection,
+    feature: &str,
+    provider: &str,
+    model: &str,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    reasoning_tokens: u64,
+) -> AppResult<()> {
+    if prompt_tokens == 0 && completion_tokens == 0 {
+        return Ok(());
+    }
+    conn.execute(
+        "INSERT INTO ai_usage
+             (feature, provider, model, prompt_tokens, completion_tokens, reasoning_tokens)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            feature,
+            provider,
+            model,
+            prompt_tokens as i64,
+            completion_tokens as i64,
+            reasoning_tokens as i64
+        ],
+    )?;
+    Ok(())
+}
+
+/// Aggregate AI usage over the trailing `days` (clamped to 1–366), bucketed by
+/// feature, with grand totals in `total`.
+pub fn ai_usage_stats(conn: &Connection, days: i64) -> AppResult<AiUsageStats> {
+    let days = days.clamp(1, 366);
+    let since = format!("-{days} days");
+    let mut total = AiUsageRow {
+        feature: "total".into(),
+        calls: 0,
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        reasoning_tokens: 0,
+    };
+    let mut by_feature = Vec::new();
+    let mut stmt = conn.prepare(
+        "SELECT feature, COUNT(*), SUM(prompt_tokens), SUM(completion_tokens),
+                SUM(reasoning_tokens)
+         FROM ai_usage
+         WHERE created_at >= datetime('now', ?1)
+         GROUP BY feature
+         ORDER BY feature",
+    )?;
+    let rows = stmt.query_map(params![since], |r| {
+        Ok(AiUsageRow {
+            feature: r.get(0)?,
+            calls: r.get(1)?,
+            prompt_tokens: r.get(2)?,
+            completion_tokens: r.get(3)?,
+            reasoning_tokens: r.get(4)?,
+        })
+    })?;
+    for row in rows {
+        let row = row?;
+        total.calls += row.calls;
+        total.prompt_tokens += row.prompt_tokens;
+        total.completion_tokens += row.completion_tokens;
+        total.reasoning_tokens += row.reasoning_tokens;
+        by_feature.push(row);
+    }
+    Ok(AiUsageStats { total, by_feature })
+}
+
 /// Daily article counts for the last `days` calendar days (inclusive of today).
 ///
-/// Uses the effective date `COALESCE(published_at, fetched_at)`, parsed with
-/// `datetime()` so RFC 3339 and SQLite datetime strings compare correctly.
+/// Counts by `fetched_at` — when the article was ingested into the database
+/// (sidebar label 收录 / "collected") — not by `published_at`. An OPML import
+/// or first refresh of a long archive would otherwise under-count: many rows
+/// have old publish dates but were only just 收录'd.
+///
+/// Calendar days use the server's local timezone (`localtime`) so an
+/// Asia/Shanghai host buckets by CST rather than UTC midnight.
 /// Returns `(YYYY-MM-DD, count)` rows — days with zero articles are omitted.
 pub fn daily_article_counts(conn: &Connection, days: i64) -> AppResult<Vec<(String, i64)>> {
     let days = days.clamp(1, 366);
@@ -2431,11 +2671,11 @@ pub fn daily_article_counts(conn: &Connection, days: i64) -> AppResult<Vec<(Stri
     let offset = -(days - 1);
     let modifier = format!("{offset} days");
     let mut stmt = conn.prepare(
-        "SELECT date(datetime(COALESCE(published_at, fetched_at))) AS d,
+        "SELECT date(datetime(fetched_at, 'localtime')) AS d,
                 COUNT(*) AS c
          FROM articles
-         WHERE datetime(COALESCE(published_at, fetched_at))
-               >= datetime('now', 'start of day', ?1)
+         WHERE datetime(fetched_at, 'localtime')
+               >= datetime('now', 'localtime', 'start of day', ?1)
          GROUP BY d
          ORDER BY d",
     )?;
@@ -2515,13 +2755,35 @@ pub fn vacuum(conn: &Connection) -> AppResult<()> {
     Ok(())
 }
 
-/// Wipe all user content (feeds → articles cascade, folders). Settings are
-/// kept. Both deletes commit together so a failure can't leave feeds wiped
-/// but folders behind.
+/// Wipe all user content (feeds → articles cascade, folders, tags, rules,
+/// feed sources). Settings are kept. Deletes commit together so a failure
+/// can't leave feeds wiped but folders / tags behind.
+///
+/// Also rebuilds the FTS5 index so shadow-table tombstones/segments collapse.
+/// Do not `DELETE FROM articles_fts_*` directly — those tables are FTS5-
+/// managed and hand-deleting them can corrupt the index.
 pub fn clear_all_data(conn: &Connection) -> AppResult<()> {
     let tx = conn.unchecked_transaction()?;
+    // Feeds first: articles (and join rows) cascade off feeds.
     tx.execute("DELETE FROM feeds", [])?;
     tx.execute("DELETE FROM folders", [])?;
+    // Tags are independent of feeds — article_tags cascade when articles go,
+    // but the tag rows themselves would otherwise linger empty.
+    tx.execute("DELETE FROM tags", [])?;
+    // Feed-scoped rules cascade with feeds; global rules (feed_id IS NULL)
+    // would otherwise survive.
+    tx.execute("DELETE FROM rules", [])?;
+    
+    tx.execute("DELETE FROM feed_sources", [])?;
+
+    // Do not wipe `feed_sources` — those are curated directory-index configs
+    // (Settings → 索引源), not subscription content.
+
+    // FTS5 keeps deleted-doc tombstones in its shadow tables (`_data`, `_idx`)
+    // after a mass DELETE. Rebuild collapses them so a cleared DB does not
+    // keep hundreds of MB of dead index segments. `articles_fts_config` keeps
+    // its single metadata row — that is required and expected.
+    tx.execute("INSERT INTO articles_fts(articles_fts) VALUES('rebuild')", [])?;
     tx.commit()?;
     Ok(())
 }
@@ -3220,15 +3482,34 @@ mod tests {
     #[test]
     fn create_tag_is_idempotent_on_name() {
         let (conn, _aid) = test_db();
-        let first = create_tag(&conn, "Rust").unwrap();
+        let first = create_tag(&conn, "Rust", TAG_KIND_INTEREST).unwrap();
         // Re-creating the same name returns the existing id, not a constraint
         // error, and does not add a second row.
-        let again = create_tag(&conn, "Rust").unwrap();
+        let again = create_tag(&conn, "Rust", TAG_KIND_INTEREST).unwrap();
         assert_eq!(first, again);
         // Case-insensitive: "rust" resolves to the same tag as "Rust".
-        let cased = create_tag(&conn, "rust").unwrap();
+        let cased = create_tag(&conn, "rust", TAG_KIND_INTEREST).unwrap();
         assert_eq!(first, cased);
-        assert_eq!(list_tags(&conn).unwrap().len(), 1);
+        assert_eq!(list_tags(&conn, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn create_tag_kinds_are_separate_taxonomies() {
+        let (conn, _aid) = test_db();
+        let interest = create_tag(&conn, "Rust", TAG_KIND_INTEREST).unwrap();
+        let ai = create_tag(&conn, "Rust", TAG_KIND_AI).unwrap();
+        assert_ne!(interest, ai);
+        assert_eq!(
+            list_tags(&conn, Some(TAG_KIND_INTEREST)).unwrap().len(),
+            1
+        );
+        assert_eq!(list_tags(&conn, Some(TAG_KIND_AI)).unwrap().len(), 1);
+        // Rename within AI must not clash with the interest twin.
+        rename_tag(&conn, ai, "RustLang").unwrap();
+        let name: String = conn
+            .query_row("SELECT name FROM tags WHERE id = ?1", [ai], |r| r.get(0))
+            .unwrap();
+        assert_eq!(name, "RustLang");
     }
 
     #[test]
@@ -3237,16 +3518,16 @@ mod tests {
         // as its trimmed form — otherwise the `COLLATE NOCASE` lookup misses
         // and a visually identical near-duplicate tag is created.
         let (conn, _aid) = test_db();
-        let rust = create_tag(&conn, "Rust").unwrap();
-        assert_eq!(create_tag(&conn, "  Rust  ").unwrap(), rust);
-        assert_eq!(create_tag(&conn, "\tRust\n").unwrap(), rust);
+        let rust = create_tag(&conn, "Rust", TAG_KIND_INTEREST).unwrap();
+        assert_eq!(create_tag(&conn, "  Rust  ", TAG_KIND_INTEREST).unwrap(), rust);
+        assert_eq!(create_tag(&conn, "\tRust\n", TAG_KIND_INTEREST).unwrap(), rust);
         // The stored name is the trimmed form.
-        let go = create_tag(&conn, "  Go ").unwrap();
+        let go = create_tag(&conn, "  Go ", TAG_KIND_INTEREST).unwrap();
         let name: String = conn
             .query_row("SELECT name FROM tags WHERE id = ?1", [go], |r| r.get(0))
             .unwrap();
         assert_eq!(name, "Go");
-        assert_eq!(list_tags(&conn).unwrap().len(), 2);
+        assert_eq!(list_tags(&conn, None).unwrap().len(), 2);
     }
 
     #[test]
@@ -3254,8 +3535,8 @@ mod tests {
         // A rename to a whitespace-padded variant of another tag's name must
         // still be rejected — the trim lets the clash check see through it.
         let (conn, _aid) = test_db();
-        let _rust = create_tag(&conn, "Rust").unwrap();
-        let go = create_tag(&conn, "Go").unwrap();
+        let _rust = create_tag(&conn, "Rust", TAG_KIND_INTEREST).unwrap();
+        let go = create_tag(&conn, "Go", TAG_KIND_INTEREST).unwrap();
         let err = rename_tag(&conn, go, "  Rust  ").unwrap_err();
         assert!(matches!(err, AppError::Coded("tagNameExists")));
     }
@@ -3266,13 +3547,13 @@ mod tests {
         // `position` sequence. A new tag must still land at the end — a
         // `COUNT(*)`-based position would collide with an existing row.
         let (conn, _aid) = test_db();
-        let a = create_tag(&conn, "alpha").unwrap();
-        let b = create_tag(&conn, "beta").unwrap();
-        let _c = create_tag(&conn, "gamma").unwrap();
+        let a = create_tag(&conn, "alpha", TAG_KIND_INTEREST).unwrap();
+        let b = create_tag(&conn, "beta", TAG_KIND_INTEREST).unwrap();
+        let _c = create_tag(&conn, "gamma", TAG_KIND_INTEREST).unwrap();
         delete_tag(&conn, b).unwrap();
-        let zoo = create_tag(&conn, "zeta").unwrap();
+        let zoo = create_tag(&conn, "zeta", TAG_KIND_INTEREST).unwrap();
 
-        let order: Vec<i64> = list_tags(&conn).unwrap().iter().map(|t| t.id).collect();
+        let order: Vec<i64> = list_tags(&conn, None).unwrap().iter().map(|t| t.id).collect();
         assert_eq!(
             order.last(),
             Some(&zoo),
@@ -4268,8 +4549,8 @@ mod tests {
     #[test]
     fn rename_tag_rejects_collision_with_another_tag() {
         let (conn, _aid) = test_db();
-        let rust = create_tag(&conn, "Rust").unwrap();
-        let go = create_tag(&conn, "Go").unwrap();
+        let rust = create_tag(&conn, "Rust", TAG_KIND_INTEREST).unwrap();
+        let go = create_tag(&conn, "Go", TAG_KIND_INTEREST).unwrap();
 
         // Renaming "Go" onto an exact match of "Rust" must be rejected with the
         // localisable code rather than the raw UNIQUE-constraint SQLite error.
@@ -4297,7 +4578,7 @@ mod tests {
     #[test]
     fn rename_tag_allows_genuine_rename_and_self_case_change() {
         let (conn, _aid) = test_db();
-        let id = create_tag(&conn, "draft").unwrap();
+        let id = create_tag(&conn, "draft", TAG_KIND_INTEREST).unwrap();
         // A free name is accepted.
         rename_tag(&conn, id, "Reading").unwrap();
         // Re-casing the tag's *own* name is allowed (no other tag clashes).
@@ -4446,5 +4727,182 @@ mod tests {
             })
             .unwrap();
         assert_eq!(name, "Tech");
+    }
+
+    #[test]
+    fn daily_article_counts_uses_fetched_at_not_published_at() {
+        // Heatmap "收录" is ingestion time. An old-published article fetched
+        // today must count; a today-published article fetched long ago must not.
+        let (conn, fixture) = test_db();
+        let feed_id: i64 = conn
+            .query_row("SELECT feed_id FROM articles WHERE id = ?1", [fixture], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute("DELETE FROM articles WHERE id = ?1", [fixture])
+            .unwrap();
+
+        let old_pub = NewArticle {
+            guid: "old-pub-new-fetch".into(),
+            url: None,
+            title: "T".into(),
+            author: None,
+            summary: None,
+            content_html: None,
+            body_text: String::new(),
+            image_url: None,
+            published_at: Some("2020-01-01T00:00:00+00:00".into()),
+            enclosures: Vec::new(),
+        };
+        upsert_article(&conn, feed_id, &old_pub, false, &[]).unwrap();
+
+        let new_pub = NewArticle {
+            guid: "new-pub-old-fetch".into(),
+            url: None,
+            title: "T".into(),
+            author: None,
+            summary: None,
+            content_html: None,
+            body_text: String::new(),
+            image_url: None,
+            published_at: Some("2026-08-01T00:00:00+00:00".into()),
+            enclosures: Vec::new(),
+        };
+        upsert_article(&conn, feed_id, &new_pub, false, &[]).unwrap();
+        conn.execute(
+            "UPDATE articles SET fetched_at = datetime('now', '-60 days')
+             WHERE guid = 'new-pub-old-fetch'",
+            [],
+        )
+        .unwrap();
+
+        let rows = daily_article_counts(&conn, 30).unwrap();
+        let total: i64 = rows.iter().map(|(_, c)| c).sum();
+        assert_eq!(total, 1, "only the recently-fetched row should count: {rows:?}");
+        let guids_today: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM articles
+                 WHERE guid = 'old-pub-new-fetch'
+                   AND datetime(fetched_at, 'localtime')
+                       >= datetime('now', 'localtime', 'start of day', '-29 days')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(guids_today, 1);
+    }
+
+    #[test]
+    fn clear_all_data_wipes_feeds_folders_tags_and_rules() {
+        let (conn, _aid) = test_db();
+        let feed_id: i64 = conn
+            .query_row("SELECT id FROM feeds", [], |r| r.get(0))
+            .unwrap();
+        // Seed enough FTS content that a plain DELETE would leave measurable
+        // shadow-table residue; rebuild should collapse it.
+        for i in 0..50 {
+            let article = NewArticle {
+                guid: format!("fts-bloat-{i}"),
+                url: None,
+                title: format!("Title with searchable words {i}"),
+                author: None,
+                summary: None,
+                content_html: None,
+                body_text: format!("Body text for full-text search document number {i}"),
+                image_url: None,
+                published_at: None,
+                enclosures: Vec::new(),
+            };
+            upsert_article(&conn, feed_id, &article, false, &[]).unwrap();
+        }
+        create_folder(&conn, "News").unwrap();
+        create_tag(&conn, "tech", TAG_KIND_INTEREST).unwrap();
+        // Global rule — would survive DELETE FROM feeds without an explicit wipe.
+        create_rule(&conn, "skip ads", None, "title", "sponsored", "skip").unwrap();
+
+        clear_all_data(&conn).unwrap();
+
+        let counts: (i64, i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM feeds),
+                    (SELECT COUNT(*) FROM folders),
+                    (SELECT COUNT(*) FROM articles),
+                    (SELECT COUNT(*) FROM tags),
+                    (SELECT COUNT(*) FROM rules)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (0, 0, 0, 0, 0));
+
+        let fts_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM articles_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts_rows, 0, "virtual FTS table must be empty after clear");
+
+        // FTS5 shadow segments must be rebuilt empty — a plain DELETE leaves
+        // tombstones in `_data` / `_idx` that still occupy disk.
+        let fts_data: i64 = conn
+            .query_row("SELECT COUNT(*) FROM articles_fts_data", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            fts_data <= 2,
+            "rebuild should collapse FTS shadow segments, got articles_fts_data={fts_data}"
+        );
+
+        // Config metadata row is required by FTS5 and must remain.
+        let fts_config: i64 = conn
+            .query_row("SELECT COUNT(*) FROM articles_fts_config", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts_config, 1);
+    }
+
+    #[test]
+    fn ai_usage_records_only_nonzero_rows_and_aggregates() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        MIGRATIONS.to_latest(&mut conn).unwrap();
+
+        // Zero-token calls (machine translation, providers without usage) are
+        // skipped so the ledger stays a meaningful LLM accounting table.
+        record_ai_usage(&conn, "translate", "", "", 0, 0, 0).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM ai_usage", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+
+        record_ai_usage(&conn, "summarize", "deepseek", "deepseek-v4-flash", 120, 45, 30)
+            .unwrap();
+        record_ai_usage(&conn, "ask", "deepseek", "deepseek-v4-flash", 300, 80, 50)
+            .unwrap();
+        record_ai_usage(&conn, "summarize", "deepseek", "deepseek-v4-flash", 90, 20, 0)
+            .unwrap();
+
+        let stats = ai_usage_stats(&conn, 30).unwrap();
+        assert_eq!(stats.by_feature.len(), 2);
+        let summarize = &stats.by_feature[0];
+        assert_eq!(summarize.feature, "ask");
+        let summarize = &stats.by_feature[1];
+        assert_eq!(summarize.feature, "summarize");
+        assert_eq!(summarize.calls, 2);
+        assert_eq!(summarize.prompt_tokens, 210);
+        assert_eq!(summarize.completion_tokens, 65);
+        assert_eq!(summarize.reasoning_tokens, 30);
+
+        let t = &stats.total;
+        assert_eq!(t.calls, 3);
+        assert_eq!(t.prompt_tokens, 510);
+        assert_eq!(t.completion_tokens, 145);
+        assert_eq!(t.reasoning_tokens, 80);
+
+        // Rows outside the window are excluded.
+        conn.execute(
+            "UPDATE ai_usage SET created_at = datetime('now', '-60 days') WHERE feature = 'ask'",
+            [],
+        )
+        .unwrap();
+        let windowed = ai_usage_stats(&conn, 30).unwrap();
+        assert_eq!(windowed.total.calls, 2);
+        assert_eq!(windowed.total.prompt_tokens, 210);
     }
 }

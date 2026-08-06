@@ -8,14 +8,17 @@ use papr_core::db;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-/// `GET /api/auto-tag/status` — queue backlog + enabled flag (admin).
+/// `GET /api/auto-tag/status` — queue backlog + enabled flags (admin).
 pub async fn status(State(state): State<AppState>, user: AuthUser) -> ApiResult<Json<Value>> {
     user.require_admin()?;
     let conn = state.db.lock().await;
-    let enabled = db::setting_flag(&conn, "auto_tag_enabled", false);
+    let interest_enabled = db::setting_flag(&conn, "auto_tag_enabled", false);
+    let ai_enabled = db::setting_flag(&conn, "ai_tag_enabled", false);
     let queue = db::auto_tag_queue_status(&conn).map_err(ApiError::from)?;
     Ok(Json(json!({
-        "enabled": enabled,
+        "enabled": interest_enabled || ai_enabled,
+        "interestEnabled": interest_enabled,
+        "aiEnabled": ai_enabled,
         "pending": queue.pending,
         "failed": queue.failed,
         "lastError": queue.last_error,

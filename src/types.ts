@@ -21,7 +21,10 @@ export interface AutoTagStatus {
   processing?: number;
   failed?: number;
   done?: number;
+  /** True when interest matching and/or AI tagging is enabled. */
   enabled?: boolean;
+  interestEnabled?: boolean;
+  aiEnabled?: boolean;
   lastError?: string | null;
   recentErrors?: { articleId?: number; error?: string; at?: string }[];
 }
@@ -47,6 +50,8 @@ export interface FeedSourceScanResult {
 export interface WordCloudTerm {
   term: string;
   count: number;
+  /** Entity category for colouring; defaults to general. */
+  group?: string;
 }
 
 export interface WordCloudResult {
@@ -55,6 +60,23 @@ export interface WordCloudResult {
   scanned?: number;
   from?: string;
   to?: string;
+}
+
+export interface WordCloudStopwords {
+  version: number;
+  words: string[];
+}
+
+export interface WordCloudEntity {
+  id: string;
+  canonical: string;
+  group: string;
+  aliases: string[];
+}
+
+export interface WordCloudEntities {
+  version: number;
+  entities: WordCloudEntity[];
 }
 
 export type SourceType =
@@ -133,11 +155,16 @@ export interface Enclosure {
   length: number | null;
 }
 
+/** Admin closed vocabulary vs free-form AI-generated tags. */
+export type TagKind = "interest" | "ai";
+
 export interface Tag {
   id: number;
   name: string;
   color: string;
   position: number;
+  /** Defaults to interest when omitted by older payloads. */
+  kind?: TagKind;
   articleCount: number;
 }
 
@@ -213,12 +240,6 @@ export interface SmartCounts {
   unread: number;
   starred: number;
   readLater: number;
-}
-
-/** One day in the sidebar activity heatmap (`GET /api/stats/daily`). */
-export interface DailyCount {
-  date: string;
-  count: number;
 }
 
 /** A user highlight / annotation (mirrors models::Highlight). */

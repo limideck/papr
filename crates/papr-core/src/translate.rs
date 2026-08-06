@@ -227,12 +227,14 @@ impl Backend {
         system: &str,
         batch: &str,
         target: &str,
+        usage: &mut ai::TokenUsage,
     ) -> AppResult<String> {
         match self {
             Backend::Llm(cfg) => {
-                let text =
+                let outcome =
                     ai::complete_chat(client, cfg, system, batch, ai::TRANSLATE_MAX_TOKENS).await?;
-                Ok(strip_code_fence(&text))
+                *usage += outcome.usage;
+                Ok(strip_code_fence(&outcome.text))
             }
             _ => translate_fragment(client, self, batch, target).await,
         }

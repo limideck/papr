@@ -882,11 +882,18 @@ fn cmd_mark(path: &Path, state: &str, ids: &[i64]) -> Result<String, AxiError> {
 
 fn cmd_tags(path: &Path) -> Result<String, AxiError> {
     let conn = open_ro(path)?;
-    let tags = db::list_tags(&conn).map_err(db_err)?;
+    let tags = db::list_tags(&conn, None).map_err(db_err)?;
     let mut d = Doc::new();
     let rows: Vec<Value> = tags
         .iter()
-        .map(|t| json!({ "id": t.id, "name": t.name, "articles": t.article_count }))
+        .map(|t| {
+            json!({
+                "id": t.id,
+                "name": t.name,
+                "kind": t.kind,
+                "articles": t.article_count
+            })
+        })
         .collect();
     d.set("tags", Value::Array(rows));
     if !tags.is_empty() {
@@ -1211,7 +1218,8 @@ fn cmd_tag(path: &Path, cmd: TagCmd) -> Result<String, AxiError> {
     let conn = open_rw(path)?;
     match cmd {
         TagCmd::Create { name } => {
-            let id = db::create_tag(&conn, &name).map_err(db_err)?;
+            let id = db::create_tag(&conn, &name, papr_core::models::TAG_KIND_INTEREST)
+                .map_err(db_err)?;
             ok_line(format!("tag: #{id} {name}"))
         }
         TagCmd::Rename { id, name } => {

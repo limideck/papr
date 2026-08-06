@@ -8,7 +8,7 @@ import { usePlayer } from "../player";
 import { useTranslationJobs } from "../translation";
 import { useArticleActions } from "../hooks/articleActions";
 import { renderMarkdown } from "../lib/markdown";
-import { downloadBlob, imageFilename } from "../lib/download";
+import { copyText } from "../lib/clipboard";
 import { imageDataUrl } from "../lib/imageBytes";
 import { fullDate } from "../lib/feedMeta";
 import { openUrl } from "../lib/openUrl";
@@ -19,7 +19,6 @@ import Icon from "./Icon";
 import TagPicker from "./TagPicker";
 import ResizeHandle from "./ResizeHandle";
 import HighlightLayer from "./HighlightLayer";
-import ContextMenu, { type MenuEntry } from "./ContextMenu";
 import Lightbox from "./Lightbox";
 
 interface Props {
@@ -201,14 +200,6 @@ export default function Reader({ onToast }: Props) {
   // way — the in-frame hint points those back to "open in browser".
   const [viewMode, setViewMode] = useState<"reader" | "web">("reader");
   const [tagPick, setTagPick] = useState<{ x: number; y: number } | null>(null);
-  const [ctxMenu, setCtxMenu] = useState<{
-    x: number;
-    y: number;
-    // Set when the right-click landed on an article image / over a text
-    // selection, so the menu can offer image- and copy-specific actions.
-    imageUrl?: string;
-    selection?: string;
-  } | null>(null);
   // Full-screen image viewer: the article's image srcs + the one to open on
   // (issue #87). Null when closed.
   const [lightbox, setLightbox] = useState<{ srcs: string[]; index: number } | null>(
@@ -240,12 +231,8 @@ export default function Reader({ onToast }: Props) {
   });
   const a: ArticleDetail | undefined = article.data;
 
-  // Feed list, so the article's source feed can be checked for its per-feed
-  // auto-translate flag. Shared cache key with the sidebar — no extra fetch.
+  // Feed list for per-feed open mode. Shared cache key with the sidebar.
   const feeds = useQuery({ queryKey: ["feeds"], queryFn: api.listFeeds });
-  const autoTranslateFeed = !!(
-    a && feeds.data?.find((f) => f.id === a.feedId)?.autoTranslate
-  );
   // Effective open mode (issue #110): the feed's own setting, falling back to
   // the global default. `undefined` while the article or feed list is still
   // loading, so the open-mode/auto-extract effects below don't fire before the
@@ -557,27 +544,6 @@ export default function Reader({ onToast }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [a?.id, a?.extractedHtml, openMode, feedOpenMode]);
 
-  // Per-feed auto-translate: when the article's source feed opts in, translate
-  // it into the configured target the moment it opens. Fires once per article
-  // (guarded by `autoTranslatedRef`), only when there's a body to translate and
-  // a usable cached translation in the target language isn't already present —
-  // so a feed left untouched still shows its original text, and reopening a
-  // cached article doesn't re-spend an API call. The toolbar toggle still lets
-  // the reader flip back to the original at any time.
-  const autoTranslatedRef = useRef<number | null>(null);
-  useEffect(() => {
-    if (!autoTranslateFeed || !a || !canTranslate) return;
-    if (autoTranslatedRef.current === a.id) return;
-    autoTranslatedRef.current = a.id;
-    // A fresh cached translation for the target language needs no new job;
-    // just surface it. Otherwise start a background translation.
-    if (!(a.translatedHtml && a.translatedLang === targetLang)) {
-      startTranslate(a.id, targetLang, engine);
-    }
-    setShowTranslation(true);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [a?.id, autoTranslateFeed, canTranslate, targetLang, engine]);
-
   // Mark the current article read once its foot is reached. Also fires for an
   // article short enough to need no scrolling at all (`scrollHeight` already
   // within `clientHeight`) — that case produces no `scroll` event, so without
@@ -614,22 +580,9 @@ export default function Reader({ onToast }: Props) {
 
   const copyLink = () => {
     if (!a?.url) return;
-    navigator.clipboard.writeText(a.url).then(() => onToast(t("reader.linkCopied")), () => {});
-  };
-  const copyText = (text: string, toastKey: string) => {
-    navigator.clipboard.writeText(text).then(() => onToast(t(toastKey)), () => {});
-  };
-  // Save a feed image to disk. The bytes are fetched in Rust (not the webview)
-  // so the request's Referer can walk the same hotlink-protection fallbacks
-  // that let these images render at all (see fetch_image). The download itself
-  // reuses the app's blob-anchor mechanism.
-  const saveImage = async (url: string) => {
-    try {
-      const buf = await api.fetchImage(url, a?.url);
-      downloadBlob(new Blob([buf]), imageFilename(url));
-    } catch {
-      toast.error(t("reader.imageSaveFailed"));
-    }
+    void copyText(a.url).then((ok) =>
+      onToast(ok ? t("reader.linkCopied") : t("reader.linkCopyFailed")),
+    );
   };
   const share = () => {
     if (!a?.url) return;
@@ -818,6 +771,24 @@ export default function Reader({ onToast }: Props) {
         >
           <Icon name="share" size={16} />
         </button>
+        <HighlightLayer
+          // Keyed by article id so the export menu / popovers reset cleanly
+          // when the reader switches articles.
+          key={a.id}
+          articleId={a.id}
+          bodyRef={bodyRef}
+          bodyVersion={displayBody}
+        />
+        <div className="tb-btn spacer" />
+        <button
+          className={`tb-btn ${aiOpen ? "on" : ""}`}
+          title={t("reader.tbAiSummary")}
+          aria-label={t("reader.tbAiSummary")}
+          aria-pressed={aiOpen}
+          onClick={() => setAiOpen(!aiOpen)}
+        >
+          <Icon name={aiOpen ? "sparkle-fill" : "sparkle"} size={16} />
+        </button>
         <button
           className={`tb-btn ${showTranslation ? "on" : ""}`}
           title={t("reader.tbTranslate")}
@@ -832,15 +803,25 @@ export default function Reader({ onToast }: Props) {
         >
           <Icon name="globe" size={16} />
         </button>
-        <HighlightLayer
-          // Keyed by article id so the export menu / popovers reset cleanly
-          // when the reader switches articles.
-          key={a.id}
-          articleId={a.id}
-          bodyRef={bodyRef}
-          bodyVersion={displayBody}
-        />
-        <div className="tb-btn spacer" />
+        {/* {a.url && (
+          <button
+            className="tb-btn"
+            title={t("reader.tbCopyLink")}
+            aria-label={t("reader.tbCopyLink")}
+            onClick={copyLink}
+          >
+            <Icon name="copy" size={16} />
+          </button>
+        )}
+        <button
+          className={`tb-btn ${focusMode ? "on" : ""}`}
+          title={t("reader.tbFocusMode")}
+          aria-label={t("reader.tbFocusMode")}
+          aria-pressed={focusMode}
+          onClick={() => setFocusMode(!focusMode)}
+        >
+          <Icon name={focusMode ? "eye-off" : "focus"} size={16} />
+        </button> */}
         {a.url && (
           <button
             className={`tb-btn ${viewMode === "web" ? "on" : ""}`}
@@ -891,24 +872,6 @@ export default function Reader({ onToast }: Props) {
         className="reader-scroll"
         ref={scrollRef}
         onScroll={onScroll}
-        onContextMenu={(e) => {
-          e.preventDefault();
-          // Capture what the click landed on so the menu can add image- and
-          // selection-specific actions (the native menu is suppressed app-wide;
-          // see main.tsx).
-          const img = (e.target as HTMLElement).closest("img") as HTMLImageElement | null;
-          const sel = window.getSelection();
-          const selection =
-            sel && !sel.isCollapsed ? sel.toString().trim() : "";
-          setCtxMenu({
-            x: e.clientX,
-            y: e.clientY,
-            // data-papr-src holds the real address when the image was
-            // recovered through the backend and src is an inline data: URL.
-            imageUrl: img?.dataset.paprSrc || img?.currentSrc || img?.getAttribute("src") || undefined,
-            selection: selection || undefined,
-          });
-        }}
       >
         <article className="article reader-content" key={a.id}>
           <button
@@ -946,8 +909,13 @@ export default function Reader({ onToast }: Props) {
               {a.tags.map((tag) => (
                 <button
                   key={tag.id}
-                  className="article-tag"
+                  className={`article-tag${tag.kind === "ai" ? " ai" : ""}`}
                   style={{ "--tag-c": tagColor(tag.color) } as React.CSSProperties}
+                  title={
+                    tag.kind === "ai"
+                      ? t("reader.aiTagHint")
+                      : t("reader.interestTagHint")
+                  }
                   onClick={() =>
                     useUi.getState().select({ kind: "tag", value: tag.id }, tag.name)
                   }
@@ -1147,72 +1115,6 @@ export default function Reader({ onToast }: Props) {
           x={tagPick.x}
           y={tagPick.y}
           onClose={() => setTagPick(null)}
-        />
-      )}
-
-      {ctxMenu && (
-        <ContextMenu
-          x={ctxMenu.x}
-          y={ctxMenu.y}
-          items={[
-            ...(ctxMenu.selection
-              ? [
-                  {
-                    icon: "copy" as const,
-                    label: t("reader.ctxCopy"),
-                    onClick: () => copyText(ctxMenu.selection!, "reader.textCopied"),
-                  },
-                ]
-              : []),
-            ...(ctxMenu.imageUrl
-              ? [
-                  {
-                    icon: "arrow-down" as const,
-                    label: t("reader.ctxSaveImage"),
-                    onClick: () => saveImage(ctxMenu.imageUrl!),
-                  },
-                  {
-                    icon: "copy" as const,
-                    label: t("reader.ctxCopyImageAddress"),
-                    onClick: () =>
-                      copyText(ctxMenu.imageUrl!, "reader.imageAddressCopied"),
-                  },
-                ]
-              : []),
-            ...(ctxMenu.selection || ctxMenu.imageUrl
-              ? [{ separator: true as const }]
-              : []),
-            {
-              icon: aiOpen ? "sparkle-fill" : "sparkle",
-              label: t("reader.tbAiSummary"),
-              onClick: () => setAiOpen(!aiOpen),
-            },
-            ...(canTranslate
-              ? [
-                  {
-                    icon: "globe",
-                    label: showTranslation
-                      ? t("reader.tbShowOriginal")
-                      : t("reader.tbTranslate"),
-                    onClick: () =>
-                      showTranslation
-                        ? setShowTranslation(false)
-                        : run(targetLang, engine),
-                  },
-                ]
-              : []),
-            { separator: true },
-            ...(a.url
-              ? [{ icon: "copy", label: t("reader.tbCopyLink"), onClick: copyLink }]
-              : []),
-            { separator: true },
-            {
-              icon: focusMode ? "eye-off" : "focus",
-              label: t("reader.tbFocusMode"),
-              onClick: () => setFocusMode(!focusMode),
-            },
-          ] as MenuEntry[]}
-          onClose={() => setCtxMenu(null)}
         />
       )}
     </div>

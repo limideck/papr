@@ -1,4 +1,4 @@
-//! Background feed refresh, feed-source index sync, and auto-tag worker.
+//! Background feed refresh, feed-source index sync, auto-tag, and wordcloud backfill.
 
 use crate::state::AppState;
 use papr_core::auto_tag::{self, MAX_ATTEMPTS};
@@ -6,6 +6,7 @@ use papr_core::db;
 use papr_core::error::AppError;
 use papr_core::ingestion::feed_source;
 use papr_core::ingestion::refresh::{self, RefreshScope};
+use papr_core::wordcloud;
 use std::time::Duration;
 
 /// Default interval between due-feed refresh ticks (seconds).
@@ -14,11 +15,14 @@ const REFRESH_TICK_SECS: u64 = 60;
 const FEED_SOURCE_TICK_SECS: u64 = 6 * 60 * 60;
 /// Auto-tag worker poll interval when idle / between jobs.
 const AUTO_TAG_TICK_SECS: u64 = 5;
+/// Word-cloud term backfill poll interval when draining a backlog.
+const WORDCLOUD_BACKFILL_TICK_SECS: u64 = 2;
 
 pub fn spawn_background_jobs(state: AppState) {
     tokio::spawn(refresh_loop(state.clone()));
     tokio::spawn(feed_source_loop(state.clone()));
-    tokio::spawn(auto_tag_loop(state));
+    tokio::spawn(auto_tag_loop(state.clone()));
+    tokio::spawn(wordcloud_backfill_loop(state));
 }
 
 async fn refresh_loop(state: AppState) {
@@ -83,6 +87,7 @@ async fn auto_tag_loop(state: AppState) {
         let enabled = {
             let conn = state.db.lock().await;
             db::setting_flag(&conn, "auto_tag_enabled", false)
+                || db::setting_flag(&conn, "ai_tag_enabled", false)
         };
         if !enabled {
             continue;
@@ -125,6 +130,47 @@ async fn auto_tag_loop(state: AppState) {
                     tracing::warn!(article_id, "auto-tag mark failure failed: {mark_err}");
                 }
             }
+        }
+    }
+}
+
+/// Drain articles missing/stale word-cloud terms. Tokenization runs outside
+/// the global DB mutex; only fetch + write hold the lock briefly.
+async fn wordcloud_backfill_loop(state: AppState) {
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    let mut ticker = tokio::time::interval(Duration::from_secs(WORDCLOUD_BACKFILL_TICK_SECS));
+    loop {
+        ticker.tick().await;
+
+        let (dict_version, rows) = {
+            let conn = state.db.lock().await;
+            match wordcloud::fetch_backfill_batch(&conn, wordcloud::BACKFILL_BATCH) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("wordcloud backfill fetch failed: {e}");
+                    continue;
+                }
+            }
+        };
+        if rows.is_empty() {
+            // Idle longer when caught up.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            continue;
+        }
+
+        let prepared = state
+            .wordcloud
+            .with_dict(|dict| wordcloud::tokenize_backfill_batch(&rows, dict));
+
+        let conn = state.db.lock().await;
+        match wordcloud::write_backfill_batch(&conn, dict_version, &prepared) {
+            Ok(()) => {
+                tracing::info!(
+                    processed = prepared.len(),
+                    "wordcloud term backfill batch complete"
+                );
+            }
+            Err(e) => tracing::warn!("wordcloud backfill write failed: {e}"),
         }
     }
 }

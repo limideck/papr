@@ -10,7 +10,7 @@
 
 use crate::error::{AppError, AppResult};
 use reqwest::{Client, Response};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::Duration;
 
@@ -144,9 +144,24 @@ impl AiConfig {
     pub fn model(&self) -> &str {
         &self.model
     }
+
+    /// A stable provider key (`anthropic` / `openai` / `deepseek`) for the
+    /// usage ledger.
+    pub fn provider_name(&self) -> &'static str {
+        self.provider.name()
+    }
 }
 
 impl Provider {
+    /// A stable lowercase name for logs and the usage ledger.
+    fn name(self) -> &'static str {
+        match self {
+            Provider::Anthropic => "anthropic",
+            Provider::OpenAi => "openai",
+            Provider::DeepSeek => "deepseek",
+        }
+    }
+
     /// The official API root for this provider, used when the user has not
     /// set a custom base URL.
     fn default_base_url(self) -> &'static str {
@@ -167,6 +182,35 @@ impl Provider {
     }
 }
 
+/// Token counts for one chat completion, captured from the provider's own
+/// usage reporting (the final SSE frame for OpenAI-compatible endpoints, the
+/// `message_start` / `message_delta` events for Anthropic). Zero when a
+/// provider does not report usage — a local or free-tier endpoint often omits
+/// it. Used for AI usage accounting / estimated cost.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    /// Portion of `completion_tokens` spent on chain-of-thought reasoning
+    /// (DeepSeek-style `completion_tokens_details.reasoning_tokens`). Zero when
+    /// the provider does not break it out.
+    pub reasoning_tokens: u64,
+}
+
+impl std::ops::AddAssign for TokenUsage {
+    fn add_assign(&mut self, rhs: Self) {
+        self.prompt_tokens += rhs.prompt_tokens;
+        self.completion_tokens += rhs.completion_tokens;
+        self.reasoning_tokens += rhs.reasoning_tokens;
+    }
+}
+
+impl TokenUsage {
+    pub fn is_empty(self) -> bool {
+        self.prompt_tokens == 0 && self.completion_tokens == 0
+    }
+}
+
 /// The result of a streamed chat completion.
 pub struct ChatOutcome {
     /// The accumulated response text.
@@ -175,6 +219,8 @@ pub struct ChatOutcome {
     /// the channel mid-stream (the user closed the AI panel) — the text is then
     /// a truncated fragment that callers must not persist as a finished result.
     pub completed: bool,
+    /// Provider-reported token usage, when available.
+    pub usage: TokenUsage,
 }
 
 /// Stream a single-turn chat completion, forwarding each token to `sink`.
@@ -199,24 +245,23 @@ pub async fn stream_chat(
     }
 }
 
-/// Run a completion to the end and return its full text WITHOUT forwarding
-/// per-token deltas anywhere. Translation and the agent CLI use this when they
-/// only want the final string.
+/// Run a completion to the end and return its outcome WITHOUT forwarding
+/// per-token deltas anywhere. Translation and auto-tagging use this when they
+/// only want the final text (plus the token usage for accounting).
 pub async fn complete_chat(
     client: &Client,
     cfg: &AiConfig,
     system: &str,
     user: &str,
     max_tokens: u32,
-) -> AppResult<String> {
+) -> AppResult<ChatOutcome> {
     // A sink that discards deltas; `consume_sse` still accumulates the full text.
     let mut discard = |_: &str| true;
-    let outcome = if cfg.provider.is_openai_compatible() {
+    if cfg.provider.is_openai_compatible() {
         stream_openai(client, cfg, system, user, &mut discard, max_tokens).await
     } else {
         stream_anthropic(client, cfg, system, user, &mut discard, max_tokens).await
-    }?;
-    Ok(outcome.text)
+    }
 }
 
 async fn stream_anthropic(
@@ -286,12 +331,14 @@ enum LineOutcome {
 }
 
 /// Process a single SSE line: pull the `data:` payload, surface any provider
-/// error, and forward a text delta to `channel` (appending it to `full`).
+/// error, forward a text delta to `channel` (appending it to `full`), and
+/// accumulate provider-reported token usage.
 fn handle_sse_line(
     line: &str,
     provider: Provider,
     full: &mut String,
     sink: &mut DeltaSink<'_>,
+    usage: &mut TokenUsage,
 ) -> AppResult<LineOutcome> {
     let Some(data) = line.trim().strip_prefix("data:") else {
         return Ok(LineOutcome::Continue);
@@ -308,6 +355,9 @@ fn handle_sse_line(
     // ending the generation silently with a truncated summary.
     if let Some(msg) = extract_error(&value, provider) {
         return Err(AppError::other(format!("AI stream error: {msg}")));
+    }
+    if let Some(u) = extract_usage(&value, provider) {
+        *usage += u;
     }
     if let Some(text) = extract_delta(&value, provider) {
         full.push_str(&text);
@@ -333,6 +383,7 @@ async fn consume_sse(
 
     let mut buf: Vec<u8> = Vec::new();
     let mut full = String::new();
+    let mut usage = TokenUsage::default();
 
     while let Some(chunk) = resp.chunk().await? {
         buf.extend_from_slice(&chunk);
@@ -347,10 +398,10 @@ async fn consume_sse(
         while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
             let raw: Vec<u8> = buf.drain(..=pos).collect();
             let line = String::from_utf8_lossy(&raw);
-            match handle_sse_line(&line, provider, &mut full, &mut *sink)? {
+            match handle_sse_line(&line, provider, &mut full, &mut *sink, &mut usage)? {
                 LineOutcome::Continue => {}
                 LineOutcome::ChannelClosed => {
-                    return Ok(ChatOutcome { text: full, completed: false });
+                    return Ok(ChatOutcome { text: full, completed: false, usage });
                 }
             }
         }
@@ -363,14 +414,14 @@ async fn consume_sse(
     // response — would be left unprocessed in `buf` and silently dropped.
     if !buf.is_empty() {
         let line = String::from_utf8_lossy(&buf);
-        match handle_sse_line(&line, provider, &mut full, &mut *sink)? {
+        match handle_sse_line(&line, provider, &mut full, &mut *sink, &mut usage)? {
             LineOutcome::Continue => {}
             LineOutcome::ChannelClosed => {
-                return Ok(ChatOutcome { text: full, completed: false });
+                return Ok(ChatOutcome { text: full, completed: false, usage });
             }
         }
     }
-    Ok(ChatOutcome { text: full, completed: true })
+    Ok(ChatOutcome { text: full, completed: true, usage })
 }
 
 /// Detect a provider error object carried inside an SSE data frame.
@@ -404,18 +455,83 @@ fn extract_delta(v: &Value, provider: Provider) -> Option<String> {
             } else {
                 None
             }
-        }
-        // DeepSeek shares the OpenAI SSE shape; see the note in `extract_error`.
+        }        // DeepSeek shares the OpenAI SSE shape; see the note in `extract_error`.
         Provider::OpenAi | Provider::DeepSeek => v["choices"][0]["delta"]["content"]
             .as_str()
             .map(String::from),
     }
 }
 
+/// Extract provider-reported token usage from a data frame, if present.
+///
+/// OpenAI-compatible endpoints send usage on a final chunk (the local DeepSeek
+/// proxy does; DeepSeek's hosted API does too, carrying
+/// `completion_tokens_details.reasoning_tokens`). Anthropic reports
+/// `input_tokens` on `message_start` and `output_tokens` on `message_delta`,
+/// so the totals here are only final once the stream closes.
+fn extract_usage(v: &Value, provider: Provider) -> Option<TokenUsage> {
+    match provider {
+        Provider::Anthropic => match v["type"].as_str() {
+            Some("message_start") => Some(TokenUsage {
+                prompt_tokens: v["message"]["usage"]["input_tokens"].as_u64().unwrap_or(0),
+                ..TokenUsage::default()
+            }),
+            Some("message_delta") => Some(TokenUsage {
+                completion_tokens: v["usage"]["output_tokens"].as_u64().unwrap_or(0),
+                ..TokenUsage::default()
+            }),
+            _ => None,
+        },
+        Provider::OpenAi | Provider::DeepSeek => {
+            let usage = v.get("usage")?;
+            let completion = usage["completion_tokens"].as_u64().unwrap_or(0);
+            let usage = TokenUsage {
+                prompt_tokens: usage["prompt_tokens"].as_u64().unwrap_or(0),
+                completion_tokens: completion,
+                reasoning_tokens: usage["completion_tokens_details"]["reasoning_tokens"]
+                    .as_u64()
+                    .unwrap_or(0),
+            };
+            (!usage.is_empty()).then_some(usage)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{extract_delta, extract_error, Provider};
+    use super::{extract_delta, extract_error, extract_usage, TokenUsage, Provider};
     use serde_json::json;
+
+    #[test]
+    fn openai_usage_is_extracted_from_final_chunk() {
+        let chunk = json!({
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 120,
+                "completion_tokens": 45,
+                "completion_tokens_details": { "reasoning_tokens": 30 }
+            }
+        });
+        assert_eq!(
+            extract_usage(&chunk, Provider::DeepSeek),
+            Some(TokenUsage { prompt_tokens: 120, completion_tokens: 45, reasoning_tokens: 30 })
+        );
+    }
+
+    #[test]
+    fn openai_chunk_without_usage_reports_none() {
+        let chunk = json!({ "choices": [{ "delta": { "content": "hi" } }] });
+        assert_eq!(extract_usage(&chunk, Provider::OpenAi), None);
+    }
+
+    #[test]
+    fn anthropic_usage_spans_start_and_delta() {
+        let start = json!({ "type": "message_start", "message": { "usage": { "input_tokens": 88 } } });
+        let delta = json!({ "type": "message_delta", "usage": { "output_tokens": 12 } });
+        let mut usage = extract_usage(&start, Provider::Anthropic).unwrap();
+        usage += extract_usage(&delta, Provider::Anthropic).unwrap();
+        assert_eq!(usage, TokenUsage { prompt_tokens: 88, completion_tokens: 12, reasoning_tokens: 0 });
+    }
 
     #[test]
     fn openai_null_error_field_is_not_an_error() {
@@ -497,8 +613,9 @@ mod tests {
         let mut got = Vec::new();
         let mut full = String::new();
         let line = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n";
-        let out = handle_sse_line(line, Provider::OpenAi, &mut full, &mut recording_sink(&mut got))
-            .unwrap();
+        let out =
+            handle_sse_line(line, Provider::OpenAi, &mut full, &mut recording_sink(&mut got), &mut TokenUsage::default())
+                .unwrap();
         assert!(matches!(out, LineOutcome::Continue));
         assert_eq!(full, "hi");
         assert_eq!(got, vec!["hi"]);
@@ -509,8 +626,14 @@ mod tests {
         let mut got = Vec::new();
         let mut full = String::new();
         for line in [": keep-alive comment\n", "data: [DONE]\n", "\n"] {
-            handle_sse_line(line, Provider::OpenAi, &mut full, &mut recording_sink(&mut got))
-                .unwrap();
+            handle_sse_line(
+                line,
+                Provider::OpenAi,
+                &mut full,
+                &mut recording_sink(&mut got),
+                &mut TokenUsage::default(),
+            )
+            .unwrap();
         }
         assert!(full.is_empty());
         assert!(got.is_empty());
@@ -520,8 +643,14 @@ mod tests {
     fn sse_line_surfaces_a_mid_stream_error() {
         let mut full = String::new();
         let line = "data: {\"error\":{\"message\":\"rate limited\"}}\n";
-        let err = handle_sse_line(line, Provider::OpenAi, &mut full, &mut |_: &str| true)
-            .unwrap_err();
+        let err = handle_sse_line(
+            line,
+            Provider::OpenAi,
+            &mut full,
+            &mut |_: &str| true,
+            &mut TokenUsage::default(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("rate limited"));
     }
 
@@ -530,7 +659,14 @@ mod tests {
         // A sink returning `false` (the consumer went away) must stop the stream.
         let mut full = String::new();
         let line = "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n";
-        let out = handle_sse_line(line, Provider::OpenAi, &mut full, &mut |_: &str| false).unwrap();
+        let out = handle_sse_line(
+            line,
+            Provider::OpenAi,
+            &mut full,
+            &mut |_: &str| false,
+            &mut TokenUsage::default(),
+        )
+        .unwrap();
         assert!(matches!(out, LineOutcome::ChannelClosed));
     }
 
@@ -543,7 +679,14 @@ mod tests {
         let mut got = Vec::new();
         let mut full = String::new();
         let last = "data: {\"choices\":[{\"delta\":{\"content\":\"!\"}}]}";
-        handle_sse_line(last, Provider::OpenAi, &mut full, &mut recording_sink(&mut got)).unwrap();
+        handle_sse_line(
+            last,
+            Provider::OpenAi,
+            &mut full,
+            &mut recording_sink(&mut got),
+            &mut TokenUsage::default(),
+        )
+        .unwrap();
         assert_eq!(full, "!");
         assert_eq!(got, vec!["!"]);
     }

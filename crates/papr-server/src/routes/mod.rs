@@ -67,6 +67,7 @@ pub fn api_router() -> Router<AppState> {
         .route("/api/ai/ask", post(ai::ask))
         .route("/api/ai/digest", post(ai::digest))
         .route("/api/ai/translate", post(ai::translate))
+        .route("/api/ai/usage", get(ai::usage))
         .route("/api/smart-counts", get(articles::smart_counts))
         // OPML
         .route("/api/opml/import", post(opml::import))
@@ -108,6 +109,10 @@ pub fn api_router() -> Router<AppState> {
         .route("/api/feed-sources/scan", post(feed_sources::scan_all))
         // wordcloud
         .route("/api/wordcloud", get(wordcloud::get))
+        .route("/api/wordcloud/stopwords", get(wordcloud::get_stopwords))
+        .route("/api/wordcloud/entities", get(wordcloud::get_entities))
+        .route("/api/wordcloud/status", get(wordcloud::status))
+        .route("/api/wordcloud/backfill", post(wordcloud::backfill))
         // highlights
         .route("/api/highlights", get(highlights::list).post(highlights::create))
         .route(
@@ -116,9 +121,10 @@ pub fn api_router() -> Router<AppState> {
         )
         // misc
         .route("/api/fetch-image", get(misc::fetch_image))
-        .route("/api/stats/daily", get(misc::daily_stats))
         .route("/api/storage/stats", get(misc::storage_stats))
         .route("/api/storage/cleanup", post(misc::cleanup))
         .route("/api/storage/vacuum", post(misc::vacuum))
+        .route("/api/storage/clear", post(misc::clear_all_data))
+        .route("/api/storage/reset-settings", post(misc::reset_settings))
         .route("/api/health", get(misc::health))
 }

@@ -33,27 +33,6 @@ pub async fn storage_stats(
 }
 
 #[derive(Deserialize)]
-pub struct DailyStatsQuery {
-    pub days: Option<i64>,
-}
-
-/// `GET /api/stats/daily?days=30` → `[{ date, count }, …]` for the heatmap.
-pub async fn daily_stats(
-    State(state): State<AppState>,
-    _user: AuthUser,
-    Query(q): Query<DailyStatsQuery>,
-) -> ApiResult<Json<Value>> {
-    let days = q.days.unwrap_or(30).clamp(1, 366);
-    let conn = state.db.lock().await;
-    let rows = db::daily_article_counts(&conn, days).map_err(ApiError::from)?;
-    let out: Vec<Value> = rows
-        .into_iter()
-        .map(|(date, count)| json!({ "date": date, "count": count }))
-        .collect();
-    Ok(Json(json!(out)))
-}
-
-#[derive(Deserialize)]
 pub struct CleanupBody {
     pub days: i64,
 }
@@ -76,6 +55,28 @@ pub async fn vacuum(
     user.require_admin()?;
     let conn = state.db.lock().await;
     conn.execute_batch("VACUUM").map_err(|e| ApiError::from(papr_core::error::AppError::from(e)))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Wipe all feeds (articles cascade), folders. Settings are kept.
+pub async fn clear_all_data(
+    State(state): State<AppState>,
+    user: AuthUser,
+) -> ApiResult<Json<Value>> {
+    user.require_admin()?;
+    let conn = state.db.lock().await;
+    db::clear_all_data(&conn).map_err(ApiError::from)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Clear every stored setting row. UI prefs in localStorage are cleared by the client.
+pub async fn reset_settings(
+    State(state): State<AppState>,
+    user: AuthUser,
+) -> ApiResult<Json<Value>> {
+    user.require_admin()?;
+    let conn = state.db.lock().await;
+    db::reset_settings(&conn).map_err(ApiError::from)?;
     Ok(Json(json!({ "ok": true })))
 }
 

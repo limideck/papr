@@ -12,11 +12,14 @@ import { modKey, modCombo } from "../lib/platform";
 import { reportError } from "../toast";
 import { downloadFile } from "../lib/download";
 import { NO_AUTOCORRECT } from "../lib/inputProps";
-import type { Feed, Rule, RuleAction, RuleField, RulePreview } from "../types";
+import type { Feed, Rule, RuleAction, RuleField, RulePreview, Tag } from "../types";
+import { tagColor, TAG_PALETTE } from "../lib/tagColors";
 import Icon, { type IconName } from "./Icon";
 import ConfirmDialog from "./ConfirmDialog";
+import PromptDialog from "./PromptDialog";
 import FeedAvatar from "./FeedAvatar";
 import FeedSourcesAdmin from "./FeedSourcesAdmin";
+import WordCloudConfigAdmin from "./WordCloudConfigAdmin";
 
 interface Props {
   onClose: () => void;
@@ -43,6 +46,7 @@ const BASE_SECTIONS: { id: string; labelKey: string; icon: IconName }[] = [
 
 const ADMIN_SECTIONS: { id: string; labelKey: string; icon: IconName }[] = [
   { id: "feedSources", labelKey: "settings.nav.feedSources", icon: "globe" },
+  { id: "wordcloud", labelKey: "settings.nav.wordcloud", icon: "sparkle" },
   { id: "users", labelKey: "settings.nav.users", icon: "star" },
   { id: "autoTag", labelKey: "settings.nav.autoTag", icon: "tag" },
 ];
@@ -106,6 +110,7 @@ export default function SettingsDialog({
     reading: t("settings.sub.reading"),
     subscriptions: t("settings.sub.subscriptions", { count: feedCount }),
     feedSources: t("settings.sub.feedSources"),
+    wordcloud: t("settings.sub.wordcloud"),
     users: t("settings.sub.users"),
     autoTag: t("settings.sub.autoTag"),
     filters: t("settings.sub.filters"),
@@ -178,7 +183,9 @@ export default function SettingsDialog({
           </button>
 
           <div className="settings-scroll">
-            {section === "general" && <GeneralSection isAdmin={isAdmin} />}
+            {section === "general" && (
+              <GeneralSection isAdmin={isAdmin} onToast={onToast} />
+            )}
             {section === "appearance" && <AppearanceSection />}
             {section === "reading" && <ReadingSection />}
             {section === "subscriptions" && (
@@ -190,6 +197,7 @@ export default function SettingsDialog({
               />
             )}
             {section === "feedSources" && isAdmin && <FeedSourcesAdmin />}
+            {section === "wordcloud" && isAdmin && <WordCloudConfigAdmin />}
             {section === "users" && isAdmin && (
               <UsersSection onToast={onToast} />
             )}
@@ -450,8 +458,104 @@ function clampSetting(raw: string | null, fallback: number, min: number, max: nu
   return Math.min(max, Math.max(min, n));
 }
 
-function GeneralSection({ isAdmin }: { isAdmin: boolean }) {
+/* ── change own password (any logged-in user) ─────────────── */
+function ChangePasswordGroup({ onToast }: { onToast: (m: string) => void }) {
   const { t } = useTranslation();
+  const [oldPassword, setOldPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const canSubmit =
+    oldPassword.length > 0 &&
+    newPassword.length >= 6 &&
+    newPassword === confirmPassword &&
+    !busy;
+
+  const submit = async () => {
+    if (!canSubmit) return;
+    if (newPassword !== confirmPassword) {
+      onToast(t("settings.general.passwordMismatch"));
+      return;
+    }
+    if (newPassword.length < 6) {
+      onToast(t("error.passwordTooShort"));
+      return;
+    }
+    setBusy(true);
+    try {
+      await api.changePassword(oldPassword, newPassword);
+      setOldPassword("");
+      setNewPassword("");
+      setConfirmPassword("");
+      onToast(t("settings.general.passwordChanged"));
+    } catch (e) {
+      reportError(e);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="settings-group">
+      <h3 className="settings-group-title">{t("settings.general.account")}</h3>
+      <p className="settings-group-desc">{t("settings.general.changePasswordDesc")}</p>
+      <Row label={t("settings.general.currentPassword")}>
+        <input
+          className="s-text-input"
+          type="password"
+          value={oldPassword}
+          onChange={(e) => setOldPassword(e.target.value)}
+          autoComplete="current-password"
+        />
+      </Row>
+      <Row
+        label={t("settings.general.newPassword")}
+        desc={t("settings.general.newPasswordDesc")}
+      >
+        <input
+          className="s-text-input"
+          type="password"
+          value={newPassword}
+          onChange={(e) => setNewPassword(e.target.value)}
+          autoComplete="new-password"
+        />
+      </Row>
+      <Row label={t("settings.general.confirmPassword")}>
+        <input
+          className="s-text-input"
+          type="password"
+          value={confirmPassword}
+          onChange={(e) => setConfirmPassword(e.target.value)}
+          autoComplete="new-password"
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && canSubmit) void submit();
+          }}
+        />
+      </Row>
+      <div style={{ display: "flex", justifyContent: "flex-end", padding: "8px 0" }}>
+        <button
+          className="s-btn primary"
+          type="button"
+          disabled={!canSubmit}
+          onClick={() => void submit()}
+        >
+          {t("settings.general.savePassword")}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function GeneralSection({
+  isAdmin,
+  onToast,
+}: {
+  isAdmin: boolean;
+  onToast: (m: string) => void;
+}) {
+  const { t } = useTranslation();
+  const { user } = useAuth();
   const prefs = useUi((s) => s.prefs);
   const setPref = useUi((s) => s.setPref);
   const [autoRefresh, setAutoRefresh] = useState(true);
@@ -484,6 +588,7 @@ function GeneralSection({ isAdmin }: { isAdmin: boolean }) {
 
   return (
     <>
+      {user && <ChangePasswordGroup onToast={onToast} />}
       {isAdmin && (
       <div className="settings-group">
         <h3 className="settings-group-title">{t("settings.general.refresh")}</h3>
@@ -819,14 +924,6 @@ function SubscriptionsSection({
       .then(() => qc.invalidateQueries({ queryKey: ["feeds"] }))
       .catch((e) => reportError(e));
   };
-  // Per-feed auto-translate: opening an article from a feed with this on
-  // translates it into the configured target language straight away.
-  const updateAutoTranslate = (f: Feed, enabled: boolean) => {
-    api
-      .setFeedAutoTranslate(f.id, enabled)
-      .then(() => qc.invalidateQueries({ queryKey: ["feeds"] }))
-      .catch((e) => reportError(e));
-  };
   // Per-feed open mode (issue #110): how the feed's articles open in the
   // reader pane. "default" ⇒ null (reader view, honouring the global
   // auto-extract preference).
@@ -952,17 +1049,6 @@ function SubscriptionsSection({
               <span className="url">{feedHost(f)}</span>
               {isAdmin && (
               <div className="actions">
-                <label
-                  className="s-feed-autotr"
-                  title={t("settings.subscriptions.autoTranslateDesc")}
-                >
-                  <Icon name="globe" size={13} color="var(--muted)" />
-                  <Toggle
-                    checked={f.autoTranslate}
-                    onChange={(v) => updateAutoTranslate(f, v)}
-                    aria-label={t("settings.subscriptions.autoTranslate")}
-                  />
-                </label>
                 <Select
                   value={f.openMode ?? "default"}
                   options={openModeOptions}
@@ -1385,6 +1471,7 @@ function AdvancedSection({
   return (
     <>
       <AiSettingsGroup onToast={onToast} />
+      <AiUsageGroup />
       <StorageGroup onToast={onToast} />
       <NetworkGroup onToast={onToast} />
       <div className="settings-group">
@@ -1634,6 +1721,7 @@ function DangerZone({ onToast }: { onToast: (m: string) => void }) {
             "useSerif", "readerSize", "readerLeading", "readerWidth",
             "collapsedFolders",
             "papr.feedSort",
+            "papr.tagSort",
           ].includes(k)
         ) {
           localStorage.removeItem(k);
@@ -1921,6 +2009,151 @@ function AiSettingsGroup({ onToast }: { onToast: (m: string) => void }) {
   );
 }
 
+/** AI usage ledger — tokens spent per feature over a window + estimated cost. */
+function AiUsageGroup() {
+  const { t } = useTranslation();
+  const [days, setDays] = useState(30);
+  const report = useQuery({
+    queryKey: ["ai-usage", days],
+    queryFn: () => api.aiUsage(days),
+  });
+
+  const fmt = (n: number) => n.toLocaleString();
+  const total = report.data?.total;
+  const cost = report.data?.estimatedCost ?? 0;
+
+  return (
+    <div className="settings-group">
+      <h3 className="settings-group-title">{t("settings.advanced.aiUsage")}</h3>
+      <Row
+        label={t("settings.advanced.aiUsageWindow")}
+        desc={t("settings.advanced.aiUsageWindowDesc")}
+      >
+        <Select
+          value={String(days)}
+          options={[
+            { value: "7", label: "7" },
+            { value: "30", label: "30" },
+            { value: "90", label: "90" },
+          ]}
+          aria-label={t("settings.advanced.aiUsageWindow")}
+          onChange={(v) => setDays(Number(v))}
+        />
+      </Row>
+
+      {report.isLoading ? (
+        <p className="settings-group-desc">{t("common.loading")}</p>
+      ) : total ? (
+        <>
+          <Row
+            label={t("settings.advanced.aiUsageCalls")}
+            desc={t("settings.advanced.aiUsageCallsDesc", { days })}
+          >
+            <span className="s-value">{fmt(total.calls)}</span>
+          </Row>
+          <Row label={t("settings.advanced.aiUsagePrompt")}>
+            <span className="s-value">{fmt(total.promptTokens)}</span>
+          </Row>
+          <Row label={t("settings.advanced.aiUsageCompletion")}>
+            <span className="s-value">{fmt(total.completionTokens)}</span>
+          </Row>
+          <Row label={t("settings.advanced.aiUsageReasoning")}>
+            <span className="s-value">{fmt(total.reasoningTokens)}</span>
+          </Row>
+          <Row
+            label={t("settings.advanced.aiUsageCost")}
+            desc={t("settings.advanced.aiUsageCostDesc")}
+          >
+            <span className="s-value">${cost.toFixed(4)}</span>
+          </Row>
+
+          {report.data!.byFeature.length > 0 && (
+            <div className="settings-group-desc" style={{ paddingTop: 6 }}>
+              {report.data!.byFeature.map((r) => (
+                <div
+                  key={r.feature}
+                  style={{ display: "flex", justifyContent: "space-between", gap: 12 }}
+                >
+                  <span>{t(`settings.advanced.aiFeature.${r.feature}`, {
+                    defaultValue: r.feature,
+                  })}</span>
+                  <span style={{ fontVariantNumeric: "tabular-nums" }}>
+                    {fmt(r.calls)} · {fmt(r.promptTokens + r.completionTokens)}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+          <AiPriceInputs onChanged={() => report.refetch()} />
+        </>
+      ) : (
+        <p className="settings-group-desc">{t("settings.advanced.aiUsageEmpty")}</p>
+      )}
+    </div>
+  );
+}
+
+/** Per-million-token price inputs (USD) used to estimate AI cost. */
+function AiPriceInputs({ onChanged }: { onChanged: () => void }) {
+  const { t } = useTranslation();
+  const [prices, setPrices] = useState<Record<string, string>>({});
+
+  useEffect(() => {
+    Promise.all([
+      api.getSetting("ai_price_input_per_m"),
+      api.getSetting("ai_price_output_per_m"),
+      api.getSetting("ai_price_reasoning_per_m"),
+    ]).then(([i, o, r]) => {
+      setPrices({
+        input: i || "0",
+        output: o || "0",
+        reasoning: r || "0",
+      });
+    });
+  }, []);
+
+  const blur = (key: "input" | "output" | "reasoning") => {
+    const v = prices[key];
+    api
+      .setSetting(
+        key === "input"
+          ? "ai_price_input_per_m"
+          : key === "output"
+            ? "ai_price_output_per_m"
+            : "ai_price_reasoning_per_m",
+        /^\d+(\.\d+)?$/.test(v) ? v : "0",
+      )
+      .then(onChanged)
+      .catch((e) => reportError(e));
+  };
+
+  const input = (
+    labelKey: string,
+    key: "input" | "output" | "reasoning",
+    ph: string,
+  ) => (
+    <Row label={t(labelKey)} desc={t("settings.advanced.aiPricePerM")}>
+      <input
+        className="s-text-input"
+        type="text"
+        inputMode="decimal"
+        placeholder={ph}
+        value={prices[key] ?? ""}
+        onChange={(e) => setPrices({ ...prices, [key]: e.target.value })}
+        onBlur={() => blur(key)}
+      />
+    </Row>
+  );
+
+  return (
+    <>
+      {input("settings.advanced.aiPriceInput", "input", "0.27")}
+      {input("settings.advanced.aiPriceOutput", "output", "1.10")}
+      {input("settings.advanced.aiPriceReasoning", "reasoning", "0.0")}
+    </>
+  );
+}
+
 /* ── users (admin) ───────────────────────────────────────── */
 function UsersSection({ onToast }: { onToast: (m: string) => void }) {
   const { t } = useTranslation();
@@ -2137,15 +2370,26 @@ function UsersSection({ onToast }: { onToast: (m: string) => void }) {
   );
 }
 
-/* ── auto-tag (admin) ────────────────────────────────────── */
+/* ── tag management: AI tags | interest tags (admin) ─────── */
 function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
   const { t } = useTranslation();
-  const [enabled, setEnabled] = useState(false);
-  const [maxNew, setMaxNew] = useState(3);
-  const [maxTotal, setMaxTotal] = useState(5);
+  const qc = useQueryClient();
+  const [tab, setTab] = useState<"ai" | "interest">("ai");
+  const [interestEnabled, setInterestEnabled] = useState(false);
+  const [aiEnabled, setAiEnabled] = useState(false);
+  const [interestMax, setInterestMax] = useState(5);
+  const [aiMax, setAiMax] = useState(5);
   const [backfillDays, setBackfillDays] = useState(7);
   const [backfillBusy, setBackfillBusy] = useState(false);
   const [statusError, setStatusError] = useState(false);
+  const [prompt, setPrompt] = useState<{
+    title: string;
+    initial: string;
+    onSubmit: (v: string) => void;
+  } | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<Tag | null>(null);
+
+  const tags = useQuery({ queryKey: ["tags"], queryFn: () => api.listTags() });
 
   const status = useQuery({
     queryKey: ["auto-tag-status"],
@@ -2162,31 +2406,88 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
   useEffect(() => {
     Promise.all([
       api.getSetting("auto_tag_enabled"),
-      api.getSetting("auto_tag_max_new_per_article"),
       api.getSetting("auto_tag_max_tags_per_article"),
+      api.getSetting("ai_tag_enabled"),
+      api.getSetting("ai_tag_max_tags_per_article"),
     ])
-      .then(([en, mn, mt]) => {
-        setEnabled(en === "1" || en === "true");
-        setMaxNew(clampSetting(mn, 3, 0, 20));
-        setMaxTotal(clampSetting(mt, 5, 1, 30));
+      .then(([interestEn, interestMt, aiEn, aiMt]) => {
+        setInterestEnabled(interestEn === "1" || interestEn === "true");
+        setInterestMax(clampSetting(interestMt, 5, 1, 30));
+        setAiEnabled(aiEn === "1" || aiEn === "true");
+        setAiMax(clampSetting(aiMt, 5, 1, 30));
       })
       .catch(() => {});
   }, []);
 
-  const saveFlag = (on: boolean) => {
-    setEnabled(on);
+  const refreshTags = () => {
+    void qc.invalidateQueries({ queryKey: ["tags"] });
+  };
+
+  const saveSetting = (key: string, value: string) => {
     api
-      .setSetting("auto_tag_enabled", on ? "1" : "0")
+      .setSetting(key, value)
       .then(() => onToast(t("settings.autoTag.saved")))
       .catch((e) => reportError(e));
   };
 
-  const saveNum = (key: string, value: number, apply: (n: number) => void) => {
-    apply(value);
+  const createInterestTag = () =>
+    setPrompt({
+      title: t("settings.autoTag.newTag"),
+      initial: "",
+      onSubmit: (v) => {
+        api
+          .createTag(v, "interest")
+          .then(() => {
+            refreshTags();
+            onToast(t("settings.autoTag.tagCreated"));
+          })
+          .catch((e) => reportError(e));
+      },
+    });
+
+  const renameTag = (tag: Tag) =>
+    setPrompt({
+      title:
+        tag.kind === "ai"
+          ? t("settings.autoTag.renameAiTag")
+          : t("settings.autoTag.renameTag"),
+      initial: tag.name,
+      onSubmit: (v) => {
+        api
+          .renameTag(tag.id, v)
+          .then(() => {
+            refreshTags();
+            onToast(
+              tag.kind === "ai"
+                ? t("settings.autoTag.aiTagRenamed")
+                : t("settings.autoTag.tagRenamed"),
+            );
+          })
+          .catch((e) => reportError(e));
+      },
+    });
+
+  const recolorTag = (tag: Tag, color: string) => {
     api
-      .setSetting(key, String(value))
-      .then(() => onToast(t("settings.autoTag.saved")))
+      .setTagColor(tag.id, color)
+      .then(() => refreshTags())
       .catch((e) => reportError(e));
+  };
+
+  const removeTag = async (tag: Tag) => {
+    try {
+      await api.deleteTag(tag.id);
+      refreshTags();
+      onToast(
+        tag.kind === "ai"
+          ? t("settings.autoTag.aiTagDeleted")
+          : t("settings.autoTag.tagDeleted"),
+      );
+    } catch (e) {
+      reportError(e);
+    } finally {
+      setConfirmDelete(null);
+    }
   };
 
   const runBackfill = async () => {
@@ -2211,62 +2512,212 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
   };
 
   const st = status.data;
+  const allTags = tags.data ?? [];
+  const interestList = allTags.filter(
+    (tg) => (tg.kind ?? "interest") === "interest",
+  );
+  const aiList = allTags.filter((tg) => tg.kind === "ai");
+
+  const renderTagRows = (list: Tag[], emptyKey: string, allowCreate: boolean) => (
+    <div className="settings-group">
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: 12,
+          marginBottom: 8,
+        }}
+      >
+        <div>
+          <h3 className="settings-group-title" style={{ margin: 0 }}>
+            {tab === "ai"
+              ? t("settings.autoTag.aiVocabulary")
+              : t("settings.autoTag.vocabulary")}
+          </h3>
+          <p className="settings-group-desc" style={{ margin: "4px 0 0" }}>
+            {tab === "ai"
+              ? t("settings.autoTag.aiVocabularyDesc")
+              : t("settings.autoTag.vocabularyDesc")}
+          </p>
+        </div>
+        {allowCreate && (
+          <button
+            className="s-btn primary"
+            type="button"
+            onClick={createInterestTag}
+          >
+            <Icon name="plus" size={12} /> {t("common.add")}
+          </button>
+        )}
+      </div>
+      {list.length === 0 ? (
+        <p className="settings-group-desc">{t(emptyKey)}</p>
+      ) : (
+        <div className="s-interest-tags">
+          {list.map((tag) => (
+            <div key={tag.id} className="s-interest-tag-row">
+              <span
+                className="s-interest-tag-dot"
+                style={{ background: tagColor(tag.color) }}
+                aria-hidden
+              />
+              <span className="s-interest-tag-name">{tag.name}</span>
+              <span className="s-interest-tag-count">
+                {t("settings.autoTag.articleCount", {
+                  count: tag.articleCount,
+                })}
+              </span>
+              <div className="s-interest-tag-swatches" role="group">
+                {Object.entries(TAG_PALETTE).map(([key, color]) => (
+                  <button
+                    key={key}
+                    type="button"
+                    className={`s-interest-tag-swatch ${
+                      tag.color === key ? "on" : ""
+                    }`}
+                    style={{ background: color }}
+                    title={key}
+                    aria-label={key}
+                    aria-pressed={tag.color === key}
+                    onClick={() => recolorTag(tag, key)}
+                  />
+                ))}
+              </div>
+              <button
+                className="icon-btn"
+                type="button"
+                title={
+                  tag.kind === "ai"
+                    ? t("settings.autoTag.renameAiTag")
+                    : t("settings.autoTag.renameTag")
+                }
+                onClick={() => renameTag(tag)}
+              >
+                <Icon name="settings" size={13} />
+              </button>
+              <button
+                className="icon-btn"
+                type="button"
+                title={t("common.delete")}
+                onClick={() => setConfirmDelete(tag)}
+              >
+                <Icon name="trash" size={13} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
 
   return (
     <>
-      <div className="settings-group">
-        <Row
-          label={t("settings.autoTag.enabled")}
-          desc={t("settings.autoTag.enabledDesc")}
+      <div className="s-tag-mgmt-tabs" role="tablist">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === "ai"}
+          className={tab === "ai" ? "on" : ""}
+          onClick={() => setTab("ai")}
         >
-          <Toggle checked={enabled} onChange={saveFlag} />
-        </Row>
-        <Row
-          label={t("settings.autoTag.maxNew")}
-          desc={t("settings.autoTag.maxNewDesc")}
+          {t("settings.autoTag.tabAi")}
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === "interest"}
+          className={tab === "interest" ? "on" : ""}
+          onClick={() => setTab("interest")}
         >
-          <input
-            className="s-text-input"
-            type="number"
-            min={0}
-            max={20}
-            value={maxNew}
-            onChange={(e) => setMaxNew(Number(e.target.value) || 0)}
-            onBlur={() =>
-              saveNum(
-                "auto_tag_max_new_per_article",
-                clampSetting(String(maxNew), 3, 0, 20),
-                setMaxNew,
-              )
-            }
-          />
-        </Row>
-        <Row
-          label={t("settings.autoTag.maxTotal")}
-          desc={t("settings.autoTag.maxTotalDesc")}
-        >
-          <input
-            className="s-text-input"
-            type="number"
-            min={1}
-            max={30}
-            value={maxTotal}
-            onChange={(e) => setMaxTotal(Number(e.target.value) || 1)}
-            onBlur={() =>
-              saveNum(
-                "auto_tag_max_tags_per_article",
-                clampSetting(String(maxTotal), 5, 1, 30),
-                setMaxTotal,
-              )
-            }
-          />
-        </Row>
+          {t("settings.autoTag.tabInterest")}
+        </button>
       </div>
+
+      {tab === "ai" ? (
+        <>
+          {renderTagRows(aiList, "settings.autoTag.aiVocabularyEmpty", false)}
+          <div className="settings-group">
+            <Row
+              label={t("settings.autoTag.aiEnabled")}
+              desc={t("settings.autoTag.aiEnabledDesc")}
+            >
+              <Toggle
+                checked={aiEnabled}
+                onChange={(on) => {
+                  setAiEnabled(on);
+                  saveSetting("ai_tag_enabled", on ? "1" : "0");
+                }}
+              />
+            </Row>
+            <Row
+              label={t("settings.autoTag.aiMaxTotal")}
+              desc={t("settings.autoTag.aiMaxTotalDesc")}
+            >
+              <input
+                className="s-text-input"
+                type="number"
+                min={1}
+                max={30}
+                value={aiMax}
+                onChange={(e) => setAiMax(Number(e.target.value) || 1)}
+                onBlur={() => {
+                  const v = clampSetting(String(aiMax), 5, 1, 30);
+                  setAiMax(v);
+                  saveSetting("ai_tag_max_tags_per_article", String(v));
+                }}
+              />
+            </Row>
+          </div>
+        </>
+      ) : (
+        <>
+          {renderTagRows(
+            interestList,
+            "settings.autoTag.vocabularyEmpty",
+            true,
+          )}
+          <div className="settings-group">
+            <Row
+              label={t("settings.autoTag.enabled")}
+              desc={t("settings.autoTag.enabledDesc")}
+            >
+              <Toggle
+                checked={interestEnabled}
+                onChange={(on) => {
+                  setInterestEnabled(on);
+                  saveSetting("auto_tag_enabled", on ? "1" : "0");
+                }}
+              />
+            </Row>
+            <Row
+              label={t("settings.autoTag.maxTotal")}
+              desc={t("settings.autoTag.maxTotalDesc")}
+            >
+              <input
+                className="s-text-input"
+                type="number"
+                min={1}
+                max={30}
+                value={interestMax}
+                onChange={(e) => setInterestMax(Number(e.target.value) || 1)}
+                onBlur={() => {
+                  const v = clampSetting(String(interestMax), 5, 1, 30);
+                  setInterestMax(v);
+                  saveSetting("auto_tag_max_tags_per_article", String(v));
+                }}
+              />
+            </Row>
+          </div>
+        </>
+      )}
 
       <div className="settings-group">
         <h3 className="settings-group-title">{t("settings.autoTag.queue")}</h3>
         {statusError || status.isError ? (
-          <p className="settings-group-desc">{t("settings.autoTag.queueUnavailable")}</p>
+          <p className="settings-group-desc">
+            {t("settings.autoTag.queueUnavailable")}
+          </p>
         ) : st ? (
           <>
             <div
@@ -2280,7 +2731,9 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
               }}
             >
               {st.pending != null && (
-                <span>{t("settings.autoTag.pending", { count: st.pending })}</span>
+                <span>
+                  {t("settings.autoTag.pending", { count: st.pending })}
+                </span>
               )}
               {st.processing != null && (
                 <span>
@@ -2288,7 +2741,9 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
                 </span>
               )}
               {st.failed != null && (
-                <span>{t("settings.autoTag.failed", { count: st.failed })}</span>
+                <span>
+                  {t("settings.autoTag.failed", { count: st.failed })}
+                </span>
               )}
               {st.done != null && (
                 <span>{t("settings.autoTag.done", { count: st.done })}</span>
@@ -2296,7 +2751,10 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
             </div>
             {st.lastError && (
               <Row label={t("settings.autoTag.lastError")}>
-                <span className="s-value" style={{ maxWidth: 280, textAlign: "right" }}>
+                <span
+                  className="s-value"
+                  style={{ maxWidth: 280, textAlign: "right" }}
+                >
                   {st.lastError}
                 </span>
               </Row>
@@ -2309,7 +2767,9 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
 
       <div className="settings-group">
         <h3 className="settings-group-title">{t("settings.autoTag.backfill")}</h3>
-        <p className="settings-group-desc">{t("settings.autoTag.backfillDesc")}</p>
+        <p className="settings-group-desc">
+          {t("settings.autoTag.backfillDesc")}
+        </p>
         <Row label={t("settings.autoTag.backfillDays")}>
           <input
             className="s-text-input"
@@ -2322,7 +2782,9 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
             }
           />
         </Row>
-        <div style={{ display: "flex", justifyContent: "flex-end", paddingTop: 8 }}>
+        <div
+          style={{ display: "flex", justifyContent: "flex-end", paddingTop: 8 }}
+        >
           <button
             className="s-btn primary"
             type="button"
@@ -2333,6 +2795,38 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
           </button>
         </div>
       </div>
+
+      {prompt && (
+        <PromptDialog
+          title={prompt.title}
+          initialValue={prompt.initial}
+          placeholder={t("settings.autoTag.tagPlaceholder")}
+          onSubmit={(v) => {
+            prompt.onSubmit(v);
+            setPrompt(null);
+          }}
+          onClose={() => setPrompt(null)}
+        />
+      )}
+      {confirmDelete && (
+        <ConfirmDialog
+          title={
+            confirmDelete.kind === "ai"
+              ? t("settings.autoTag.deleteAiTag")
+              : t("settings.autoTag.deleteTag")
+          }
+          message={t(
+            confirmDelete.kind === "ai"
+              ? "settings.autoTag.deleteAiConfirm"
+              : "settings.autoTag.deleteConfirm",
+            { name: confirmDelete.name },
+          )}
+          confirmLabel={t("common.delete")}
+          danger
+          onConfirm={() => void removeTag(confirmDelete)}
+          onClose={() => setConfirmDelete(null)}
+        />
+      )}
     </>
   );
 }

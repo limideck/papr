@@ -3,13 +3,21 @@
 //! English words (`[a-z0-9]{2,}`) plus overlapping CJK bigrams, with a shared
 //! stopword list. Ported in spirit from FeedOverflow's Go wordcloud package —
 //! rewritten in Rust, not linked to Go.
+//!
+//! Hot path: terms are tokenized once at ingest into `article_terms`, then the
+//! API aggregates with SQL over a calendar-day window. Mid-migration / empty
+//! windows fall back to the legacy scan+tokenize path.
 
-use chrono::{Local, NaiveDate, TimeZone};
+use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, TimeZone};
 use regex::Regex;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
+
+use crate::error::AppResult;
+use crate::wordcloud_dict::{self, EntityGroup, WordCloudDict};
 
 /// Default number of terms returned in the cloud (not articles scanned).
 pub const DEFAULT_TOP_N: usize = 100;
@@ -21,6 +29,20 @@ pub const MAX_TOP_N: usize = 120;
 pub const MAX_SCAN_ROWS: i64 = 100_000;
 pub const MAX_SUMMARY_RUN: usize = 400;
 
+/// Settings key: monotonically increasing version bumped when the shared
+/// stopwords/entities dictionary is reloaded. Articles whose
+/// `article_term_index.dict_version` lags need a backfill rebuild.
+pub const DICT_VERSION_KEY: &str = "wordcloud_terms_dict_version";
+/// Last seen `stopwords.version:entities.version` fingerprint from the shared
+/// JSON files — used to bump [`DICT_VERSION_KEY`] only when files change.
+pub const DICT_FILE_VERSION_KEY: &str = "wordcloud_dict_file_version";
+
+/// Batch size for backfill workers (fetch → tokenize off-lock → write).
+pub const BACKFILL_BATCH: usize = 64;
+
+/// TTL for in-process preset cloud cache (1/3/7 day windows).
+const PRESET_CACHE_TTL: Duration = Duration::from_secs(45);
+
 static EN_WORD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[a-z0-9]{2,}").unwrap());
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -28,12 +50,22 @@ static EN_WORD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[a-z0-9]{2,}"
 pub struct Term {
     pub term: String,
     pub count: i64,
+    /// Entity/category group for colouring (`country`, `person`, …).
+    pub group: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct TextSnippet {
     pub title: String,
     pub summary: String,
+}
+
+/// One weighted term extracted from a single article snippet.
+#[derive(Debug, Clone)]
+pub struct ExtractedTerm {
+    pub term: String,
+    pub group: String,
+    pub weight: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -54,10 +86,28 @@ pub struct Range {
 #[serde(rename_all = "camelCase")]
 pub struct CloudResult {
     pub terms: Vec<Term>,
-    /// Number of article rows actually loaded and tokenized for this range
-    /// (not the term count). May be less than the true match count only when
+    /// Number of article rows actually used for this range (not the term
+    /// count). May be less than the true match count only when
     /// [`MAX_SCAN_ROWS`] is hit.
     pub scanned: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackfillStatus {
+    pub dict_version: i64,
+    pub indexed: i64,
+    pub stale: i64,
+    pub missing: i64,
+    pub total_articles: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackfillBatchResult {
+    pub processed: usize,
+    pub remaining: i64,
+    pub dict_version: i64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -72,12 +122,67 @@ pub enum RangeError {
     RangeTooLong,
 }
 
+// ─── preset TTL cache ───────────────────────────────────────────────────
+
+#[derive(Clone)]
+struct CacheEntry {
+    at: Instant,
+    from: String,
+    to: String,
+    result: CloudResult,
+}
+
+static PRESET_CACHE: LazyLock<Mutex<HashMap<(i32, usize), CacheEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Drop all cached preset clouds (call after dict reload or backfill write).
+pub fn invalidate_cache() {
+    if let Ok(mut guard) = PRESET_CACHE.lock() {
+        guard.clear();
+    }
+}
+
+fn cache_get(days: i32, top_n: usize) -> Option<(String, String, CloudResult)> {
+    if !matches!(days, 1 | 3 | 7) {
+        return None;
+    }
+    let guard = PRESET_CACHE.lock().ok()?;
+    let entry = guard.get(&(days, top_n))?;
+    if entry.at.elapsed() > PRESET_CACHE_TTL {
+        return None;
+    }
+    Some((entry.from.clone(), entry.to.clone(), entry.result.clone()))
+}
+
+fn cache_put(days: i32, top_n: usize, range: &Range, result: &CloudResult) {
+    if !matches!(days, 1 | 3 | 7) {
+        return;
+    }
+    if let Ok(mut guard) = PRESET_CACHE.lock() {
+        guard.insert(
+            (days, top_n),
+            CacheEntry {
+                at: Instant::now(),
+                from: range.from.clone(),
+                to: range.to.clone(),
+                result: result.clone(),
+            },
+        );
+    }
+}
+
+// ─── tokenize / extract ─────────────────────────────────────────────────
+
 fn is_cjk(r: char) -> bool {
     matches!(r, '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}')
 }
 
-/// Extract English words and overlapping CJK bigrams from `s`.
+/// Extract English words and overlapping CJK bigrams from `s` (builtin stopwords only).
 pub fn tokenize(s: &str) -> Vec<String> {
+    tokenize_with(s, None)
+}
+
+fn tokenize_with(s: &str, dict: Option<&WordCloudDict>) -> Vec<String> {
     if s.is_empty() {
         return Vec::new();
     }
@@ -86,7 +191,7 @@ pub fn tokenize(s: &str) -> Vec<String> {
     let lower = s.to_lowercase();
     for m in EN_WORD_RE.find_iter(&lower) {
         let w = m.as_str();
-        if !is_stopword(w) {
+        if !is_filtered(w, dict) {
             out.push(w.to_string());
         }
     }
@@ -105,13 +210,13 @@ pub fn tokenize(s: &str) -> Vec<String> {
         let run = &runes[i..j];
         if run.len() == 1 {
             let term: String = run.iter().collect();
-            if !is_stopword(&term) {
+            if !is_filtered(&term, dict) {
                 out.push(term);
             }
         } else {
             for k in 0..run.len() - 1 {
                 let term: String = run[k..k + 2].iter().collect();
-                if !is_stopword(&term) {
+                if !is_filtered(&term, dict) {
                     out.push(term);
                 }
             }
@@ -121,31 +226,469 @@ pub fn tokenize(s: &str) -> Vec<String> {
     out
 }
 
+#[derive(Default)]
+struct Freq {
+    count: i64,
+    group: EntityGroup,
+    text: String,
+}
+
 /// Aggregate token counts across snippets; return top N by count (then term).
 pub fn aggregate(snippets: &[TextSnippet], top_n: usize) -> Vec<Term> {
-    let mut top_n = top_n;
+    aggregate_with(snippets, top_n, None)
+}
+
+/// Aggregate with optional entity gazetteer + file stopwords.
+pub fn aggregate_with(
+    snippets: &[TextSnippet],
+    top_n: usize,
+    dict: Option<&WordCloudDict>,
+) -> Vec<Term> {
+    let top_n = clamp_top_n(top_n);
+    let mut freq: HashMap<String, Freq> = HashMap::new();
+    for sn in snippets {
+        let summary: String = sn.summary.chars().take(MAX_SUMMARY_RUN).collect();
+        let text = format!("{} {}", sn.title, summary);
+        count_text(&text, dict, &mut freq);
+    }
+    finish_freq(freq, top_n)
+}
+
+fn clamp_top_n(mut top_n: usize) -> usize {
     if top_n == 0 {
         top_n = DEFAULT_TOP_N;
     }
     if top_n > MAX_TOP_N {
         top_n = MAX_TOP_N;
     }
-    let mut counts: HashMap<String, i64> = HashMap::new();
-    for sn in snippets {
-        let summary: String = sn.summary.chars().take(MAX_SUMMARY_RUN).collect();
-        let text = format!("{} {}", sn.title, summary);
-        for tok in tokenize(&text) {
-            *counts.entry(tok).or_insert(0) += 1;
-        }
-    }
-    let mut terms: Vec<Term> = counts
-        .into_iter()
-        .map(|(term, count)| Term { term, count })
+    top_n
+}
+
+fn finish_freq(freq: HashMap<String, Freq>, top_n: usize) -> Vec<Term> {
+    let mut terms: Vec<Term> = freq
+        .into_values()
+        .filter(|f| !f.text.is_empty())
+        .map(|f| Term {
+            term: f.text,
+            count: f.count,
+            group: f.group.as_str().to_string(),
+        })
         .collect();
     terms.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.term.cmp(&b.term)));
     terms.truncate(top_n);
     terms
 }
+
+fn count_text(text: &str, dict: Option<&WordCloudDict>, freq: &mut HashMap<String, Freq>) {
+    for et in terms_for_text(text, dict) {
+        let key = format!("{}|{}", et.group, et.term);
+        let entry = freq.entry(key).or_default();
+        entry.count += et.weight.round() as i64;
+        if entry.count < 1 {
+            entry.count = 1;
+        }
+        entry.group = EntityGroup::parse_loose(&et.group);
+        entry.text = et.term;
+    }
+}
+
+/// Tokenize + entity-match one article text blob into weighted terms.
+///
+/// Shared by ingest indexing, backfill, and the legacy scan fallback.
+pub fn terms_for_text(text: &str, dict: Option<&WordCloudDict>) -> Vec<ExtractedTerm> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Vec::new();
+    }
+
+    let mut freq: HashMap<String, ExtractedTerm> = HashMap::new();
+
+    if let Some(dict) = dict {
+        let (hits, occupied, norm) = dict.match_entities(text);
+        for (id, n) in hits {
+            if n <= 0 {
+                continue;
+            }
+            let Some(ent) = dict.entity(&id) else {
+                continue;
+            };
+            let key = format!("e:{id}");
+            let entry = freq.entry(key).or_insert_with(|| ExtractedTerm {
+                term: ent.canonical.clone(),
+                group: ent.group.as_str().to_string(),
+                weight: 0.0,
+            });
+            entry.weight += n as f64;
+        }
+        for span in wordcloud_dict::unoccupied_spans(&norm, &occupied) {
+            for tok in tokenize_with(&span, Some(dict)) {
+                let entry = freq.entry(tok.clone()).or_insert_with(|| ExtractedTerm {
+                    term: tok.clone(),
+                    group: EntityGroup::General.as_str().to_string(),
+                    weight: 0.0,
+                });
+                entry.weight += 1.0;
+            }
+        }
+        return freq.into_values().collect();
+    }
+
+    for tok in tokenize_with(text, None) {
+        let entry = freq.entry(tok.clone()).or_insert_with(|| ExtractedTerm {
+            term: tok.clone(),
+            group: EntityGroup::General.as_str().to_string(),
+            weight: 0.0,
+        });
+        entry.weight += 1.0;
+    }
+    freq.into_values().collect()
+}
+
+/// Build terms for one article's title + summary (summary already truncated).
+pub fn terms_for_snippet(
+    title: &str,
+    summary: &str,
+    dict: Option<&WordCloudDict>,
+) -> Vec<ExtractedTerm> {
+    let summary: String = summary.chars().take(MAX_SUMMARY_RUN).collect();
+    let text = format!("{} {}", title, summary);
+    terms_for_text(&text, dict)
+}
+
+// ─── day helpers ────────────────────────────────────────────────────────
+
+/// Local calendar day `YYYY-MM-DD` for an article's effective timestamp,
+/// aligned with [`resolve_range`]'s local-day windows.
+pub fn effective_day_local(published_at: Option<&str>, fetched_at: Option<&str>) -> String {
+    let raw = published_at
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| fetched_at.map(str::trim).filter(|s| !s.is_empty()))
+        .unwrap_or("");
+    if raw.is_empty() {
+        return Local::now().format("%Y-%m-%d").to_string();
+    }
+    if let Ok(dt) = DateTime::parse_from_rfc3339(raw) {
+        return dt.with_timezone(&Local).format("%Y-%m-%d").to_string();
+    }
+    // SQLite `datetime('now')` / space-separated form.
+    if let Ok(naive) = NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S") {
+        return Local
+            .from_utc_datetime(&naive)
+            .format("%Y-%m-%d")
+            .to_string();
+    }
+    if let Ok(naive) = NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S") {
+        return Local
+            .from_utc_datetime(&naive)
+            .format("%Y-%m-%d")
+            .to_string();
+    }
+    if raw.len() >= 10 {
+        if let Ok(d) = NaiveDate::parse_from_str(&raw[..10], "%Y-%m-%d") {
+            return d.format("%Y-%m-%d").to_string();
+        }
+    }
+    Local::now().format("%Y-%m-%d").to_string()
+}
+
+// ─── dict version + persistence ─────────────────────────────────────────
+
+pub fn current_dict_version(conn: &Connection) -> AppResult<i64> {
+    let v: Option<String> = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            params![DICT_VERSION_KEY],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(v.and_then(|s| s.parse().ok()).unwrap_or(0))
+}
+
+/// Bump the stored dict version (call after stopwords/entities reload).
+/// Does not delete existing terms — backfill rebuilds stale articles.
+pub fn bump_dict_version(conn: &Connection) -> AppResult<i64> {
+    let next = current_dict_version(conn)?.saturating_add(1);
+    conn.execute(
+        "INSERT INTO settings(key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![DICT_VERSION_KEY, next.to_string()],
+    )?;
+    invalidate_cache();
+    Ok(next)
+}
+
+/// After a dict reload, bump the terms dict version only when the on-disk
+/// stopwords/entities `version` fields changed. Returns the (possibly new)
+/// terms dict version and whether a bump happened.
+pub fn sync_dict_file_version(conn: &Connection, dict: &WordCloudDict) -> AppResult<(i64, bool)> {
+    let fingerprint = format!("{}:{}", dict.stopwords.version, dict.entities.version);
+    let prev: Option<String> = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            params![DICT_FILE_VERSION_KEY],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if prev.as_deref() == Some(fingerprint.as_str()) {
+        return Ok((current_dict_version(conn)?, false));
+    }
+    conn.execute(
+        "INSERT INTO settings(key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![DICT_FILE_VERSION_KEY, fingerprint],
+    )?;
+    // First sighting seeds the fingerprint without forcing a full rebuild.
+    if prev.is_none() {
+        let v = ensure_dict_version(conn)?;
+        return Ok((v, false));
+    }
+    let v = bump_dict_version(conn)?;
+    Ok((v, true))
+}
+
+/// Ensure a non-zero dict version exists (first run / fresh DB).
+pub fn ensure_dict_version(conn: &Connection) -> AppResult<i64> {
+    let v = current_dict_version(conn)?;
+    if v > 0 {
+        return Ok(v);
+    }
+    conn.execute(
+        "INSERT INTO settings(key, value) VALUES (?1, '1')
+         ON CONFLICT(key) DO NOTHING",
+        params![DICT_VERSION_KEY],
+    )?;
+    current_dict_version(conn)
+}
+
+/// Replace all stored terms for one article (idempotent re-index).
+///
+/// Starts its own transaction. When already inside a caller transaction
+/// (e.g. ingest), use [`replace_article_terms_conn`] instead.
+pub fn replace_article_terms(
+    conn: &Connection,
+    article_id: i64,
+    day: &str,
+    terms: &[ExtractedTerm],
+    dict_version: i64,
+) -> AppResult<()> {
+    let tx = conn.unchecked_transaction()?;
+    replace_article_terms_conn(&tx, article_id, day, terms, dict_version)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Like [`replace_article_terms`] but does not open a nested transaction —
+/// safe to call from inside `upsert_article`'s write transaction.
+pub fn replace_article_terms_conn(
+    conn: &Connection,
+    article_id: i64,
+    day: &str,
+    terms: &[ExtractedTerm],
+    dict_version: i64,
+) -> AppResult<()> {
+    conn.execute(
+        "DELETE FROM article_terms WHERE article_id = ?1",
+        params![article_id],
+    )?;
+    {
+        let mut stmt = conn.prepare(
+            "INSERT INTO article_terms(article_id, term, group_key, weight, day)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(article_id, term) DO UPDATE SET
+                 group_key = excluded.group_key,
+                 weight = excluded.weight,
+                 day = excluded.day",
+        )?;
+        for et in terms {
+            if et.term.is_empty() || et.weight <= 0.0 {
+                continue;
+            }
+            stmt.execute(params![article_id, et.term, et.group, et.weight, day])?;
+        }
+    }
+    conn.execute(
+        "INSERT INTO article_term_index(article_id, dict_version, updated_at)
+         VALUES (?1, ?2, datetime('now'))
+         ON CONFLICT(article_id) DO UPDATE SET
+             dict_version = excluded.dict_version,
+             updated_at = datetime('now')",
+        params![article_id, dict_version],
+    )?;
+    Ok(())
+}
+
+/// Index one article from title/summary snippets already in hand (ingest path).
+///
+/// Uses the process-wide word-cloud dictionary when `dict` is `None`.
+/// `fetched_at` may be `None` on insert (SQLite default); day then falls back
+/// to published_at or "today".
+pub fn index_article_snippet(
+    conn: &Connection,
+    article_id: i64,
+    title: &str,
+    summary: &str,
+    published_at: Option<&str>,
+    fetched_at: Option<&str>,
+) -> AppResult<()> {
+    let dict_arc = wordcloud_dict::process_dict();
+    dict_arc.with_dict(|dict| {
+        let dict_version = ensure_dict_version(conn).unwrap_or(1);
+        let day = effective_day_local(published_at, fetched_at);
+        let terms = terms_for_snippet(title, summary, Some(dict));
+        // No nested transaction — ingest may already hold one.
+        replace_article_terms_conn(conn, article_id, &day, &terms, dict_version)
+    })
+}
+
+/// Index one article by loading its row (backfill path).
+pub fn index_article_by_id(conn: &Connection, article_id: i64, dict: &WordCloudDict) -> AppResult<()> {
+    let row: Option<(String, String, Option<String>, String)> = conn
+        .query_row(
+            "SELECT title,
+                    COALESCE(summary, substr(body_text, 1, 400), ''),
+                    published_at,
+                    fetched_at
+             FROM articles WHERE id = ?1",
+            params![article_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    let Some((title, summary, published_at, fetched_at)) = row else {
+        return Ok(());
+    };
+    let dict_version = ensure_dict_version(conn)?;
+    let day = effective_day_local(published_at.as_deref(), Some(&fetched_at));
+    let terms = terms_for_snippet(&title, &summary, Some(dict));
+    replace_article_terms(conn, article_id, &day, &terms, dict_version)?;
+    Ok(())
+}
+
+/// Articles needing (re)tokenization for the current dict version.
+pub fn list_articles_needing_terms(
+    conn: &Connection,
+    limit: usize,
+) -> AppResult<Vec<(i64, String, String, Option<String>, String)>> {
+    let dict_version = ensure_dict_version(conn)?;
+    let limit = limit.max(1) as i64;
+    let mut stmt = conn.prepare(
+        "SELECT a.id,
+                a.title,
+                COALESCE(a.summary, substr(a.body_text, 1, 400), ''),
+                a.published_at,
+                a.fetched_at
+         FROM articles a
+         LEFT JOIN article_term_index i ON i.article_id = a.id
+         WHERE i.article_id IS NULL OR i.dict_version != ?1
+         ORDER BY datetime(COALESCE(a.published_at, a.fetched_at)) DESC, a.id DESC
+         LIMIT ?2",
+    )?;
+    let rows = stmt
+        .query_map(params![dict_version, limit], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+pub fn backfill_status(conn: &Connection) -> AppResult<BackfillStatus> {
+    let dict_version = ensure_dict_version(conn)?;
+    let total_articles: i64 =
+        conn.query_row("SELECT COUNT(*) FROM articles", [], |r| r.get(0))?;
+    let indexed: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM article_term_index WHERE dict_version = ?1",
+        params![dict_version],
+        |r| r.get(0),
+    )?;
+    let stale: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM article_term_index WHERE dict_version != ?1",
+        params![dict_version],
+        |r| r.get(0),
+    )?;
+    let missing = (total_articles - indexed - stale).max(0);
+    Ok(BackfillStatus {
+        dict_version,
+        indexed,
+        stale,
+        missing,
+        total_articles,
+    })
+}
+
+/// Process up to `limit` articles missing/stale terms.
+///
+/// Intended for the background worker: caller should fetch rows under the DB
+/// lock, tokenize **without** holding the lock, then call
+/// [`write_backfill_batch`] — or use this convenience when the lock is cheap.
+pub fn backfill_batch(
+    conn: &Connection,
+    dict: &WordCloudDict,
+    limit: usize,
+) -> AppResult<BackfillBatchResult> {
+    let rows = list_articles_needing_terms(conn, limit)?;
+    let dict_version = ensure_dict_version(conn)?;
+    let mut prepared = Vec::with_capacity(rows.len());
+    for (id, title, summary, published_at, fetched_at) in &rows {
+        let day = effective_day_local(published_at.as_deref(), Some(fetched_at));
+        let terms = terms_for_snippet(title, summary, Some(dict));
+        prepared.push((*id, day, terms));
+    }
+    write_backfill_batch(conn, dict_version, &prepared)?;
+    let status = backfill_status(conn)?;
+    let remaining = status.missing + status.stale;
+    Ok(BackfillBatchResult {
+        processed: prepared.len(),
+        remaining,
+        dict_version,
+    })
+}
+
+/// Write a pre-tokenized backfill batch (tokenize happened off the DB lock).
+pub fn write_backfill_batch(
+    conn: &Connection,
+    dict_version: i64,
+    prepared: &[(i64, String, Vec<ExtractedTerm>)],
+) -> AppResult<()> {
+    for (id, day, terms) in prepared {
+        replace_article_terms(conn, *id, day, terms, dict_version)?;
+    }
+    if !prepared.is_empty() {
+        invalidate_cache();
+    }
+    Ok(())
+}
+
+/// Fetch a batch of articles needing terms (hold DB lock only for this).
+pub fn fetch_backfill_batch(
+    conn: &Connection,
+    limit: usize,
+) -> AppResult<(i64, Vec<(i64, String, String, Option<String>, String)>)> {
+    let dict_version = ensure_dict_version(conn)?;
+    let rows = list_articles_needing_terms(conn, limit)?;
+    Ok((dict_version, rows))
+}
+
+/// Tokenize a fetched backfill batch without touching the DB.
+pub fn tokenize_backfill_batch(
+    rows: &[(i64, String, String, Option<String>, String)],
+    dict: &WordCloudDict,
+) -> Vec<(i64, String, Vec<ExtractedTerm>)> {
+    rows.iter()
+        .map(|(id, title, summary, published_at, fetched_at)| {
+            let day = effective_day_local(published_at.as_deref(), Some(fetched_at));
+            let terms = terms_for_snippet(title, summary, Some(dict));
+            (*id, day, terms)
+        })
+        .collect()
+}
+
+// ─── range resolve ──────────────────────────────────────────────────────
 
 /// Build a time window from `days` (1|3|7) or `from`/`to` calendar dates.
 /// When both from and to are present they win. `to` is inclusive.
@@ -172,9 +715,7 @@ pub fn resolve_range(
             .from_local_datetime(&from_day.and_hms_opt(0, 0, 0).unwrap())
             .single()
             .ok_or(RangeError::InvalidFrom)?;
-        let to_exclusive_day = to_day
-            .succ_opt()
-            .ok_or(RangeError::InvalidTo)?;
+        let to_exclusive_day = to_day.succ_opt().ok_or(RangeError::InvalidTo)?;
         let to_dt = loc
             .from_local_datetime(&to_exclusive_day.and_hms_opt(0, 0, 0).unwrap())
             .single()
@@ -213,35 +754,139 @@ pub fn resolve_range_local(days: i32, from_str: &str, to_str: &str) -> Result<Ra
     resolve_range(days, from_str, to_str, now)
 }
 
+// ─── build cloud ────────────────────────────────────────────────────────
+
 /// Load article snippets in `[from_ms, to_ms)` and aggregate terms.
-///
-/// Scans every matching article up to [`MAX_SCAN_ROWS`] (newest first). The
-/// returned [`CloudResult::scanned`] is the number of rows actually used —
-/// distinct from `terms.len()`, which is capped by `top_n` / [`DEFAULT_TOP_N`].
 pub fn build_for_range(
     conn: &Connection,
     range: &Range,
     top_n: usize,
-) -> crate::error::AppResult<CloudResult> {
-    // published_at / fetched_at are stored as text; compare via unixepoch where possible.
+) -> AppResult<CloudResult> {
+    build_for_range_with(conn, range, top_n, None)
+}
+
+/// Like [`build_for_range`], applying a shared stopwords/entities dictionary.
+///
+/// Prefers SQL aggregation over `article_terms`. Falls back to the legacy
+/// scan+tokenize path when the window has articles but no indexed terms yet
+/// (mid-migration / empty backfill).
+pub fn build_for_range_with(
+    conn: &Connection,
+    range: &Range,
+    top_n: usize,
+    dict: Option<&WordCloudDict>,
+) -> AppResult<CloudResult> {
+    let top_n = clamp_top_n(top_n);
+    if let Some(cloud) = try_build_from_terms(conn, range, top_n)? {
+        return Ok(cloud);
+    }
+    build_for_range_scan(conn, range, top_n, dict)
+}
+
+/// Preset-aware entry: serves 1/3/7-day results from a short TTL cache when
+/// the resolved window is a 1/3/7-day preset (no custom from/to).
+pub fn build_for_range_cached(
+    conn: &Connection,
+    range: &Range,
+    days: i32,
+    custom_range: bool,
+    top_n: usize,
+    dict: Option<&WordCloudDict>,
+) -> AppResult<CloudResult> {
+    let top_n = clamp_top_n(top_n);
+    if !custom_range {
+        if let Some((from, to, result)) = cache_get(days, top_n) {
+            if range.from == from && range.to == to {
+                return Ok(result);
+            }
+        }
+    }
+    let cloud = build_for_range_with(conn, range, top_n, dict)?;
+    if !custom_range {
+        cache_put(days, top_n, range, &cloud);
+    }
+    Ok(cloud)
+}
+
+fn try_build_from_terms(
+    conn: &Connection,
+    range: &Range,
+    top_n: usize,
+) -> AppResult<Option<CloudResult>> {
+    // Table may be empty mid-migration — detect coverage for this window.
+    let terms_articles: i64 = conn.query_row(
+        "SELECT COUNT(DISTINCT article_id) FROM article_terms
+         WHERE day >= ?1 AND day <= ?2",
+        params![range.from, range.to],
+        |r| r.get(0),
+    )?;
+    if terms_articles == 0 {
+        // Any articles in the window at all? If yes, fall back to scan.
+        let articles_in_range = count_articles_in_range(conn, range)?;
+        if articles_in_range > 0 {
+            return Ok(None);
+        }
+        return Ok(Some(CloudResult {
+            terms: Vec::new(),
+            scanned: 0,
+        }));
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT term, group_key, CAST(ROUND(SUM(weight)) AS INTEGER) AS cnt
+         FROM article_terms
+         WHERE day >= ?1 AND day <= ?2
+         GROUP BY term, group_key
+         ORDER BY cnt DESC, term ASC
+         LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(params![range.from, range.to, top_n as i64], |r| {
+        Ok(Term {
+            term: r.get(0)?,
+            group: r.get(1)?,
+            count: r.get(2)?,
+        })
+    })?;
+    let mut terms = Vec::new();
+    for row in rows {
+        terms.push(row?);
+    }
+    Ok(Some(CloudResult {
+        terms,
+        scanned: terms_articles.min(MAX_SCAN_ROWS),
+    }))
+}
+
+fn count_articles_in_range(conn: &Connection, range: &Range) -> AppResult<i64> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM articles a
+         WHERE datetime(COALESCE(a.published_at, a.fetched_at))
+               >= datetime(?1 / 1000, 'unixepoch')
+           AND datetime(COALESCE(a.published_at, a.fetched_at))
+               < datetime(?2 / 1000, 'unixepoch')",
+        params![range.from_ms, range.to_ms],
+        |r| r.get(0),
+    )?;
+    Ok(n)
+}
+
+/// Legacy path: scan title/summary text and tokenize in-process.
+fn build_for_range_scan(
+    conn: &Connection,
+    range: &Range,
+    top_n: usize,
+    dict: Option<&WordCloudDict>,
+) -> AppResult<CloudResult> {
+    // Date filter uses the same `datetime(COALESCE(...))` expression as
+    // `idx_articles_sort` / list queries — not per-row `strftime('%s', ...)`.
     let mut stmt = conn.prepare(
         "SELECT a.title, COALESCE(a.summary, substr(a.body_text, 1, 400), '')
          FROM articles a
-         WHERE (
-             CASE
-               WHEN a.published_at IS NOT NULL AND a.published_at != ''
-                 THEN CAST(strftime('%s', a.published_at) AS INTEGER) * 1000
-               ELSE CAST(strftime('%s', a.fetched_at) AS INTEGER) * 1000
-             END
-           ) >= ?1
-           AND (
-             CASE
-               WHEN a.published_at IS NOT NULL AND a.published_at != ''
-                 THEN CAST(strftime('%s', a.published_at) AS INTEGER) * 1000
-               ELSE CAST(strftime('%s', a.fetched_at) AS INTEGER) * 1000
-             END
-           ) < ?2
-         ORDER BY datetime(COALESCE(a.published_at, a.fetched_at)) DESC
+         WHERE datetime(COALESCE(a.published_at, a.fetched_at))
+               >= datetime(?1 / 1000, 'unixepoch')
+           AND datetime(COALESCE(a.published_at, a.fetched_at))
+               < datetime(?2 / 1000, 'unixepoch')
+         ORDER BY datetime(COALESCE(a.published_at, a.fetched_at)) DESC, a.id DESC
          LIMIT ?3",
     )?;
     let rows = stmt.query_map(params![range.from_ms, range.to_ms, MAX_SCAN_ROWS], |r| {
@@ -256,13 +901,32 @@ pub fn build_for_range(
     }
     let scanned = snippets.len() as i64;
     Ok(CloudResult {
-        terms: aggregate(&snippets, top_n),
+        terms: aggregate_with(&snippets, top_n, dict),
         scanned,
     })
 }
 
-fn is_stopword(term: &str) -> bool {
-    STOPWORDS.contains(term)
+fn is_filtered(term: &str, dict: Option<&WordCloudDict>) -> bool {
+    if STOPWORDS.contains(term) {
+        return true;
+    }
+    dict.is_some_and(|d| d.is_file_stopword(term))
+}
+
+impl EntityGroup {
+    fn parse_loose(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "country" => Self::Country,
+            "person" => Self::Person,
+            "location" => Self::Location,
+            "military" => Self::Military,
+            "politics" => Self::Politics,
+            "economy" => Self::Economy,
+            "disaster" => Self::Disaster,
+            "org" => Self::Org,
+            _ => Self::General,
+        }
+    }
 }
 
 /// Common English + Chinese stopwords (lowercase / as emitted by tokenize).
@@ -344,9 +1008,7 @@ mod tests {
     #[test]
     fn resolve_range_days() {
         let loc = FixedOffset::east_opt(8 * 3600).unwrap();
-        let now = loc
-            .with_ymd_and_hms(2026, 8, 4, 15, 30, 0)
-            .unwrap();
+        let now = loc.with_ymd_and_hms(2026, 8, 4, 15, 30, 0).unwrap();
         let r = resolve_range(1, "", "", now).unwrap();
         assert_eq!(r.from, "2026-08-04");
         assert_eq!(r.to, "2026-08-04");
@@ -369,9 +1031,10 @@ mod tests {
         assert_eq!(r.to_ms, want_to);
     }
 
-    #[test]
-    fn build_for_range_scanned_is_article_count_not_term_cap() {
+    fn migrate_memory() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
+        // Minimal schema for term index tests + full migration via open is
+        // heavy; create the tables the wordcloud helpers need.
         conn.execute_batch(
             "CREATE TABLE articles (
                 id INTEGER PRIMARY KEY,
@@ -380,10 +1043,29 @@ mod tests {
                 body_text TEXT,
                 published_at TEXT,
                 fetched_at TEXT
+            );
+            CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE article_terms (
+                article_id INTEGER NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
+                term TEXT NOT NULL,
+                group_key TEXT NOT NULL DEFAULT 'general',
+                weight REAL NOT NULL DEFAULT 1,
+                day TEXT NOT NULL,
+                PRIMARY KEY (article_id, term)
+            );
+            CREATE TABLE article_term_index (
+                article_id INTEGER PRIMARY KEY REFERENCES articles(id) ON DELETE CASCADE,
+                dict_version INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             );",
         )
         .unwrap();
-        // 150 articles in range — well above DEFAULT_TOP_N (100 terms).
+        conn
+    }
+
+    #[test]
+    fn build_for_range_scanned_is_article_count_not_term_cap() {
+        let conn = migrate_memory();
         for i in 0..150 {
             conn.execute(
                 "INSERT INTO articles (title, summary, published_at, fetched_at)
@@ -396,7 +1078,6 @@ mod tests {
             )
             .unwrap();
         }
-        // Outside the window — must not be counted.
         conn.execute(
             "INSERT INTO articles (title, summary, published_at, fetched_at)
              VALUES ('Old', 'old', '2026-07-01T12:00:00Z', '2026-07-01T12:00:00Z')",
@@ -407,12 +1088,40 @@ mod tests {
         let loc = FixedOffset::east_opt(0).unwrap();
         let now = loc.with_ymd_and_hms(2026, 8, 4, 15, 0, 0).unwrap();
         let range = resolve_range(1, "", "", now).unwrap();
+        // No pre-agg yet → scan fallback.
         let cloud = build_for_range(&conn, &range, DEFAULT_TOP_N).unwrap();
-        assert_eq!(cloud.scanned, 150, "scanned must be article rows, not term cap");
+        assert_eq!(
+            cloud.scanned, 150,
+            "scanned must be article rows, not term cap"
+        );
         assert!(
             cloud.terms.len() <= DEFAULT_TOP_N,
             "terms stay capped at top_n"
         );
         assert!(!cloud.terms.is_empty());
+    }
+
+    #[test]
+    fn build_from_preaggregated_terms() {
+        let conn = migrate_memory();
+        conn.execute(
+            "INSERT INTO articles (id, title, summary, published_at, fetched_at)
+             VALUES (1, 'Bitcoin rally', 'markets', '2026-08-04T12:00:00Z', '2026-08-04T12:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let terms = terms_for_snippet("Bitcoin rally", "Bitcoin markets", None);
+        replace_article_terms(&conn, 1, "2026-08-04", &terms, 1).unwrap();
+
+        let loc = FixedOffset::east_opt(0).unwrap();
+        let now = loc.with_ymd_and_hms(2026, 8, 4, 15, 0, 0).unwrap();
+        let range = resolve_range(1, "", "", now).unwrap();
+        let cloud = build_for_range(&conn, &range, DEFAULT_TOP_N).unwrap();
+        assert_eq!(cloud.scanned, 1);
+        assert!(
+            cloud.terms.iter().any(|t| t.term == "bitcoin"),
+            "terms={:?}",
+            cloud.terms
+        );
     }
 }

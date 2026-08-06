@@ -77,7 +77,16 @@ pub struct Enclosure {
     pub length: Option<i64>,
 }
 
-/// A user-defined label that can be attached to any number of articles.
+/// Admin-defined interest vocabulary (closed list; AI may match, not invent).
+pub const TAG_KIND_INTEREST: &str = "interest";
+/// Free-form tags created/attached by AI from title + summary.
+pub const TAG_KIND_AI: &str = "ai";
+
+/// A label that can be attached to any number of articles.
+///
+/// Two taxonomies share the `tags` table, distinguished by [`Tag::kind`]:
+/// - `interest` — admin CRUD; AI may only match from this closed list
+/// - `ai` — created by the auto-tag worker (and admin-managed afterwards)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Tag {
@@ -86,6 +95,8 @@ pub struct Tag {
     /// A palette key (resolved to a colour by the frontend).
     pub color: String,
     pub position: i64,
+    /// `interest` | `ai` — see [`TAG_KIND_INTEREST`] / [`TAG_KIND_AI`].
+    pub kind: String,
     /// How many articles currently carry this tag.
     pub article_count: i64,
 }
