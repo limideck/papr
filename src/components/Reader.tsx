@@ -812,7 +812,7 @@ export default function Reader({ onToast }: Props) {
           >
             <Icon name="copy" size={16} />
           </button>
-        )}
+        )} */}
         <button
           className={`tb-btn ${focusMode ? "on" : ""}`}
           title={t("reader.tbFocusMode")}
@@ -821,7 +821,7 @@ export default function Reader({ onToast }: Props) {
           onClick={() => setFocusMode(!focusMode)}
         >
           <Icon name={focusMode ? "eye-off" : "focus"} size={16} />
-        </button> */}
+        </button>
         {a.url && (
           <button
             className={`tb-btn ${viewMode === "web" ? "on" : ""}`}
