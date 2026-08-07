@@ -1985,6 +1985,13 @@ button { font-family: inherit; }
 .s-btn.primary:hover { filter: brightness(0.95); }
 .s-btn.danger { color: var(--danger); border-color: var(--danger-line); }
 .s-btn.danger:hover { background: var(--danger-soft); }
+.s-btn:disabled,
+.s-btn:disabled:hover {
+  opacity: 0.45;
+  cursor: default;
+  background: transparent;
+  filter: none;
+}
 /* a filled, destructive primary — the confirm button in ConfirmDialog */
 .s-btn.primary.danger {
   background: var(--danger-solid);
@@ -3232,6 +3239,8 @@ button { font-family: inherit; }
 .s-tag-list-actions {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 10px;
   flex-shrink: 0;
 }

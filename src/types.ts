@@ -27,6 +27,11 @@ export interface AutoTagStatus {
   aiEnabled?: boolean;
   lastError?: string | null;
   recentErrors?: { articleId?: number; error?: string; at?: string }[];
+  /** Backfill window used for the tagged/untagged hint. */
+  windowDays?: number;
+  articlesInWindow?: number;
+  untaggedInWindow?: number;
+  taggedInWindow?: number;
 }
 
 /** Admin overview from `GET /api/stats/overview`. */
@@ -46,7 +51,7 @@ export interface StatsOverview {
     done: number;
     lastError?: string | null;
   };
-  /** Zero-filled daily ingest counts (`fetched_at`, local calendar days). */
+  /** Zero-filled daily ingest counts (`fetched_at`, local calendar days), newest first. */
   daily: { date: string; count: number }[];
 }
 

@@ -135,8 +135,10 @@ type RawAutoTagStatus = AutoTagStatus & {
   recent_errors?: { article_id?: number; error?: string; at?: string }[];
 };
 
-export const getAutoTagStatus = () =>
-  apiJson<RawAutoTagStatus>(`${API}/auto-tag/status`).then(normalizeAutoTagStatus);
+export const getAutoTagStatus = (days = 7) =>
+  apiJson<RawAutoTagStatus>(
+    `${API}/auto-tag/status${qs({ days })}`,
+  ).then(normalizeAutoTagStatus);
 
 function normalizeAutoTagStatus(raw: RawAutoTagStatus): AutoTagStatus {
   const recent = raw.recentErrors ?? raw.recent_errors;
@@ -147,6 +149,10 @@ function normalizeAutoTagStatus(raw: RawAutoTagStatus): AutoTagStatus {
     done: raw.done,
     enabled: raw.enabled,
     lastError: raw.lastError ?? raw.last_error ?? null,
+    windowDays: raw.windowDays,
+    articlesInWindow: raw.articlesInWindow,
+    untaggedInWindow: raw.untaggedInWindow,
+    taggedInWindow: raw.taggedInWindow,
     recentErrors: recent?.map((e) => {
       const row = e as {
         articleId?: number;
@@ -533,6 +539,12 @@ export const setTagColor = (id: number, color: string) =>
   });
 export const deleteTag = (id: number) =>
   apiJson<void>(`${API}/tags/${id}`, { method: "DELETE" });
+/** Delete AI tags with zero articles. Interest tags are never cleaned up. */
+export const cleanupEmptyTags = (kind: "ai" = "ai") =>
+  apiJson<{ deleted: number }>(`${API}/tags/cleanup-empty`, {
+    method: "POST",
+    body: JSON.stringify({ kind }),
+  });
 export const reorderTags = (ids: number[]) =>
   apiJson<void>(`${API}/tags/reorder`, {
     method: "POST",

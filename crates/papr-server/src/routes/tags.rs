@@ -84,6 +84,25 @@ pub async fn delete(
 }
 
 #[derive(Deserialize)]
+pub struct CleanupEmptyBody {
+    /// Must be `ai`. Interest tags are never bulk-deleted when unused.
+    pub kind: String,
+}
+
+/// Delete unused AI tags (`article_count = 0`). Admin only.
+/// Interest cleanup is rejected — empty interest tags stay as vocabulary.
+pub async fn cleanup_empty(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Json(body): Json<CleanupEmptyBody>,
+) -> ApiResult<Json<Value>> {
+    user.require_admin()?;
+    let conn = state.db.lock().await;
+    let deleted = db::delete_empty_tags(&conn, &body.kind).map_err(ApiError::from)?;
+    Ok(Json(json!({ "deleted": deleted })))
+}
+
+#[derive(Deserialize)]
 pub struct ReorderBody {
     pub ids: Vec<i64>,
 }

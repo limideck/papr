@@ -2,19 +2,32 @@
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::{AppState, AuthUser};
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::Json;
 use papr_core::db;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+#[derive(Deserialize)]
+pub struct StatusQuery {
+    /// Window for tagged/untagged hint (same basis as backfill). Default 7.
+    #[serde(default = "default_days")]
+    pub days: i64,
+}
+
 /// `GET /api/auto-tag/status` — queue backlog + enabled flags (admin).
-pub async fn status(State(state): State<AppState>, user: AuthUser) -> ApiResult<Json<Value>> {
+pub async fn status(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Query(q): Query<StatusQuery>,
+) -> ApiResult<Json<Value>> {
     user.require_admin()?;
+    let days = q.days.clamp(1, 365);
     let conn = state.db.lock().await;
     let interest_enabled = db::setting_flag(&conn, "auto_tag_enabled", false);
     let ai_enabled = db::setting_flag(&conn, "ai_tag_enabled", false);
     let queue = db::auto_tag_queue_status(&conn).map_err(ApiError::from)?;
+    let window = db::auto_tag_window_stats(&conn, days).map_err(ApiError::from)?;
     Ok(Json(json!({
         "enabled": interest_enabled || ai_enabled,
         "interestEnabled": interest_enabled,
@@ -24,6 +37,10 @@ pub async fn status(State(state): State<AppState>, user: AuthUser) -> ApiResult<
         "failed": queue.failed,
         "done": queue.done,
         "lastError": queue.last_error,
+        "windowDays": window.days,
+        "articlesInWindow": window.articles,
+        "untaggedInWindow": window.untagged,
+        "taggedInWindow": window.tagged,
     })))
 }
 
@@ -32,8 +49,8 @@ pub struct BackfillBody {
     /// Re-enqueue articles from the last N days (default 7, min 1, max 365).
     #[serde(default = "default_days")]
     pub days: i64,
-    /// When true, also reset successfully `done` jobs so tagging re-runs.
-    /// Default false: only never-queued + failed (avoids re-spending tokens).
+    /// When true, also reset `done` jobs that already have tags.
+    /// Default false: never-queued + failed + done-with-zero-tags.
     #[serde(default)]
     pub force: bool,
 }
@@ -44,8 +61,9 @@ fn default_days() -> i64 {
 
 /// `POST /api/auto-tag/backfill` — enqueue recent articles for tagging (admin).
 ///
-/// Default: enqueue missing (never queued) and re-queue `failed` only.
-/// `force: true` also resets `done` so operators can re-tag on demand.
+/// Default: never-queued, `failed`, and queue rows with **zero tags**
+/// (including soft-empty `done`). Skips `done` articles that already have tags.
+/// `force: true` also resets those tagged `done` rows.
 pub async fn backfill(
     State(state): State<AppState>,
     user: AuthUser,

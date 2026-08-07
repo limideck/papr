@@ -1181,7 +1181,7 @@ Final: {"tags":["Rust","Go"]}"#;
     }
 
     #[test]
-    fn backfill_skips_done_unless_forced() {
+    fn backfill_requeues_done_untagged_skips_tagged() {
         let (conn, path) = temp_db();
         db::set_setting(&conn, "auto_tag_enabled", "1").unwrap();
         let feed_id = db::insert_feed(
@@ -1194,36 +1194,84 @@ Final: {"tags":["Rust","Go"]}"#;
             None,
         )
         .unwrap();
-        let article = NewArticle {
-            guid: "bf".into(),
-            url: Some("https://example.com/bf".into()),
-            title: "Backfill".into(),
+        let now = chrono::Utc::now().to_rfc3339();
+        let empty = NewArticle {
+            guid: "bf-empty".into(),
+            url: Some("https://example.com/bf-empty".into()),
+            title: "Empty done".into(),
             author: None,
             summary: None,
             content_html: None,
             body_text: "".into(),
             image_url: None,
-            published_at: Some(chrono::Utc::now().to_rfc3339()),
+            published_at: Some(now.clone()),
             enclosures: vec![],
         };
-        assert!(db::upsert_article(&conn, feed_id, &article, false, &[]).unwrap());
-        let id = db::claim_auto_tag_job(&conn).unwrap().unwrap().0;
-        db::mark_auto_tag_done(&conn, id).unwrap();
+        let tagged = NewArticle {
+            guid: "bf-tagged".into(),
+            url: Some("https://example.com/bf-tagged".into()),
+            title: "Tagged done".into(),
+            author: None,
+            summary: None,
+            content_html: None,
+            body_text: "".into(),
+            image_url: None,
+            published_at: Some(now),
+            enclosures: vec![],
+        };
+        assert!(db::upsert_article(&conn, feed_id, &empty, false, &[]).unwrap());
+        assert!(db::upsert_article(&conn, feed_id, &tagged, false, &[]).unwrap());
+        let empty_id: i64 = conn
+            .query_row(
+                "SELECT id FROM articles WHERE guid = 'bf-empty'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let tagged_id: i64 = conn
+            .query_row(
+                "SELECT id FROM articles WHERE guid = 'bf-tagged'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
 
-        // Default backfill must not reset done (token-saving).
-        assert_eq!(db::enqueue_auto_tag_backfill(&conn, 7, false).unwrap(), 0);
-        assert_eq!(db::auto_tag_queue_status(&conn).unwrap().done, 1);
+        // Both start pending from ingest; mark done. Attach a tag only to one.
+        for _ in 0..2 {
+            let claimed = db::claim_auto_tag_job(&conn).unwrap().unwrap().0;
+            assert!(claimed == empty_id || claimed == tagged_id);
+            db::mark_auto_tag_done(&conn, claimed).unwrap();
+        }
+        let tag_id = db::create_tag(&conn, "Rust", TAG_KIND_INTEREST).unwrap();
+        db::set_article_tag(&conn, tagged_id, tag_id, true).unwrap();
 
-        // Force re-queues done.
-        assert_eq!(db::enqueue_auto_tag_backfill(&conn, 7, true).unwrap(), 1);
+        // Default: re-queue done-with-zero-tags; leave done-with-tags alone.
+        assert_eq!(db::enqueue_auto_tag_backfill(&conn, 7, false).unwrap(), 1);
         assert_eq!(db::auto_tag_queue_status(&conn).unwrap().pending, 1);
+        assert_eq!(db::auto_tag_queue_status(&conn).unwrap().done, 1);
+        let pending_id: i64 = conn
+            .query_row(
+                "SELECT article_id FROM auto_tag_queue WHERE status = 'pending'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending_id, empty_id);
 
-        // Failed is re-queued even without force.
+        // Force also re-queues tagged done.
+        assert_eq!(db::enqueue_auto_tag_backfill(&conn, 7, true).unwrap(), 1);
+        assert_eq!(db::auto_tag_queue_status(&conn).unwrap().pending, 2);
+
+        // Failed is re-queued even without force (and even if it somehow has tags).
         let id = db::claim_auto_tag_job(&conn).unwrap().unwrap().0;
         db::mark_auto_tag_failure(&conn, id, "x", 1).unwrap();
         assert_eq!(db::auto_tag_queue_status(&conn).unwrap().failed, 1);
         assert_eq!(db::enqueue_auto_tag_backfill(&conn, 7, false).unwrap(), 1);
-        assert_eq!(db::auto_tag_queue_status(&conn).unwrap().pending, 1);
+
+        let window = db::auto_tag_window_stats(&conn, 7).unwrap();
+        assert_eq!(window.articles, 2);
+        assert_eq!(window.untagged, 1);
+        assert_eq!(window.tagged, 1);
 
         remove_temp_db(conn, path);
     }
@@ -1286,6 +1334,170 @@ Final: {"tags":["Rust","Go"]}"#;
         assert_eq!(second.0, old_id);
         // Claimed rows are processing — no double claim.
         assert!(db::claim_auto_tag_job(&conn).unwrap().is_none());
+
+        remove_temp_db(conn, path);
+    }
+
+    #[test]
+    fn backfill_does_not_boost_old_over_newer_pending() {
+        // Backfill bumps queue.updated_at, but claim orders by article date —
+        // re-queuing an older failed item must not jump ahead of a newer pending.
+        let (conn, path) = temp_db();
+        let feed_id = db::insert_feed(
+            &conn,
+            "https://example.com/feed-bf-prio.xml",
+            None,
+            "Example",
+            None,
+            SourceType::Rss,
+            None,
+        )
+        .unwrap();
+
+        let older = NewArticle {
+            guid: "old-fail".into(),
+            url: Some("https://example.com/old-fail".into()),
+            title: "Old fail".into(),
+            author: None,
+            summary: None,
+            content_html: None,
+            body_text: "".into(),
+            image_url: None,
+            published_at: Some("2026-08-01T00:00:00+00:00".into()),
+            enclosures: vec![],
+        };
+        let newer = NewArticle {
+            guid: "new-pend".into(),
+            url: Some("https://example.com/new-pend".into()),
+            title: "New pending".into(),
+            author: None,
+            summary: None,
+            content_html: None,
+            body_text: "".into(),
+            image_url: None,
+            published_at: Some("2026-08-06T00:00:00+00:00".into()),
+            enclosures: vec![],
+        };
+        assert!(db::upsert_article(&conn, feed_id, &older, false, &[]).unwrap());
+        assert!(db::upsert_article(&conn, feed_id, &newer, false, &[]).unwrap());
+        let old_id: i64 = conn
+            .query_row(
+                "SELECT id FROM articles WHERE guid = 'old-fail'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let new_id: i64 = conn
+            .query_row(
+                "SELECT id FROM articles WHERE guid = 'new-pend'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        db::enqueue_auto_tag(&conn, old_id).unwrap();
+        let claimed = db::claim_auto_tag_job(&conn).unwrap().unwrap().0;
+        assert_eq!(claimed, old_id);
+        db::mark_auto_tag_failure(&conn, old_id, "boom", 1).unwrap();
+
+        db::enqueue_auto_tag(&conn, new_id).unwrap();
+        assert_eq!(db::enqueue_auto_tag_backfill(&conn, 30, false).unwrap(), 1);
+        assert_eq!(db::auto_tag_queue_status(&conn).unwrap().pending, 2);
+
+        let first = db::claim_auto_tag_job(&conn).unwrap().unwrap();
+        assert_eq!(
+            first.0, new_id,
+            "newer pending must stay ahead after backfill re-queues older failed"
+        );
+        let second = db::claim_auto_tag_job(&conn).unwrap().unwrap();
+        assert_eq!(second.0, old_id);
+
+        remove_temp_db(conn, path);
+    }
+
+    #[test]
+    fn backfill_zero_tag_redo_does_not_boost_old_over_newer_pending() {
+        // Default 补打 re-queues done-with-zero-tags. Claim still orders by
+        // article date — an older 0-tag redo must not jump a newer pending.
+        let (conn, path) = temp_db();
+        let feed_id = db::insert_feed(
+            &conn,
+            "https://example.com/feed-bf-zerotag.xml",
+            None,
+            "Example",
+            None,
+            SourceType::Rss,
+            None,
+        )
+        .unwrap();
+
+        let older = NewArticle {
+            guid: "old-zerotag".into(),
+            url: Some("https://example.com/old-zerotag".into()),
+            title: "Old zero-tag".into(),
+            author: None,
+            summary: None,
+            content_html: None,
+            body_text: "".into(),
+            image_url: None,
+            published_at: Some("2026-08-01T00:00:00+00:00".into()),
+            enclosures: vec![],
+        };
+        let newer = NewArticle {
+            guid: "new-pend-zt".into(),
+            url: Some("https://example.com/new-pend-zt".into()),
+            title: "New pending".into(),
+            author: None,
+            summary: None,
+            content_html: None,
+            body_text: "".into(),
+            image_url: None,
+            published_at: Some("2026-08-06T00:00:00+00:00".into()),
+            enclosures: vec![],
+        };
+        assert!(db::upsert_article(&conn, feed_id, &older, false, &[]).unwrap());
+        assert!(db::upsert_article(&conn, feed_id, &newer, false, &[]).unwrap());
+        let old_id: i64 = conn
+            .query_row(
+                "SELECT id FROM articles WHERE guid = 'old-zerotag'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let new_id: i64 = conn
+            .query_row(
+                "SELECT id FROM articles WHERE guid = 'new-pend-zt'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        db::enqueue_auto_tag(&conn, old_id).unwrap();
+        let claimed = db::claim_auto_tag_job(&conn).unwrap().unwrap().0;
+        assert_eq!(claimed, old_id);
+        // Done with zero tags — the 0-tag redo path for default backfill.
+        db::mark_auto_tag_done(&conn, old_id).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM article_tags WHERE article_id = ?1",
+                rusqlite::params![old_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+
+        db::enqueue_auto_tag(&conn, new_id).unwrap();
+        assert_eq!(db::enqueue_auto_tag_backfill(&conn, 30, false).unwrap(), 1);
+        assert_eq!(db::auto_tag_queue_status(&conn).unwrap().pending, 2);
+
+        let first = db::claim_auto_tag_job(&conn).unwrap().unwrap();
+        assert_eq!(
+            first.0, new_id,
+            "newer pending must stay ahead after backfill re-queues older 0-tag done"
+        );
+        let second = db::claim_auto_tag_job(&conn).unwrap().unwrap();
+        assert_eq!(second.0, old_id);
 
         remove_temp_db(conn, path);
     }

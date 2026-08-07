@@ -2069,6 +2069,27 @@ pub fn delete_tag(conn: &Connection, id: i64) -> AppResult<()> {
     Ok(())
 }
 
+/// Delete tags of the given kind that have zero `article_tags` rows.
+///
+/// Only AI tags may be cleaned up this way — interest tags are an
+/// admin-maintained closed vocabulary and must be kept even when unused.
+/// Returns the number of rows deleted.
+pub fn delete_empty_tags(conn: &Connection, kind: &str) -> AppResult<usize> {
+    let kind = normalize_tag_kind(kind)?;
+    if kind != TAG_KIND_AI {
+        return Err(AppError::code("cleanupEmptyInterestForbidden"));
+    }
+    let n = conn.execute(
+        "DELETE FROM tags
+         WHERE kind = ?1
+           AND NOT EXISTS (
+             SELECT 1 FROM article_tags at WHERE at.tag_id = tags.id
+           )",
+        params![kind],
+    )?;
+    Ok(n)
+}
+
 /// Attach (`on = true`) or detach a tag from one article.
 pub fn set_article_tag(conn: &Connection, article_id: i64, tag_id: i64, on: bool) -> AppResult<()> {
     if on {
@@ -2172,12 +2193,13 @@ fn enqueue_auto_tag_inner(
 
 /// Enqueue articles published (or fetched) within the last `days` days.
 ///
-/// Default (`force = false`): only never-queued and `failed` rows become
-/// pending. Successfully `done` jobs are left alone so backfill does not
-/// re-spend AI tokens on articles that already completed tagging.
-/// Pending/processing rows are never touched.
+/// Default (`force = false`): never-queued, `failed`, and non-active queue rows
+/// whose article still has **zero** `article_tags` become pending. Soft-empty /
+/// empty-AI completions stay visible as “untagged” in the UI; re-queuing only
+/// those spends tokens where it matters. Articles that already have tags are
+/// left alone. Pending/processing rows are never touched.
 ///
-/// With `force = true`: also resets `done` rows (admin re-tag).
+/// With `force = true`: also resets every non-active row (admin re-tag), tags or not.
 /// Returns the number of rows newly set to pending.
 pub fn enqueue_auto_tag_backfill(
     conn: &Connection,
@@ -2191,7 +2213,13 @@ pub fn enqueue_auto_tag_backfill(
     let conflict_filter = if force {
         "auto_tag_queue.status NOT IN ('pending', 'processing')"
     } else {
-        "auto_tag_queue.status = 'failed'"
+        // failed always; any non-active row only when the article still has no tags.
+        "(auto_tag_queue.status = 'failed'
+          OR (auto_tag_queue.status NOT IN ('pending', 'processing')
+              AND NOT EXISTS (
+                  SELECT 1 FROM article_tags at
+                  WHERE at.article_id = auto_tag_queue.article_id
+              )))"
     };
     let sql = format!(
         "INSERT INTO auto_tag_queue(article_id, status, attempts, last_error, updated_at)
@@ -2208,6 +2236,48 @@ pub fn enqueue_auto_tag_backfill(
     );
     let n = conn.execute(&sql, params![modifier])?;
     Ok(n)
+}
+
+/// Article coverage inside the backfill time window (published/fetched).
+///
+/// `untagged` = no rows in `article_tags` (matches what default backfill
+/// treats as still needing tags when status is `done`).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoTagWindowStats {
+    pub days: i64,
+    pub articles: i64,
+    pub untagged: i64,
+    pub tagged: i64,
+}
+
+/// Count articles (and untagged subset) in the same window backfill uses.
+pub fn auto_tag_window_stats(conn: &Connection, days: i64) -> AppResult<AutoTagWindowStats> {
+    let days = days.max(1);
+    let modifier = format!("-{days} days");
+    let articles: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM articles a
+         WHERE datetime(COALESCE(a.published_at, a.fetched_at))
+               >= datetime('now', ?1)",
+        params![modifier],
+        |r| r.get(0),
+    )?;
+    let untagged: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM articles a
+         WHERE datetime(COALESCE(a.published_at, a.fetched_at))
+               >= datetime('now', ?1)
+           AND NOT EXISTS (
+               SELECT 1 FROM article_tags at WHERE at.article_id = a.id
+           )",
+        params![modifier],
+        |r| r.get(0),
+    )?;
+    Ok(AutoTagWindowStats {
+        days,
+        articles,
+        untagged,
+        tagged: articles - untagged,
+    })
 }
 
 /// Atomically claim one pending job → `processing`.
@@ -3004,6 +3074,7 @@ pub fn estimate_ai_cost_cny(conn: &Connection, stats: &AiUsageStats) -> f64 {
 /// Calendar days use the server's local timezone (`localtime`) so an
 /// Asia/Shanghai host buckets by CST rather than UTC midnight.
 /// Returns `(YYYY-MM-DD, count)` rows — days with zero articles are omitted.
+/// Per-day article ingest counts (`fetched_at`, local calendar), newest day first.
 pub fn daily_article_counts(conn: &Connection, days: i64) -> AppResult<Vec<(String, i64)>> {
     let days = days.clamp(1, 366);
     // Inclusive window: today and the preceding (days − 1) calendar days.
@@ -3016,7 +3087,7 @@ pub fn daily_article_counts(conn: &Connection, days: i64) -> AppResult<Vec<(Stri
          WHERE datetime(fetched_at, 'localtime')
                >= datetime('now', 'localtime', 'start of day', ?1)
          GROUP BY d
-         ORDER BY d",
+         ORDER BY d DESC",
     )?;
     let rows = stmt
         .query_map(params![modifier], |r| {
@@ -3028,6 +3099,7 @@ pub fn daily_article_counts(conn: &Connection, days: i64) -> AppResult<Vec<(Stri
 
 /// Like [`daily_article_counts`], but every calendar day in the window is
 /// present (zero-filled) so charts/lists do not have gaps.
+/// Days are newest-first (today at index 0).
 pub fn daily_article_counts_filled(
     conn: &Connection,
     days: i64,
@@ -3038,7 +3110,7 @@ pub fn daily_article_counts_filled(
     let map: std::collections::HashMap<String, i64> = sparse.into_iter().collect();
     let today = Local::now().date_naive();
     let mut out = Vec::with_capacity(days as usize);
-    for i in (0..days).rev() {
+    for i in 0..days {
         let d = today - Duration::days(i);
         let key = d.format("%Y-%m-%d").to_string();
         let count = map.get(&key).copied().unwrap_or(0);
@@ -4006,6 +4078,46 @@ mod tests {
         // The pre-existing tags keep their relative order.
         assert!(
             order.iter().position(|&x| x == a) < order.iter().position(|&x| x == zoo),
+        );
+    }
+
+    #[test]
+    fn delete_empty_tags_removes_only_unused_ai() {
+        let (conn, article_id) = test_db();
+        let empty_ai = create_tag(&conn, "orphan-ai", TAG_KIND_AI).unwrap();
+        let used_ai = create_tag(&conn, "used-ai", TAG_KIND_AI).unwrap();
+        let empty_interest = create_tag(&conn, "orphan-interest", TAG_KIND_INTEREST).unwrap();
+        set_article_tag(&conn, article_id, used_ai, true).unwrap();
+
+        let deleted = delete_empty_tags(&conn, TAG_KIND_AI).unwrap();
+        assert_eq!(deleted, 1);
+        assert!(list_tags(&conn, Some(TAG_KIND_AI))
+            .unwrap()
+            .iter()
+            .all(|t| t.id != empty_ai));
+        assert!(list_tags(&conn, Some(TAG_KIND_AI))
+            .unwrap()
+            .iter()
+            .any(|t| t.id == used_ai));
+        // Empty interest vocabulary is never cleaned up.
+        assert!(list_tags(&conn, Some(TAG_KIND_INTEREST))
+            .unwrap()
+            .iter()
+            .any(|t| t.id == empty_interest));
+    }
+
+    #[test]
+    fn delete_empty_tags_rejects_interest_kind() {
+        let (conn, _aid) = test_db();
+        let _ = create_tag(&conn, "keep-me", TAG_KIND_INTEREST).unwrap();
+        let err = delete_empty_tags(&conn, TAG_KIND_INTEREST).unwrap_err();
+        assert!(matches!(
+            err,
+            AppError::Coded("cleanupEmptyInterestForbidden")
+        ));
+        assert_eq!(
+            list_tags(&conn, Some(TAG_KIND_INTEREST)).unwrap().len(),
+            1
         );
     }
 

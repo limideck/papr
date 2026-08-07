@@ -2560,6 +2560,8 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
     onSubmit: (v: string) => void;
   } | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<Tag | null>(null);
+  const [confirmCleanupEmpty, setConfirmCleanupEmpty] = useState(false);
+  const [cleanupBusy, setCleanupBusy] = useState(false);
   const [tagSort, setTagSort] = useState<{
     mode: TagSortMode;
     dir: TagSortDir;
@@ -2568,8 +2570,8 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
 
   const tags = useQuery({ queryKey: ["tags"], queryFn: () => api.listTags() });
   const status = useQuery({
-    queryKey: ["auto-tag-status"],
-    queryFn: api.getAutoTagStatus,
+    queryKey: ["auto-tag-status", backfillDays],
+    queryFn: () => api.getAutoTagStatus(backfillDays),
     retry: false,
     refetchInterval: 15_000,
   });
@@ -2666,6 +2668,20 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
     }
   };
 
+  const cleanupEmptyAiTags = async () => {
+    setCleanupBusy(true);
+    try {
+      const res = await api.cleanupEmptyTags("ai");
+      refreshTags();
+      onToast(t("settings.autoTag.cleanupEmptyDone", { count: res.deleted }));
+    } catch (e) {
+      reportError(e);
+    } finally {
+      setCleanupBusy(false);
+      setConfirmCleanupEmpty(false);
+    }
+  };
+
   const runBackfill = async () => {
     setBackfillBusy(true);
     try {
@@ -2707,6 +2723,8 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
     (tg) => (tg.kind ?? "interest") === "interest",
   );
   const aiList = allTags.filter((tg) => tg.kind === "ai");
+  const emptyAiCount = aiList.filter((tg) => (tg.articleCount ?? 0) === 0)
+    .length;
   const activeList = tab === "ai" ? aiList : interestList;
   const sortedList = sortTagsList(activeList, tagSort.mode, tagSort.dir);
   const totalPages = Math.max(
@@ -2780,6 +2798,18 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
                 {tagSort.mode === "count" && tagSort.dir === "asc" ? "↑" : "↓"}
               </button>
             </span>
+          )}
+          {/* Always visible on AI tab — never gate on client empty count. */}
+          {tab === "ai" && (
+            <button
+              className="s-btn danger"
+              type="button"
+              disabled={cleanupBusy}
+              onClick={() => setConfirmCleanupEmpty(true)}
+              title={t("settings.autoTag.cleanupEmptyHint")}
+            >
+              {t("settings.autoTag.cleanupEmpty")}
+            </button>
           )}
           {allowCreate && (
             <button
@@ -3051,6 +3081,14 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
             }
           />
         </Row>
+        {st?.articlesInWindow != null && st.untaggedInWindow != null && (
+          <p className="settings-group-desc" style={{ marginTop: -4 }}>
+            {t("settings.autoTag.backfillWindowHint", {
+              untagged: st.untaggedInWindow,
+              total: st.articlesInWindow,
+            })}
+          </p>
+        )}
         <Row
           label={t("settings.autoTag.backfillForce")}
           desc={t("settings.autoTag.backfillForceDesc")}
@@ -3100,6 +3138,22 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
           danger
           onConfirm={() => void removeTag(confirmDelete)}
           onClose={() => setConfirmDelete(null)}
+        />
+      )}
+      {confirmCleanupEmpty && (
+        <ConfirmDialog
+          title={t("settings.autoTag.cleanupEmpty")}
+          message={
+            emptyAiCount > 0
+              ? t("settings.autoTag.cleanupEmptyConfirm", {
+                  count: emptyAiCount,
+                })
+              : t("settings.autoTag.cleanupEmptyConfirmUnknown")
+          }
+          confirmLabel={t("settings.autoTag.cleanupEmpty")}
+          danger
+          onConfirm={() => void cleanupEmptyAiTags()}
+          onClose={() => setConfirmCleanupEmpty(false)}
         />
       )}
     </>
