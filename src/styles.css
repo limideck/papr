@@ -1992,6 +1992,14 @@ button { font-family: inherit; }
   background: transparent;
   filter: none;
 }
+/* Keep filled primary look when disabled — otherwise transparent bg + #fff
+   text leaves the label unreadable (accent border only), e.g. 保存密码. */
+.s-btn.primary:disabled,
+.s-btn.primary:disabled:hover {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
 /* a filled, destructive primary — the confirm button in ConfirmDialog */
 .s-btn.primary.danger {
   background: var(--danger-solid);
@@ -1999,6 +2007,12 @@ button { font-family: inherit; }
   color: #fff;
 }
 .s-btn.primary.danger:hover { background: var(--danger-solid); filter: brightness(0.94); }
+.s-btn.primary.danger:disabled,
+.s-btn.primary.danger:disabled:hover {
+  background: var(--danger-solid);
+  border-color: var(--danger-solid);
+  color: #fff;
+}
 
 /* Feed list (in subscriptions section) */
 .s-feed-row {
@@ -2735,16 +2749,20 @@ button { font-family: inherit; }
   background: color-mix(in oklch, var(--tag-c) 16%, transparent);
 }
 
+/* Tag picker — same chrome as .ctx-menu / settings rows; quiet hierarchy. */
 .tag-picker {
   position: fixed;
   z-index: 300;
-  width: 232px;
-  background: var(--paper);
+  width: 268px;
+  background: var(--panel-2);
   border: 1px solid var(--hair-strong);
   border-radius: 10px;
-  box-shadow: var(--shadow-pop);
+  box-shadow: var(--shadow-pop), var(--shadow-ring);
   display: flex;
   flex-direction: column;
+  padding: 5px;
+  animation: cp-pop .12s ease;
+  max-height: calc(100vh - 16px);
   overflow: hidden;
 }
 .tag-picker-head {
@@ -2752,10 +2770,151 @@ button { font-family: inherit; }
   font-weight: 600;
   color: var(--muted-2);
   text-transform: uppercase;
-  letter-spacing: 0.07em;
-  padding: 10px 12px 6px;
+  letter-spacing: 0.1em;
+  padding: 7px 10px 5px;
 }
-.tag-picker-list { max-height: 220px; overflow-y: auto; padding: 0 6px; }
+.tag-picker-section-label {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--muted-2);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  padding: 8px 10px 4px;
+}
+.tag-picker-sep {
+  height: 1px;
+  background: var(--hair);
+  margin: 4px 6px;
+}
+.tag-picker-current {
+  padding: 0 4px 2px;
+}
+.tag-picker-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  padding: 2px 6px 6px;
+}
+/* Match .article-tag; compact remove affordance instead of extra chip chrome. */
+.tag-picker-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--tag-c);
+  background: color-mix(in oklch, var(--tag-c) 13%, transparent);
+  border: 0;
+  border-radius: 12px;
+  padding: 2px 4px 2px 7px;
+  max-width: 100%;
+}
+.tag-picker-chip .tag-dot { background: var(--tag-c); }
+.tag-picker-chip.ai {
+  border: 1px dashed color-mix(in oklch, var(--tag-c) 45%, transparent);
+  background: color-mix(in oklch, var(--tag-c) 8%, transparent);
+}
+.tag-picker-chip-name {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: default;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 140px;
+}
+button.tag-picker-chip-name {
+  cursor: pointer;
+  border-radius: 4px;
+}
+button.tag-picker-chip-name:hover,
+button.tag-picker-chip-name:focus-visible {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  outline: none;
+}
+.tag-picker-chip-remove {
+  width: 18px;
+  height: 18px;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--tag-c);
+  opacity: 0.55;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  padding: 0;
+}
+.tag-picker-chip-remove:hover,
+.tag-picker-chip-remove:focus-visible {
+  opacity: 1;
+  background: color-mix(in oklch, var(--tag-c) 18%, transparent);
+  outline: none;
+}
+.tag-picker-ai {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 4px 6px 6px;
+}
+/* Native control — mirrors .s-btn / .s-btn.primary with app accent. */
+.tag-picker-ai-btn {
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--ink);
+  background: var(--panel);
+  border: 1px solid var(--hair-strong);
+  border-radius: 7px;
+  padding: 6px 11px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  width: 100%;
+  transition: background .12s, border-color .12s, filter .12s;
+}
+.tag-picker-ai-btn:hover {
+  background: var(--hover);
+  border-color: var(--ink-2);
+}
+.tag-picker-ai-btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.tag-picker-ai-btn.primary:hover { filter: brightness(0.95); }
+.tag-picker-ai-btn:disabled,
+.tag-picker-ai-btn:disabled:hover {
+  opacity: 0.55;
+  cursor: default;
+  filter: none;
+}
+.tag-picker-ai-btn.primary:disabled,
+.tag-picker-ai-btn.primary:disabled:hover {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.tag-picker-ai-hint {
+  margin: 0;
+  padding: 0 2px;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--muted);
+}
+.tag-picker-list {
+  max-height: 180px;
+  overflow-y: auto;
+  padding: 0 2px;
+}
 .tag-picker-row {
   display: flex;
   align-items: center;
@@ -2767,7 +2926,7 @@ button { font-family: inherit; }
   color: var(--ink-2);
 }
 .tag-picker-row:hover,
-.tag-picker-row:focus-visible { background: var(--hover); outline: none; }
+.tag-picker-row:focus-visible { background: var(--selected); color: var(--ink); outline: none; }
 .tag-picker-row.on { color: var(--ink); font-weight: 500; }
 .tag-picker-name {
   flex: 1;
@@ -2776,12 +2935,18 @@ button { font-family: inherit; }
   white-space: nowrap;
 }
 .tag-picker-row svg { color: var(--accent); }
-.tag-picker-empty { padding: 8px 10px 12px; font-size: 12px; color: var(--muted); }
+.tag-picker-empty {
+  padding: 8px 10px 10px;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.45;
+}
 .tag-picker-create {
   display: flex;
   gap: 6px;
-  padding: 8px;
+  padding: 6px 6px 4px;
   border-top: 1px solid var(--hair);
+  margin-top: 2px;
 }
 .tag-picker-create input {
   flex: 1;
@@ -2789,7 +2954,7 @@ button { font-family: inherit; }
   font-family: inherit;
   font-size: 12.5px;
   border: 1px solid var(--hair-strong);
-  border-radius: 6px;
+  border-radius: 7px;
   padding: 5px 8px;
   background: var(--panel);
   color: var(--ink);
@@ -2800,14 +2965,16 @@ button { font-family: inherit; }
   background: var(--accent);
   color: #fff;
   border: 0;
-  border-radius: 6px;
+  border-radius: 7px;
   width: 30px;
   cursor: pointer;
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  flex-shrink: 0;
 }
 .tag-picker-create button:disabled { opacity: 0.4; cursor: default; }
+.tag-picker-create button:hover:not(:disabled) { filter: brightness(0.95); }
 
 /* ====== Podcast episode play button ====== */
 .episode {

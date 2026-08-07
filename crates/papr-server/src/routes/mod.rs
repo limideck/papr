@@ -61,6 +61,10 @@ pub fn api_router() -> Router<AppState> {
             post(articles::extract_fulltext),
         )
         .route(
+            "/api/articles/{id}/auto-tag",
+            post(auto_tag::process_one),
+        )
+        .route(
             "/api/articles/{id}/translate-preview",
             post(ai::translate_preview),
         )

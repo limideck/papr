@@ -84,8 +84,17 @@
   },
   "tagPicker": {
     "title": "为这篇文章打标签",
-    "empty": "还没有标签——在下方新建一个。",
-    "createPlaceholder": "新标签…"
+    "empty": "还没有兴趣标签——在下方新建一个。",
+    "createPlaceholder": "新标签…",
+    "current": "本文标签",
+    "interestVocab": "兴趣标签",
+    "detach": "从本文移除",
+    "rename": "重命名标签",
+    "renameAi": "重命名 AI 标签",
+    "aiAuto": "AI 自动打标签",
+    "aiAgain": "AI 再打一次",
+    "aiTagging": "正在打标签…",
+    "aiHint": "立即打标，优先于后台队列。"
   },
   "player": {
     "play": "播放",

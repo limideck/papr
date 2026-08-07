@@ -84,8 +84,17 @@
   },
   "tagPicker": {
     "title": "Tag this article",
-    "empty": "No tags yet — create one below.",
-    "createPlaceholder": "New tag…"
+    "empty": "No interest tags yet — create one below.",
+    "createPlaceholder": "New tag…",
+    "current": "On this article",
+    "interestVocab": "Interest tags",
+    "detach": "Remove from article",
+    "rename": "Rename tag",
+    "renameAi": "Rename AI tag",
+    "aiAuto": "AI auto-tag",
+    "aiAgain": "AI tag again",
+    "aiTagging": "Tagging…",
+    "aiHint": "Tags this article now — ahead of the background queue."
   },
   "player": {
     "play": "Play",

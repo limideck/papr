@@ -84,8 +84,17 @@
   },
   "tagPicker": {
     "title": "この記事にタグを付ける",
-    "empty": "タグがありません — 下で作成してください。",
-    "createPlaceholder": "新しいタグ…"
+    "empty": "インタレストタグがありません — 下で作成してください。",
+    "createPlaceholder": "新しいタグ…",
+    "current": "この記事のタグ",
+    "interestVocab": "インタレストタグ",
+    "detach": "記事から外す",
+    "rename": "タグ名を変更",
+    "renameAi": "AIタグ名を変更",
+    "aiAuto": "AI自動タグ付け",
+    "aiAgain": "AIでもう一度",
+    "aiTagging": "タグ付け中…",
+    "aiHint": "すぐタグ付け。バックグラウンドキューより優先します。"
   },
   "player": {
     "play": "再生",

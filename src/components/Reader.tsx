@@ -1111,7 +1111,7 @@ export default function Reader({ onToast }: Props) {
       {tagPick && (
         <TagPicker
           articleId={a.id}
-          attached={a.tags.map((tg) => tg.id)}
+          attachedTags={a.tags}
           x={tagPick.x}
           y={tagPick.y}
           onClose={() => setTagPick(null)}

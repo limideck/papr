@@ -8,12 +8,14 @@ import { reportError } from "../toast";
 import { tagColor } from "../lib/tagColors";
 import { clampToViewport } from "../lib/viewport";
 import { NO_AUTOCORRECT } from "../lib/inputProps";
+import type { Tag } from "../types";
 import Icon from "./Icon";
+import PromptDialog from "./PromptDialog";
 
 interface Props {
   articleId: number;
-  /** Ids of tags already attached to the article. */
-  attached: number[];
+  /** Tags already attached to the article (interest + AI). */
+  attachedTags: Tag[];
   /** Anchor point (viewport coords) the popover opens from. */
   x: number;
   y: number;
@@ -21,13 +23,15 @@ interface Props {
 }
 
 /**
- * Floating tag editor: toggle existing tags on an article, or create a new
- * one and attach it in a single step. Stays open across toggles.
- * Super-admins only — non-admins see tags on the article but cannot edit.
+ * Floating tag editor for a single article.
+ *
+ * - No tags → primary “AI auto-tag” action (any signed-in reader).
+ * - Has tags → current chips (detach for anyone; rename global for admin),
+ *   optional “AI tag again”, and admin interest vocabulary toggles + create.
  */
 export default function TagPicker({
   articleId,
-  attached,
+  attachedTags,
   x,
   y,
   onClose,
@@ -35,29 +39,29 @@ export default function TagPicker({
   const { t } = useTranslation();
   const { user } = useAuth();
   const isAdmin = !!user?.isAdmin;
+  const loggedIn = !!user;
   const qc = useQueryClient();
   const ref = useRef<HTMLDivElement>(null);
   const [draft, setDraft] = useState("");
+  const [aiBusy, setAiBusy] = useState(false);
+  const [rename, setRename] = useState<Tag | null>(null);
 
-  // Admin attach uses the closed interest vocabulary; AI tags are shown on
-  // the article but managed by the auto-tag worker / Settings.
+  // Admin attach uses the closed interest vocabulary; AI tags show on the
+  // article chips and are created by auto-tag.
   const tags = useQuery({
     queryKey: ["tags", "interest"],
     queryFn: () => api.listTags("interest"),
+    enabled: isAdmin,
   });
-  const attachedSet = new Set(attached);
+  const attachedSet = new Set(attachedTags.map((tg) => tg.id));
+  const hasTags = attachedTags.length > 0;
 
-  // Tabbing past the popover's last control dismisses it, the way a click
-  // outside does — otherwise it floats over the page, orphaned from the
-  // keyboard.
   useDismiss(ref, onClose, { onFocusOut: true });
 
-  // Move focus into the popover on open so it is keyboard-reachable, and
-  // restore it to the trigger (the toolbar tag button) on close.
   useEffect(() => {
     const trigger = document.activeElement as HTMLElement | null;
     ref.current
-      ?.querySelector<HTMLElement>('[role="button"], input')
+      ?.querySelector<HTMLElement>("button, [role='button'], input")
       ?.focus();
     return () => trigger?.focus?.();
   }, []);
@@ -65,6 +69,14 @@ export default function TagPicker({
   const sync = () => {
     qc.invalidateQueries({ queryKey: ["article", articleId] });
     qc.invalidateQueries({ queryKey: ["tags"] });
+  };
+
+  const detach = (tagId: number) => {
+    if (!loggedIn) return;
+    api
+      .setArticleTag(articleId, tagId, false)
+      .then(sync)
+      .catch((e) => reportError(e));
   };
 
   const toggle = (tagId: number, on: boolean) => {
@@ -89,67 +101,198 @@ export default function TagPicker({
     }
   };
 
-  // Clamp inside the viewport with the shared two-sided helper. The popover
-  // is ~232px wide and ~320px tall; the 248/320 footprint plus the 0px margin
-  // reproduces the historical pull-back while flooring the top-left corner so
-  // a narrow/short window can't push the popover off-screen.
-  const { left, top } = clampToViewport({ x, y, width: 248, height: 320, margin: 0 });
+  const runAiTag = async () => {
+    if (!loggedIn || aiBusy) return;
+    setAiBusy(true);
+    try {
+      await api.autoTagArticle(articleId);
+      sync();
+    } catch (e) {
+      reportError(e);
+    } finally {
+      setAiBusy(false);
+    }
+  };
+
+  const { left, top } = clampToViewport({
+    x,
+    y,
+    width: 268,
+    height: 380,
+    margin: 0,
+  });
+
+  const showAi = loggedIn;
+  const showVocab = isAdmin;
+  const showCurrent = hasTags;
 
   return (
-    <div className="tag-picker" ref={ref} style={{ left, top }}>
-      <div className="tag-picker-head">{t("tagPicker.title")}</div>
-      <div className="tag-picker-list">
-        {(tags.data ?? []).map((tag) => {
-          const on = attachedSet.has(tag.id);
-          return (
-            <div
-              key={tag.id}
-              className={`tag-picker-row ${on ? "on" : ""}`}
-              role="button"
-              tabIndex={isAdmin ? 0 : -1}
-              aria-pressed={on}
-              aria-disabled={!isAdmin}
-              onClick={() => isAdmin && toggle(tag.id, !on)}
-              onKeyDown={(e) => {
-                if (!isAdmin) return;
-                if (e.key === "Enter" || e.key === " ") {
-                  e.preventDefault();
-                  toggle(tag.id, !on);
-                }
-              }}
-            >
-              <span
-                className="tag-dot"
-                style={{ background: tagColor(tag.color) }}
-              />
-              <span className="tag-picker-name">{tag.name}</span>
-              {on && <Icon name="check" size={13} />}
+    <>
+      <div className="tag-picker" ref={ref} style={{ left, top }}>
+        <div className="tag-picker-head">{t("tagPicker.title")}</div>
+
+        {showCurrent && (
+          <div className="tag-picker-current">
+            <div className="tag-picker-section-label">
+              {t("tagPicker.current")}
             </div>
-          );
-        })}
-        {(tags.data ?? []).length === 0 && (
+            <div className="tag-picker-chips">
+              {attachedTags.map((tag) => (
+                <div
+                  key={tag.id}
+                  className={`tag-picker-chip${tag.kind === "ai" ? " ai" : ""}`}
+                  style={
+                    { "--tag-c": tagColor(tag.color) } as React.CSSProperties
+                  }
+                  title={
+                    tag.kind === "ai"
+                      ? t("reader.aiTagHint")
+                      : t("reader.interestTagHint")
+                  }
+                >
+                  <span className="tag-dot" />
+                  {isAdmin ? (
+                    <button
+                      type="button"
+                      className="tag-picker-chip-name"
+                      onClick={() => setRename(tag)}
+                      title={t("tagPicker.rename")}
+                    >
+                      {tag.name}
+                    </button>
+                  ) : (
+                    <span className="tag-picker-chip-name">{tag.name}</span>
+                  )}
+                  {loggedIn && (
+                    <button
+                      type="button"
+                      className="tag-picker-chip-remove"
+                      onClick={() => detach(tag.id)}
+                      title={t("tagPicker.detach")}
+                      aria-label={t("tagPicker.detach")}
+                    >
+                      <Icon name="x" size={11} />
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {showAi && (
+          <>
+            {showCurrent && <div className="tag-picker-sep" />}
+            <div className="tag-picker-ai">
+              <button
+                type="button"
+                className={`tag-picker-ai-btn${hasTags ? "" : " primary"}${aiBusy ? " busy" : ""}`}
+                onClick={runAiTag}
+                disabled={aiBusy}
+                aria-busy={aiBusy}
+                title={t("tagPicker.aiHint")}
+              >
+                <Icon
+                  name="sparkle"
+                  size={14}
+                  className={aiBusy ? "spinning" : undefined}
+                />
+                <span>
+                  {aiBusy
+                    ? t("tagPicker.aiTagging")
+                    : hasTags
+                      ? t("tagPicker.aiAgain")
+                      : t("tagPicker.aiAuto")}
+                </span>
+              </button>
+              <p className="tag-picker-ai-hint">{t("tagPicker.aiHint")}</p>
+            </div>
+          </>
+        )}
+
+        {showVocab && (
+          <>
+            {(showCurrent || showAi) && <div className="tag-picker-sep" />}
+            <div className="tag-picker-section-label">
+              {t("tagPicker.interestVocab")}
+            </div>
+            <div className="tag-picker-list">
+              {(tags.data ?? []).map((tag) => {
+                const on = attachedSet.has(tag.id);
+                return (
+                  <div
+                    key={tag.id}
+                    className={`tag-picker-row ${on ? "on" : ""}`}
+                    role="button"
+                    tabIndex={0}
+                    aria-pressed={on}
+                    onClick={() => toggle(tag.id, !on)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        toggle(tag.id, !on);
+                      }
+                    }}
+                  >
+                    <span
+                      className="tag-dot"
+                      style={{ background: tagColor(tag.color) }}
+                    />
+                    <span className="tag-picker-name">{tag.name}</span>
+                    {on && <Icon name="check" size={13} />}
+                  </div>
+                );
+              })}
+              {(tags.data ?? []).length === 0 && (
+                <div className="tag-picker-empty">{t("tagPicker.empty")}</div>
+              )}
+            </div>
+            <div className="tag-picker-create">
+              <input
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.nativeEvent.isComposing) {
+                    createAndAttach();
+                  }
+                }}
+                placeholder={t("tagPicker.createPlaceholder")}
+                aria-label={t("tagPicker.createPlaceholder")}
+                {...NO_AUTOCORRECT}
+              />
+              <button
+                type="button"
+                onClick={createAndAttach}
+                disabled={!draft.trim()}
+              >
+                <Icon name="plus" size={13} />
+              </button>
+            </div>
+          </>
+        )}
+
+        {!isAdmin && !hasTags && !loggedIn && (
           <div className="tag-picker-empty">{t("tagPicker.empty")}</div>
         )}
       </div>
-      {isAdmin && (
-        <div className="tag-picker-create">
-          <input
-            value={draft}
-            onChange={(e) => setDraft(e.target.value)}
-            onKeyDown={(e) => {
-              // Skip the Enter that confirms an IME candidate (CJK input) so a
-              // half-composed draft isn't turned into a tag.
-              if (e.key === "Enter" && !e.nativeEvent.isComposing) createAndAttach();
-            }}
-            placeholder={t("tagPicker.createPlaceholder")}
-            aria-label={t("tagPicker.createPlaceholder")}
-            {...NO_AUTOCORRECT}
-          />
-          <button onClick={createAndAttach} disabled={!draft.trim()}>
-            <Icon name="plus" size={13} />
-          </button>
-        </div>
+
+      {rename && (
+        <PromptDialog
+          title={
+            rename.kind === "ai"
+              ? t("tagPicker.renameAi")
+              : t("tagPicker.rename")
+          }
+          initialValue={rename.name}
+          onSubmit={(name) => {
+            api
+              .renameTag(rename.id, name)
+              .then(sync)
+              .catch((e) => reportError(e));
+          }}
+          onClose={() => setRename(null)}
+        />
       )}
-    </div>
+    </>
   );
 }

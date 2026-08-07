@@ -2392,10 +2392,14 @@ pub fn release_auto_tag_job(conn: &Connection, article_id: i64) -> AppResult<()>
 }
 
 pub fn mark_auto_tag_done(conn: &Connection, article_id: i64) -> AppResult<()> {
+    // Upsert so interactive / sync tagging (never queued) still lands as done.
     conn.execute(
-        "UPDATE auto_tag_queue
-         SET status = 'done', last_error = NULL, updated_at = datetime('now')
-         WHERE article_id = ?1",
+        "INSERT INTO auto_tag_queue(article_id, status, attempts, last_error, updated_at)
+         VALUES (?1, 'done', 0, NULL, datetime('now'))
+         ON CONFLICT(article_id) DO UPDATE SET
+             status = 'done',
+             last_error = NULL,
+             updated_at = datetime('now')",
         params![article_id],
     )?;
     Ok(())

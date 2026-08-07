@@ -129,7 +129,12 @@ pub async fn set_article_tag(
     Path((article_id, tag_id)): Path<(i64, i64)>,
     Json(body): Json<SetTagBody>,
 ) -> ApiResult<Json<Value>> {
-    user.require_admin()?;
+    // Attach (and create-via-toggle) stays admin-only. Any authenticated
+    // reader may detach a tag from an article — especially useful for
+    // clearing unwanted AI tags without leaving the reader.
+    if body.on {
+        user.require_admin()?;
+    }
     let conn = state.db.lock().await;
     db::set_article_tag(&conn, article_id, tag_id, body.on).map_err(ApiError::from)?;
     Ok(Json(json!({ "ok": true })))

@@ -562,6 +562,13 @@ export const setArticleTag = (articleId: number, tagId: number, on: boolean) =>
     body: JSON.stringify({ on }),
   });
 
+/** Run interest + AI auto-tag on one article (sync). Returns updated tags. */
+export const autoTagArticle = (articleId: number) =>
+  apiJson<{ ok: boolean; tags: Tag[] }>(
+    `${API}/articles/${articleId}/auto-tag`,
+    { method: "POST" },
+  );
+
 // ── filter rules ──
 export const listRules = () => apiJson<Rule[]>(`${API}/rules`);
 export const createRule = (

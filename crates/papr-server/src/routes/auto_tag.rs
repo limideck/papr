@@ -1,10 +1,10 @@
-//! Auto-tag queue status and backfill (admin).
+//! Auto-tag queue status, backfill (admin), and per-article sync tagging.
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::{AppState, AuthUser};
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::Json;
-use papr_core::db;
+use papr_core::{auto_tag, db};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -96,5 +96,40 @@ pub async fn clear_queue(
     let cleared = db::clear_auto_tag_queue(&conn).map_err(ApiError::from)?;
     Ok(Json(json!({
         "cleared": cleared,
+    })))
+}
+
+/// `POST /api/articles/{id}/auto-tag` — run the auto-tag pipeline on one
+/// article synchronously (interest closed-vocab + AI free-form, as configured).
+/// Any authenticated reader may call this; returns the article's tags after.
+///
+/// Manual tagging takes priority over the background queue: while this handler
+/// runs, workers skip claiming new jobs (see `AppState::auto_tag_manual_inflight`).
+pub async fn process_one(
+    State(state): State<AppState>,
+    _user: AuthUser,
+    Path(article_id): Path<i64>,
+) -> ApiResult<Json<Value>> {
+    // Ensure the article exists before spending an LLM call.
+    {
+        let conn = state.db.lock().await;
+        db::get_article(&conn, article_id).map_err(ApiError::from)?;
+    }
+
+    // Pause backlog claims for the duration of this sync call (cleared on drop).
+    let _manual = state.begin_manual_auto_tag();
+
+    auto_tag::process_article(&state.db, &state.http, article_id)
+        .await
+        .map_err(ApiError::from)?;
+
+    let conn = state.db.lock().await;
+    // Queue bookkeeping so status / backfill views stay consistent.
+    let _ = db::mark_auto_tag_done(&conn, article_id);
+
+    let article = db::get_article(&conn, article_id).map_err(ApiError::from)?;
+    Ok(Json(json!({
+        "ok": true,
+        "tags": article.tags,
     })))
 }

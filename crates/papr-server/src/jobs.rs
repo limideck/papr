@@ -121,22 +121,41 @@ async fn auto_tag_worker(state: AppState, worker_id: usize) {
             continue;
         }
 
+        // Manual sync auto-tag (reader click) holds the LLM / writer mutex —
+        // skip claiming so backlog workers do not pile on in parallel.
+        if state.manual_auto_tag_busy() {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            continue;
+        }
+
         let job = {
             let conn = state.db.lock().await;
             // Cheap periodic reclaim so a crashed peer does not leave jobs stuck.
             if worker_id == 0 {
                 let _ = db::reclaim_stale_auto_tag_jobs(&conn, Some(AUTO_TAG_STALE_MINUTES));
             }
-            match db::claim_auto_tag_job(&conn) {
-                Ok(j) => j,
-                Err(e) => {
-                    tracing::warn!(worker_id, "auto-tag claim failed: {e}");
-                    None
+            // Re-check under the lock window: a manual request may have started
+            // between the busy probe and acquiring the DB mutex.
+            if state.manual_auto_tag_busy() {
+                None
+            } else {
+                match db::claim_auto_tag_job(&conn) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        tracing::warn!(worker_id, "auto-tag claim failed: {e}");
+                        None
+                    }
                 }
             }
         };
         let Some((article_id, _attempts)) = job else {
-            tokio::time::sleep(Duration::from_secs(AUTO_TAG_IDLE_SECS)).await;
+            // Brief nap when a race lost to manual busy; otherwise idle poll.
+            let wait = if state.manual_auto_tag_busy() {
+                Duration::from_millis(400)
+            } else {
+                Duration::from_secs(AUTO_TAG_IDLE_SECS)
+            };
+            tokio::time::sleep(wait).await;
             continue;
         };
 
