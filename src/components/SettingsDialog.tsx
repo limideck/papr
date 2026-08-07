@@ -49,6 +49,7 @@ const ADMIN_SECTIONS: { id: string; labelKey: string; icon: IconName }[] = [
   { id: "wordcloud", labelKey: "settings.nav.wordcloud", icon: "sparkle" },
   { id: "users", labelKey: "settings.nav.users", icon: "star" },
   { id: "autoTag", labelKey: "settings.nav.autoTag", icon: "tag" },
+  { id: "stats", labelKey: "settings.nav.stats", icon: "list" },
 ];
 
 function buildSettingsSections(isAdmin: boolean) {
@@ -113,6 +114,7 @@ export default function SettingsDialog({
     wordcloud: t("settings.sub.wordcloud"),
     users: t("settings.sub.users"),
     autoTag: t("settings.sub.autoTag"),
+    stats: t("settings.sub.stats"),
     filters: t("settings.sub.filters"),
     sync: t("settings.sub.sync"),
     shortcuts: t("settings.sub.shortcuts"),
@@ -204,6 +206,7 @@ export default function SettingsDialog({
             {section === "autoTag" && isAdmin && (
               <AutoTagSection onToast={onToast} />
             )}
+            {section === "stats" && isAdmin && <StatsSection />}
             {section === "filters" && isAdmin && (
               <FiltersSection feeds={feeds.data ?? []} onToast={onToast} />
             )}
@@ -2432,6 +2435,113 @@ function sortTagsList(
   return sorted;
 }
 
+const STATS_DAILY_DAYS = 30;
+
+function StatsSection() {
+  const { t } = useTranslation();
+  const overview = useQuery({
+    queryKey: ["stats-overview", STATS_DAILY_DAYS],
+    queryFn: () => api.getStatsOverview(STATS_DAILY_DAYS),
+    retry: false,
+    refetchInterval: 60_000,
+  });
+
+  if (overview.isError) {
+    return (
+      <div className="settings-group">
+        <p className="settings-group-desc">{t("settings.stats.unavailable")}</p>
+      </div>
+    );
+  }
+
+  const d = overview.data;
+  const daily = d?.daily ?? [];
+  const maxDaily = Math.max(1, ...daily.map((x) => x.count));
+
+  return (
+    <>
+      <div className="settings-group">
+        <h3 className="settings-group-title">{t("settings.stats.overview")}</h3>
+        {!d ? (
+          <p className="settings-group-desc">{t("settings.stats.loading")}</p>
+        ) : (
+          <>
+            <Row label={t("settings.stats.totalArticles")}>
+              <span className="s-value">{d.totalArticles}</span>
+            </Row>
+            <Row label={t("settings.stats.feeds")}>
+              <span className="s-value">{d.feeds}</span>
+            </Row>
+            <Row
+              label={t("settings.stats.tagged")}
+              desc={t("settings.stats.taggedDesc")}
+            >
+              <span className="s-value">{d.taggedArticles}</span>
+            </Row>
+            <Row label={t("settings.stats.taggedInterest")}>
+              <span className="s-value">{d.taggedInterest}</span>
+            </Row>
+            <Row label={t("settings.stats.taggedAi")}>
+              <span className="s-value">{d.taggedAi}</span>
+            </Row>
+          </>
+        )}
+      </div>
+
+      <div className="settings-group">
+        <h3 className="settings-group-title">{t("settings.stats.queue")}</h3>
+        {!d ? (
+          <p className="settings-group-desc">{t("settings.stats.loading")}</p>
+        ) : (
+          <>
+            <Row label={t("settings.stats.pending")}>
+              <span className="s-value">{d.queue.pending}</span>
+            </Row>
+            <Row label={t("settings.stats.processing")}>
+              <span className="s-value">{d.queue.processing}</span>
+            </Row>
+            <Row label={t("settings.stats.failed")}>
+              <span className="s-value">{d.queue.failed}</span>
+            </Row>
+            <Row label={t("settings.stats.done")}>
+              <span className="s-value">{d.queue.done}</span>
+            </Row>
+          </>
+        )}
+      </div>
+
+      <div className="settings-group">
+        <h3 className="settings-group-title">
+          {t("settings.stats.daily", { days: STATS_DAILY_DAYS })}
+        </h3>
+        <p className="settings-group-desc">{t("settings.stats.dailyDesc")}</p>
+        {!d ? (
+          <p className="settings-group-desc">{t("settings.stats.loading")}</p>
+        ) : (
+          <div className="s-stats-daily" role="img" aria-label={t("settings.stats.daily", { days: STATS_DAILY_DAYS })}>
+            {daily.map((row) => {
+              const pct = Math.round((row.count / maxDaily) * 100);
+              const label = row.date.slice(5); // MM-DD
+              return (
+                <div key={row.date} className="s-stats-daily-row" title={`${row.date}: ${row.count}`}>
+                  <span className="s-stats-daily-date">{label}</span>
+                  <div className="s-stats-daily-bar-track">
+                    <div
+                      className="s-stats-daily-bar"
+                      style={{ width: `${pct}%` }}
+                    />
+                  </div>
+                  <span className="s-stats-daily-count">{row.count}</span>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </>
+  );
+}
+
 function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
   const { t } = useTranslation();
   const qc = useQueryClient();
@@ -2441,6 +2551,7 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
   const [interestMax, setInterestMax] = useState(5);
   const [aiMax, setAiMax] = useState(5);
   const [backfillDays, setBackfillDays] = useState(7);
+  const [backfillForce, setBackfillForce] = useState(false);
   const [backfillBusy, setBackfillBusy] = useState(false);
   const [statusError, setStatusError] = useState(false);
   const [prompt, setPrompt] = useState<{
@@ -2558,7 +2669,7 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
   const runBackfill = async () => {
     setBackfillBusy(true);
     try {
-      const res = await api.backfillAutoTag(backfillDays);
+      const res = await api.backfillAutoTag(backfillDays, backfillForce);
       const count =
         res && typeof res === "object"
           ? (res.enqueued ?? res.queued ?? res.count)
@@ -2939,6 +3050,12 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
               setBackfillDays(clampSetting(e.target.value, 7, 1, 365))
             }
           />
+        </Row>
+        <Row
+          label={t("settings.autoTag.backfillForce")}
+          desc={t("settings.autoTag.backfillForceDesc")}
+        >
+          <Toggle checked={backfillForce} onChange={setBackfillForce} />
         </Row>
         <div
           style={{ display: "flex", justifyContent: "flex-end", paddingTop: 8 }}

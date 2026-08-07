@@ -30,6 +30,7 @@ import type {
   RulePreview,
   SessionUser,
   SmartCounts,
+  StatsOverview,
   Tag,
   TagKind,
   TranslateEvent,
@@ -162,18 +163,27 @@ function normalizeAutoTagStatus(raw: RawAutoTagStatus): AutoTagStatus {
   };
 }
 
-export const backfillAutoTag = (days: number) =>
-  apiJson<{ enqueued?: number; queued?: number; count?: number; days?: number }>(
-    `${API}/auto-tag/backfill`,
-    {
-      method: "POST",
-      body: JSON.stringify({ days }),
-    },
-  ).then((res) => ({
+export const backfillAutoTag = (days: number, force = false) =>
+  apiJson<{
+    enqueued?: number;
+    queued?: number;
+    count?: number;
+    days?: number;
+    force?: boolean;
+  }>(`${API}/auto-tag/backfill`, {
+    method: "POST",
+    body: JSON.stringify({ days, force }),
+  }).then((res) => ({
     ...res,
     // Backend returns `enqueued`; keep aliases for toast/UI.
     enqueued: res.enqueued ?? res.queued ?? res.count,
   }));
+
+/** Admin overview: totals, tagged coverage, queue, daily ingest. */
+export const getStatsOverview = (days = 30) =>
+  apiJson<StatsOverview>(
+    `${API}/stats/overview?days=${encodeURIComponent(String(days))}`,
+  );
 
 // ── folders ──
 export const listFolders = () => apiJson<Folder[]>(`${API}/folders`);

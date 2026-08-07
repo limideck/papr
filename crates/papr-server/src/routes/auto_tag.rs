@@ -32,6 +32,10 @@ pub struct BackfillBody {
     /// Re-enqueue articles from the last N days (default 7, min 1, max 365).
     #[serde(default = "default_days")]
     pub days: i64,
+    /// When true, also reset successfully `done` jobs so tagging re-runs.
+    /// Default false: only never-queued + failed (avoids re-spending tokens).
+    #[serde(default)]
+    pub force: bool,
 }
 
 fn default_days() -> i64 {
@@ -40,8 +44,8 @@ fn default_days() -> i64 {
 
 /// `POST /api/auto-tag/backfill` — enqueue recent articles for tagging (admin).
 ///
-/// Force path: resets done/failed rows in the window so tagging re-runs
-/// (ignores the recent-done skip used by routine enqueue).
+/// Default: enqueue missing (never queued) and re-queue `failed` only.
+/// `force: true` also resets `done` so operators can re-tag on demand.
 pub async fn backfill(
     State(state): State<AppState>,
     user: AuthUser,
@@ -50,10 +54,12 @@ pub async fn backfill(
     user.require_admin()?;
     let days = body.days.clamp(1, 365);
     let conn = state.db.lock().await;
-    let enqueued = db::enqueue_auto_tag_backfill(&conn, days).map_err(ApiError::from)?;
+    let enqueued =
+        db::enqueue_auto_tag_backfill(&conn, days, body.force).map_err(ApiError::from)?;
     Ok(Json(json!({
         "ok": true,
         "days": days,
+        "force": body.force,
         "enqueued": enqueued,
     })))
 }

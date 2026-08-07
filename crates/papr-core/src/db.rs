@@ -2105,7 +2105,7 @@ pub const AUTO_TAG_STATUS_PROCESSING: &str = "processing";
 pub const AUTO_TAG_STATUS_DONE: &str = "done";
 pub const AUTO_TAG_STATUS_FAILED: &str = "failed";
 
-/// Skip re-enqueue of recently completed jobs unless force/backfill.
+/// Skip re-enqueue of recently completed jobs unless force.
 const AUTO_TAG_RECENT_DONE_HOURS: i64 = 24;
 
 /// Enqueue (or re-enqueue) an article for auto-tagging.
@@ -2171,12 +2171,29 @@ fn enqueue_auto_tag_inner(
 }
 
 /// Enqueue articles published (or fetched) within the last `days` days.
-/// Force path: resets done/failed rows so backfill re-runs tagging.
+///
+/// Default (`force = false`): only never-queued and `failed` rows become
+/// pending. Successfully `done` jobs are left alone so backfill does not
+/// re-spend AI tokens on articles that already completed tagging.
+/// Pending/processing rows are never touched.
+///
+/// With `force = true`: also resets `done` rows (admin re-tag).
 /// Returns the number of rows newly set to pending.
-pub fn enqueue_auto_tag_backfill(conn: &Connection, days: i64) -> AppResult<usize> {
+pub fn enqueue_auto_tag_backfill(
+    conn: &Connection,
+    days: i64,
+    force: bool,
+) -> AppResult<usize> {
     let days = days.max(1);
     let modifier = format!("-{days} days");
-    let n = conn.execute(
+    // ON CONFLICT DO UPDATE WHERE … — when the WHERE is false SQLite treats
+    // the conflict like IGNORE (no update, not counted in changes()).
+    let conflict_filter = if force {
+        "auto_tag_queue.status NOT IN ('pending', 'processing')"
+    } else {
+        "auto_tag_queue.status = 'failed'"
+    };
+    let sql = format!(
         "INSERT INTO auto_tag_queue(article_id, status, attempts, last_error, updated_at)
          SELECT a.id, 'pending', 0, NULL, datetime('now')
          FROM articles a
@@ -2187,9 +2204,9 @@ pub fn enqueue_auto_tag_backfill(conn: &Connection, days: i64) -> AppResult<usiz
              attempts = 0,
              last_error = NULL,
              updated_at = datetime('now')
-         WHERE auto_tag_queue.status NOT IN ('pending', 'processing')",
-        params![modifier],
-    )?;
+         WHERE {conflict_filter}"
+    );
+    let n = conn.execute(&sql, params![modifier])?;
     Ok(n)
 }
 
@@ -3007,6 +3024,108 @@ pub fn daily_article_counts(conn: &Connection, days: i64) -> AppResult<Vec<(Stri
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+/// Like [`daily_article_counts`], but every calendar day in the window is
+/// present (zero-filled) so charts/lists do not have gaps.
+pub fn daily_article_counts_filled(
+    conn: &Connection,
+    days: i64,
+) -> AppResult<Vec<(String, i64)>> {
+    use chrono::{Duration, Local};
+    let days = days.clamp(1, 366);
+    let sparse = daily_article_counts(conn, days)?;
+    let map: std::collections::HashMap<String, i64> = sparse.into_iter().collect();
+    let today = Local::now().date_naive();
+    let mut out = Vec::with_capacity(days as usize);
+    for i in (0..days).rev() {
+        let d = today - Duration::days(i);
+        let key = d.format("%Y-%m-%d").to_string();
+        let count = map.get(&key).copied().unwrap_or(0);
+        out.push((key, count));
+    }
+    Ok(out)
+}
+
+/// Counts of articles that carry at least one tag, plus interest/AI breakdowns.
+/// An article with both kinds is counted in `tagged`, `tagged_interest`, and
+/// `tagged_ai` (breakdowns are not mutually exclusive).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaggedArticleCounts {
+    pub tagged: i64,
+    pub tagged_interest: i64,
+    pub tagged_ai: i64,
+}
+
+pub fn tagged_article_counts(conn: &Connection) -> AppResult<TaggedArticleCounts> {
+    let tagged: i64 = conn.query_row(
+        "SELECT COUNT(DISTINCT article_id) FROM article_tags",
+        [],
+        |r| r.get(0),
+    )?;
+    let tagged_interest: i64 = conn.query_row(
+        "SELECT COUNT(DISTINCT at.article_id)
+         FROM article_tags at
+         JOIN tags t ON t.id = at.tag_id
+         WHERE t.kind = ?1",
+        params![crate::models::TAG_KIND_INTEREST],
+        |r| r.get(0),
+    )?;
+    let tagged_ai: i64 = conn.query_row(
+        "SELECT COUNT(DISTINCT at.article_id)
+         FROM article_tags at
+         JOIN tags t ON t.id = at.tag_id
+         WHERE t.kind = ?1",
+        params![crate::models::TAG_KIND_AI],
+        |r| r.get(0),
+    )?;
+    Ok(TaggedArticleCounts {
+        tagged,
+        tagged_interest,
+        tagged_ai,
+    })
+}
+
+/// Admin dashboard snapshot: totals, tagging coverage, queue, daily ingest.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatsOverview {
+    pub total_articles: i64,
+    pub feeds: i64,
+    pub tagged_articles: i64,
+    pub tagged_interest: i64,
+    pub tagged_ai: i64,
+    pub queue: AutoTagQueueStatus,
+    pub daily: Vec<DailyCount>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DailyCount {
+    pub date: String,
+    pub count: i64,
+}
+
+/// Build the admin stats overview. `daily_days` defaults to 30 when ≤ 0.
+pub fn stats_overview(conn: &Connection, daily_days: i64) -> AppResult<StatsOverview> {
+    let daily_days = if daily_days <= 0 { 30 } else { daily_days };
+    let (_, total_articles, feeds) = storage_stats(conn)?;
+    let tagged = tagged_article_counts(conn)?;
+    let queue = auto_tag_queue_status(conn)?;
+    let daily = daily_article_counts_filled(conn, daily_days)?
+        .into_iter()
+        .map(|(date, count)| DailyCount { date, count })
+        .collect();
+    Ok(StatsOverview {
+        total_articles,
+        feeds,
+        tagged_articles: tagged.tagged,
+        tagged_interest: tagged.tagged_interest,
+        tagged_ai: tagged.tagged_ai,
+        queue,
+        daily,
+    })
 }
 
 /// Delete read articles older than `days`, keeping starred / read-later ones.

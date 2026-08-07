@@ -29,6 +29,27 @@ export interface AutoTagStatus {
   recentErrors?: { articleId?: number; error?: string; at?: string }[];
 }
 
+/** Admin overview from `GET /api/stats/overview`. */
+export interface StatsOverview {
+  totalArticles: number;
+  feeds: number;
+  /** Articles with ≥1 tag of any kind. */
+  taggedArticles: number;
+  /** Articles with ≥1 interest tag. */
+  taggedInterest: number;
+  /** Articles with ≥1 AI tag. */
+  taggedAi: number;
+  queue: {
+    pending: number;
+    processing: number;
+    failed: number;
+    done: number;
+    lastError?: string | null;
+  };
+  /** Zero-filled daily ingest counts (`fetched_at`, local calendar days). */
+  daily: { date: string; count: number }[];
+}
+
 /** A directory-index feed source (admin-managed). */
 export interface FeedSource {
   id: number;

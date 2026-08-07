@@ -11,7 +11,7 @@ use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::models::{TAG_KIND_AI, TAG_KIND_INTEREST};
 use rusqlite::Connection;
-use serde::Deserialize;
+use serde_json::Value;
 
 /// Max characters for a stored tag name (after trim).
 pub const MAX_TAG_NAME_CHARS: usize = 32;
@@ -22,8 +22,9 @@ pub const DEFAULT_MAX_TAGS_PER_ARTICLE: i64 = 5;
 /// Failed jobs stop retrying after this many attempts.
 pub const MAX_ATTEMPTS: i64 = 3;
 
-/// Output token cap for tagging. Tag JSON is tiny; keep cost/latency low.
-pub const TAG_MAX_TOKENS: u32 = 128;
+/// Output token cap for tagging. JSON is tiny, but reasoning models may spend
+/// budget before the final object — leave a little headroom.
+pub const TAG_MAX_TOKENS: u32 = 256;
 
 /// Record a completed auto-tag call in the usage ledger. Only meaningful for
 /// LLM tagging — the queue is only ever populated for that path, and the db
@@ -61,85 +62,183 @@ pub fn normalize_tag_name(raw: &str) -> Option<String> {
     Some(capped.to_string())
 }
 
-#[derive(Debug, Deserialize)]
-struct InterestTagPayload {
-    #[serde(default)]
-    tags: Vec<String>,
-    /// Optional explicit "new" list; treated as suggestions and still filtered
-    /// against the closed vocabulary (never created).
-    #[serde(default)]
-    new: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AiTagPayload {
-    #[serde(default)]
-    tags: Vec<String>,
-    #[serde(default)]
-    ai: Vec<String>,
-    #[serde(default)]
-    new: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CombinedTagPayload {
-    #[serde(default)]
-    interest: Vec<String>,
-    #[serde(default)]
-    tags: Vec<String>,
-    #[serde(default)]
-    ai: Vec<String>,
-}
-
-/// Pull a JSON object out of model output (tolerates markdown fences / prose).
-/// Public for unit tests.
-pub fn extract_json_object(text: &str) -> Option<&str> {
-    let start = text.find('{')?;
-    let end = text.rfind('}')?;
-    if end <= start {
-        return None;
-    }
-    Some(&text[start..=end])
-}
-
 /// How model text maps to tags before apply.
 #[derive(Debug, PartialEq, Eq)]
 pub enum JsonParseOutcome<T> {
     /// Parsed successfully (may be an empty tag list).
     Ok(T),
-    /// Empty / no `{...}` — soft-skip (do not burn retries as hard failures).
+    /// Empty / prose / unusable — soft-skip (do not burn retries as hard failures).
     SoftEmpty,
-    /// Found braces but JSON did not deserialize — candidate for one repair.
+    /// Looks like truncated/broken JSON — candidate for one repair call.
     Invalid(String),
 }
 
-fn soft_or_object(text: &str) -> JsonParseOutcome<&str> {
-    let trimmed = text.trim();
-    // Empty / prose with no `{` → soft-done (empty tags). A bare `[...]` is
-    // handled by `parse_string_array_fallback` in the interest/AI parsers.
-    if trimmed.is_empty() || !trimmed.contains('{') {
-        return JsonParseOutcome::SoftEmpty;
+/// Strip markdown fences and common reasoning wrappers before JSON scan.
+pub fn preprocess_model_text(text: &str) -> String {
+    let mut s = text.trim().to_string();
+    for (open, close) in [
+        ("<think>", "</think>"),
+        ("<thinking>", "</thinking>"),
+        ("<reasoning>", "</reasoning>"),
+        ("<redacted_reasoning>", "</redacted_reasoning>"),
+    ] {
+        while let Some(start) = s.to_ascii_lowercase().find(open) {
+            let after_open = start + open.len();
+            let rest_lower = s[after_open..].to_ascii_lowercase();
+            if let Some(rel) = rest_lower.find(close) {
+                let end = after_open + rel + close.len();
+                s.replace_range(start..end, " ");
+            } else {
+                // Unclosed reasoning block — drop from open tag to end.
+                s.truncate(start);
+                break;
+            }
+        }
     }
-    match extract_json_object(trimmed) {
-        Some(s) => JsonParseOutcome::Ok(s),
-        // Saw `{` but no complete `{...}` — repair candidate, not soft-skip.
-        None => JsonParseOutcome::Invalid(
-            "no complete JSON object in model response".into(),
-        ),
+    // ```json ... ``` / ``` ... ```
+    if let Some(start) = s.find("```") {
+        let after = start + 3;
+        let body_start = s[after..]
+            .find('\n')
+            .map(|i| after + i + 1)
+            .unwrap_or(after);
+        if let Some(rel_end) = s[body_start..].find("```") {
+            let body = s[body_start..body_start + rel_end].trim();
+            return body.to_string();
+        }
+        // Opening fence without close — take everything after the language line.
+        return s[body_start..].trim().to_string();
     }
+    s.trim().to_string()
 }
 
-/// Bare `["a","b"]` when the model skipped the object wrapper.
-fn parse_string_array_fallback(text: &str) -> Option<Vec<String>> {
-    let trimmed = text.trim();
-    let start = trimmed.find('[')?;
-    let end = trimmed.rfind(']')?;
-    if end <= start {
-        return None;
+/// Drop trailing commas before `]` / `}` (common LLM slip). Respects strings.
+pub fn sanitize_json_trailing_commas(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    let mut in_string = false;
+    let mut escape = false;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_string {
+            out.push(c);
+            if escape {
+                escape = false;
+            } else if c == '\\' {
+                escape = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '"' {
+            in_string = true;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c == ',' {
+            let mut j = i + 1;
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+            if j < chars.len() && (chars[j] == ']' || chars[j] == '}') {
+                i += 1;
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
     }
-    let arr = &trimmed[start..=end];
-    let names: Vec<String> = serde_json::from_str(arr).ok()?;
-    Some(dedupe_names(names))
+    out
+}
+
+/// Balanced `{...}` slices (string-aware), each trailing-comma sanitized.
+/// Public for unit tests.
+pub fn extract_json_objects(text: &str) -> Vec<String> {
+    extract_balanced(text, '{', '}')
+        .into_iter()
+        .map(|s| sanitize_json_trailing_commas(&s))
+        .collect()
+}
+
+/// Balanced `[...]` slices (string-aware), each trailing-comma sanitized.
+fn extract_json_arrays(text: &str) -> Vec<String> {
+    extract_balanced(text, '[', ']')
+        .into_iter()
+        .map(|s| sanitize_json_trailing_commas(&s))
+        .collect()
+}
+
+fn extract_balanced(text: &str, open: char, close: char) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != open {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut depth = 0i32;
+        let mut in_string = false;
+        let mut escape = false;
+        let mut ended = false;
+        while i < chars.len() {
+            let c = chars[i];
+            if in_string {
+                if escape {
+                    escape = false;
+                } else if c == '\\' {
+                    escape = true;
+                } else if c == '"' {
+                    in_string = false;
+                }
+                i += 1;
+                continue;
+            }
+            match c {
+                '"' => in_string = true,
+                c if c == open => depth += 1,
+                c if c == close => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let slice: String = chars[start..=i].iter().collect();
+                        out.push(slice);
+                        i += 1;
+                        ended = true;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        if !ended {
+            // Truncated from this opener — stop; remainder is not a complete value.
+            break;
+        }
+    }
+    out
+}
+
+/// Best-effort single object: last balanced `{...}` after preprocess (answer
+/// after reasoning). Public for unit tests / older call sites.
+pub fn extract_json_object(text: &str) -> Option<String> {
+    let cleaned = preprocess_model_text(text);
+    extract_json_objects(&cleaned).into_iter().last()
+}
+
+fn strings_from_json_array(value: Option<&Value>) -> Vec<String> {
+    let Some(Value::Array(items)) = value else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+        .collect()
 }
 
 fn dedupe_names(names: impl IntoIterator<Item = String>) -> Vec<String> {
@@ -154,68 +253,142 @@ fn dedupe_names(names: impl IntoIterator<Item = String>) -> Vec<String> {
     out
 }
 
-/// Parse closed-vocabulary interest suggestions from model output.
-pub fn parse_interest_payload_outcome(text: &str) -> JsonParseOutcome<Vec<String>> {
-    match soft_or_object(text) {
-        JsonParseOutcome::Ok(json_str) => match serde_json::from_str::<InterestTagPayload>(json_str)
-        {
-            Ok(payload) => {
-                JsonParseOutcome::Ok(dedupe_names(payload.tags.into_iter().chain(payload.new)))
-            }
-            Err(e) => JsonParseOutcome::Invalid(e.to_string()),
-        },
-        JsonParseOutcome::SoftEmpty => {
-            if let Some(names) = parse_string_array_fallback(text) {
-                JsonParseOutcome::Ok(names)
-            } else {
-                JsonParseOutcome::SoftEmpty
+fn names_from_object_keys(obj: &serde_json::Map<String, Value>, keys: &[&str]) -> Vec<String> {
+    let mut names = Vec::new();
+    for key in keys {
+        names.extend(strings_from_json_array(obj.get(*key)));
+    }
+    dedupe_names(names)
+}
+
+/// True when the text looks like an unfinished `{...}` / `[...]` (repair-worthy).
+fn looks_truncated_json(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return false;
+    }
+    let has_obj_open = t.contains('{');
+    let has_arr_open = t.contains('[');
+    if !has_obj_open && !has_arr_open {
+        return false;
+    }
+    let objs = extract_json_objects(t);
+    let arrs = extract_json_arrays(t);
+    // Complete values exist → not truncated (may still be wrong shape).
+    if !objs.is_empty() || !arrs.is_empty() {
+        return false;
+    }
+    true
+}
+
+/// Balanced `{...}` that still looks like JSON (quotes/colon) but failed to parse.
+fn looks_like_json_object(s: &str) -> bool {
+    let t = s.trim();
+    t.starts_with('{') && (t.contains('"') || t.contains(':'))
+}
+
+/// Bare `["a","b"]` when the model skipped the object wrapper.
+fn parse_string_array_fallback(text: &str) -> Option<Vec<String>> {
+    for arr in extract_json_arrays(text).into_iter().rev() {
+        if let Ok(Value::Array(items)) = serde_json::from_str::<Value>(&arr) {
+            let names: Vec<String> = items
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+            // Only accept arrays of strings (tag lists), not nested junk.
+            if items.iter().all(|v| v.is_string() || v.is_null()) {
+                return Some(dedupe_names(names));
             }
         }
-        JsonParseOutcome::Invalid(e) => JsonParseOutcome::Invalid(e),
     }
+    None
+}
+
+fn parse_tag_list_outcome(text: &str, object_keys: &[&str]) -> JsonParseOutcome<Vec<String>> {
+    let cleaned = preprocess_model_text(text);
+    if cleaned.is_empty() {
+        return JsonParseOutcome::SoftEmpty;
+    }
+
+    // Prefer the last object (final answer after chain-of-thought braces).
+    let mut malformed_json = None;
+    for obj in extract_json_objects(&cleaned).into_iter().rev() {
+        match serde_json::from_str::<Value>(&obj) {
+            Ok(Value::Object(map)) => {
+                // Valid object → success even when tag arrays are empty / null / absent.
+                return JsonParseOutcome::Ok(names_from_object_keys(&map, object_keys));
+            }
+            Ok(_) => continue,
+            Err(e) if looks_like_json_object(&obj) => {
+                malformed_json = Some(e.to_string());
+            }
+            Err(_) => continue,
+        }
+    }
+    if let Some(err) = malformed_json {
+        return JsonParseOutcome::Invalid(err);
+    }
+
+    if let Some(names) = parse_string_array_fallback(&cleaned) {
+        return JsonParseOutcome::Ok(names);
+    }
+
+    if looks_truncated_json(&cleaned) {
+        return JsonParseOutcome::Invalid("truncated or incomplete JSON in model response".into());
+    }
+
+    // Prose, reasoning-only, "no tags", or balanced non-JSON braces → empty done.
+    JsonParseOutcome::SoftEmpty
+}
+
+/// Parse closed-vocabulary interest suggestions from model output.
+pub fn parse_interest_payload_outcome(text: &str) -> JsonParseOutcome<Vec<String>> {
+    parse_tag_list_outcome(text, &["tags", "new", "interest"])
 }
 
 /// Parse free-form AI tag suggestions from model output.
 pub fn parse_ai_payload_outcome(text: &str) -> JsonParseOutcome<Vec<String>> {
-    match soft_or_object(text) {
-        JsonParseOutcome::Ok(json_str) => match serde_json::from_str::<AiTagPayload>(json_str) {
-            Ok(payload) => JsonParseOutcome::Ok(dedupe_names(
-                payload
-                    .tags
-                    .into_iter()
-                    .chain(payload.ai)
-                    .chain(payload.new),
-            )),
-            Err(e) => JsonParseOutcome::Invalid(e.to_string()),
-        },
-        JsonParseOutcome::SoftEmpty => {
-            if let Some(names) = parse_string_array_fallback(text) {
-                JsonParseOutcome::Ok(names)
-            } else {
-                JsonParseOutcome::SoftEmpty
-            }
-        }
-        JsonParseOutcome::Invalid(e) => JsonParseOutcome::Invalid(e),
-    }
+    parse_tag_list_outcome(text, &["tags", "ai", "new"])
 }
 
 /// Parse a combined interest + AI response.
 pub fn parse_combined_payload_outcome(
     text: &str,
 ) -> JsonParseOutcome<(Vec<String>, Vec<String>)> {
-    let json_str = match soft_or_object(text) {
-        JsonParseOutcome::Ok(s) => s,
-        JsonParseOutcome::SoftEmpty => return JsonParseOutcome::SoftEmpty,
-        JsonParseOutcome::Invalid(e) => return JsonParseOutcome::Invalid(e),
-    };
-    match serde_json::from_str::<CombinedTagPayload>(json_str) {
-        Ok(payload) => {
-            let interest = dedupe_names(payload.interest);
-            let ai = dedupe_names(payload.tags.into_iter().chain(payload.ai));
-            JsonParseOutcome::Ok((interest, ai))
-        }
-        Err(e) => JsonParseOutcome::Invalid(e.to_string()),
+    let cleaned = preprocess_model_text(text);
+    if cleaned.is_empty() {
+        return JsonParseOutcome::SoftEmpty;
     }
+
+    let mut malformed_json = None;
+    for obj in extract_json_objects(&cleaned).into_iter().rev() {
+        match serde_json::from_str::<Value>(&obj) {
+            Ok(Value::Object(map)) => {
+                let interest = names_from_object_keys(&map, &["interest"]);
+                let ai = names_from_object_keys(&map, &["tags", "ai", "new"]);
+                return JsonParseOutcome::Ok((interest, ai));
+            }
+            Ok(_) => continue,
+            Err(e) if looks_like_json_object(&obj) => {
+                malformed_json = Some(e.to_string());
+            }
+            Err(_) => continue,
+        }
+    }
+    if let Some(err) = malformed_json {
+        return JsonParseOutcome::Invalid(err);
+    }
+
+    // Bare string array: treat as AI free-form only (interest stays closed).
+    if let Some(names) = parse_string_array_fallback(&cleaned) {
+        return JsonParseOutcome::Ok((Vec::new(), names));
+    }
+
+    if looks_truncated_json(&cleaned) {
+        return JsonParseOutcome::Invalid("truncated or incomplete JSON in model response".into());
+    }
+
+    JsonParseOutcome::SoftEmpty
 }
 
 /// Parse closed-vocabulary interest suggestions from model output.
@@ -224,6 +397,7 @@ pub fn parse_interest_payload(text: &str) -> AppResult<Vec<String>> {
     match parse_interest_payload_outcome(text) {
         JsonParseOutcome::Ok(v) => Ok(v),
         JsonParseOutcome::SoftEmpty => Ok(Vec::new()),
+        // Public API: Invalid still errors; the worker soft-completes via outcome + repair.
         JsonParseOutcome::Invalid(e) => Err(AppError::other(format!("auto-tag: invalid JSON: {e}"))),
     }
 }
@@ -522,20 +696,24 @@ where
         JsonParseOutcome::Ok(v) => Ok((v, outcome)),
         JsonParseOutcome::SoftEmpty => Ok((soft_empty, outcome)),
         JsonParseOutcome::Invalid(_) => {
-            let repaired = repair_tag_json(client, cfg, system, &outcome.text).await?;
-            // Accumulate usage from both calls.
-            outcome.usage += repaired.usage;
-            let text = repaired.text;
-            match parse(&text) {
-                JsonParseOutcome::Ok(v) => {
-                    outcome.text = text;
-                    Ok((v, outcome))
+            // One cheap repair; if the repair call itself fails, soft-complete
+            // rather than burning the job into the permanent failed pile.
+            match repair_tag_json(client, cfg, system, &outcome.text).await {
+                Ok(repaired) => {
+                    outcome.usage += repaired.usage;
+                    let text = repaired.text;
+                    match parse(&text) {
+                        JsonParseOutcome::Ok(v) => {
+                            outcome.text = text;
+                            Ok((v, outcome))
+                        }
+                        JsonParseOutcome::SoftEmpty | JsonParseOutcome::Invalid(_) => {
+                            outcome.text = text;
+                            Ok((soft_empty, outcome))
+                        }
+                    }
                 }
-                // Soft-done after repair: empty tags beat an endless failed pile.
-                JsonParseOutcome::SoftEmpty | JsonParseOutcome::Invalid(_) => {
-                    outcome.text = text;
-                    Ok((soft_empty, outcome))
-                }
+                Err(_) => Ok((soft_empty, outcome)),
             }
         }
     }
@@ -544,8 +722,9 @@ where
 /// Run one auto-tag job end-to-end (caller holds no DB lock across the AI call).
 ///
 /// Steps: load context → skip if at caps → LLM (+ one JSON repair) → apply tags.
-/// Admin backfill force-reenqueues past the recent-done guard; at-cap skip still
-/// applies because apply_* cannot attach more tags past the configured max.
+/// At-cap skip still applies because apply_* cannot attach more tags past the
+/// configured max (force backfill may re-queue `done`, but capped articles
+/// skip the LLM).
 pub async fn process_article(
     db: &tokio::sync::Mutex<Connection>,
     client: &reqwest::Client,
@@ -711,14 +890,56 @@ mod tests {
             parse_interest_payload_outcome("Sorry, I cannot help with that."),
             JsonParseOutcome::SoftEmpty
         );
+        assert_eq!(
+            parse_interest_payload_outcome("No relevant tags."),
+            JsonParseOutcome::SoftEmpty
+        );
+        assert_eq!(
+            parse_interest_payload_outcome("none"),
+            JsonParseOutcome::SoftEmpty
+        );
         // SoftEmpty maps to empty vec via the public parser (no hard error).
         assert!(parse_interest_payload("no braces here").unwrap().is_empty());
+        // Valid object with empty / null tags → Ok(empty), not a failure.
+        assert_eq!(
+            parse_interest_payload_outcome(r#"{"tags":[]}"#),
+            JsonParseOutcome::Ok(vec![])
+        );
+        assert_eq!(
+            parse_interest_payload_outcome(r#"{"tags":null}"#),
+            JsonParseOutcome::Ok(vec![])
+        );
     }
 
     #[test]
     fn parse_bare_array_fallback() {
         assert_eq!(
             parse_interest_payload_outcome(r#"["Rust", "Go"]"#),
+            JsonParseOutcome::Ok(vec!["Rust".into(), "Go".into()])
+        );
+        assert_eq!(
+            parse_interest_payload_outcome("```\n[\"Rust\"]\n```"),
+            JsonParseOutcome::Ok(vec!["Rust".into()])
+        );
+    }
+
+    #[test]
+    fn parse_trailing_commas_and_fences() {
+        let text = "```json\n{\"tags\":[\"Rust\",],}\n```";
+        assert_eq!(
+            parse_interest_payload_outcome(text),
+            JsonParseOutcome::Ok(vec!["Rust".into()])
+        );
+    }
+
+    #[test]
+    fn parse_prefers_last_object_after_reasoning() {
+        let text = r#"Thinking {about this} briefly.
+<think>internal {noise}</think>
+{"tags":["Go"]}
+Final: {"tags":["Rust","Go"]}"#;
+        assert_eq!(
+            parse_interest_payload_outcome(text),
             JsonParseOutcome::Ok(vec!["Rust".into(), "Go".into()])
         );
     }
@@ -736,13 +957,35 @@ mod tests {
     }
 
     #[test]
+    fn parse_prose_braces_are_soft_empty() {
+        // Balanced braces that are not JSON-like → soft empty, not repair.
+        assert_eq!(
+            parse_interest_payload_outcome("I looked at {the article} and found nothing."),
+            JsonParseOutcome::SoftEmpty
+        );
+    }
+
+    #[test]
     fn extract_json_object_finds_braces() {
         assert_eq!(
             extract_json_object("here {\"tags\":[]} trailing"),
-            Some("{\"tags\":[]}")
+            Some("{\"tags\":[]}".into())
         );
         assert_eq!(extract_json_object(""), None);
         assert_eq!(extract_json_object("no object here"), None);
+        // Nested braces in strings stay intact.
+        assert_eq!(
+            extract_json_object(r#"{"tags":["a{b}"]}"#),
+            Some(r#"{"tags":["a{b}"]}"#.into())
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_trailing_commas() {
+        assert_eq!(
+            sanitize_json_trailing_commas(r#"{"tags":["a",],}"#),
+            r#"{"tags":["a"]}"#
+        );
     }
 
     #[test]
@@ -933,6 +1176,54 @@ mod tests {
         let status = db::auto_tag_queue_status(&conn).unwrap();
         assert_eq!(status.failed, 1);
         assert_eq!(status.last_error.as_deref(), Some("final"));
+
+        remove_temp_db(conn, path);
+    }
+
+    #[test]
+    fn backfill_skips_done_unless_forced() {
+        let (conn, path) = temp_db();
+        db::set_setting(&conn, "auto_tag_enabled", "1").unwrap();
+        let feed_id = db::insert_feed(
+            &conn,
+            "https://example.com/feed-bf.xml",
+            None,
+            "Example",
+            None,
+            SourceType::Rss,
+            None,
+        )
+        .unwrap();
+        let article = NewArticle {
+            guid: "bf".into(),
+            url: Some("https://example.com/bf".into()),
+            title: "Backfill".into(),
+            author: None,
+            summary: None,
+            content_html: None,
+            body_text: "".into(),
+            image_url: None,
+            published_at: Some(chrono::Utc::now().to_rfc3339()),
+            enclosures: vec![],
+        };
+        assert!(db::upsert_article(&conn, feed_id, &article, false, &[]).unwrap());
+        let id = db::claim_auto_tag_job(&conn).unwrap().unwrap().0;
+        db::mark_auto_tag_done(&conn, id).unwrap();
+
+        // Default backfill must not reset done (token-saving).
+        assert_eq!(db::enqueue_auto_tag_backfill(&conn, 7, false).unwrap(), 0);
+        assert_eq!(db::auto_tag_queue_status(&conn).unwrap().done, 1);
+
+        // Force re-queues done.
+        assert_eq!(db::enqueue_auto_tag_backfill(&conn, 7, true).unwrap(), 1);
+        assert_eq!(db::auto_tag_queue_status(&conn).unwrap().pending, 1);
+
+        // Failed is re-queued even without force.
+        let id = db::claim_auto_tag_job(&conn).unwrap().unwrap().0;
+        db::mark_auto_tag_failure(&conn, id, "x", 1).unwrap();
+        assert_eq!(db::auto_tag_queue_status(&conn).unwrap().failed, 1);
+        assert_eq!(db::enqueue_auto_tag_backfill(&conn, 7, false).unwrap(), 1);
+        assert_eq!(db::auto_tag_queue_status(&conn).unwrap().pending, 1);
 
         remove_temp_db(conn, path);
     }

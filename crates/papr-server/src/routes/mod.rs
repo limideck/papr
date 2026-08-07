@@ -12,6 +12,7 @@ mod misc;
 mod opml;
 mod rules;
 mod settings;
+mod stats;
 mod tags;
 mod users;
 mod wordcloud;
@@ -77,6 +78,8 @@ pub fn api_router() -> Router<AppState> {
         // auto-tag (admin)
         .route("/api/auto-tag/status", get(auto_tag::status))
         .route("/api/auto-tag/backfill", post(auto_tag::backfill))
+        // stats (admin)
+        .route("/api/stats/overview", get(stats::overview))
         // tags
         .route("/api/tags", get(tags::list).post(tags::create))
         .route(

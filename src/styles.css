@@ -1895,6 +1895,43 @@ button { font-family: inherit; }
   white-space: nowrap;
 }
 
+/* Settings → Stats daily ingest bars */
+.s-stats-daily {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 4px;
+  max-height: 360px;
+  overflow-y: auto;
+}
+.s-stats-daily-row {
+  display: grid;
+  grid-template-columns: 44px 1fr 36px;
+  align-items: center;
+  gap: 10px;
+}
+.s-stats-daily-date,
+.s-stats-daily-count {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted);
+}
+.s-stats-daily-count {
+  text-align: right;
+}
+.s-stats-daily-bar-track {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--hover);
+  overflow: hidden;
+}
+.s-stats-daily-bar {
+  height: 100%;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--accent) 70%, transparent);
+  min-width: 0;
+}
+
 /* Segmented (light variant) */
 .s-seg {
   display: inline-flex;
