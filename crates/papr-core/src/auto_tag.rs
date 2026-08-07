@@ -1344,9 +1344,9 @@ Final: {"tags":["Rust","Go"]}"#;
     }
 
     #[test]
-    fn claim_prefers_newer_fetched_over_newer_published() {
-        // Primary sort is fetched_at DESC: an older-fetched article with a
-        // newer published_at must NOT jump ahead of a just-ingested item.
+    fn claim_prefers_newer_published_over_newer_fetched() {
+        // Primary sort is effective publish date DESC: a newer-published
+        // article wins even when it was fetched earlier than an older item.
         let (conn, path) = temp_db();
         let feed_id = db::insert_feed(
             &conn,
@@ -1415,11 +1415,11 @@ Final: {"tags":["Rust","Go"]}"#;
 
         let first = db::claim_auto_tag_job(&conn).unwrap().unwrap();
         assert_eq!(
-            first.0, new_id,
-            "newer fetched_at must be claimed first even with older published_at"
+            first.0, old_id,
+            "newer published_at must be claimed first even with older fetched_at"
         );
         let second = db::claim_auto_tag_job(&conn).unwrap().unwrap();
-        assert_eq!(second.0, old_id);
+        assert_eq!(second.0, new_id);
         assert!(db::claim_auto_tag_job(&conn).unwrap().is_none());
 
         remove_temp_db(conn, path);
@@ -1477,8 +1477,9 @@ Final: {"tags":["Rust","Go"]}"#;
             content_html: None,
             body_text: "".into(),
             image_url: None,
-            // Ancient publish date must not keep B behind A.
-            published_at: Some("2019-01-01T00:00:00+00:00".into()),
+            // No publish date: a fresh ingest must still cut ahead of the
+            // backlog via the fetched_at fallback in the effective date.
+            published_at: None,
             enclosures: vec![],
         };
         assert!(db::upsert_article(&conn, feed_id, &b, false, &[]).unwrap());
@@ -1500,7 +1501,7 @@ Final: {"tags":["Rust","Go"]}"#;
         let first = db::claim_auto_tag_job(&conn).unwrap().unwrap();
         assert_eq!(
             first.0, b_id,
-            "later-fetched B must cut ahead of still-pending earlier-fetched A"
+            "fresh dateless B must cut ahead of still-pending dated A"
         );
         let second = db::claim_auto_tag_job(&conn).unwrap().unwrap();
         assert_eq!(second.0, a_id);
@@ -1565,8 +1566,9 @@ Final: {"tags":["Rust","Go"]}"#;
 
     #[test]
     fn backfill_does_not_boost_old_over_newer_pending() {
-        // Backfill bumps queue.updated_at, but claim orders by fetched_at —
-        // re-queuing an older failed item must not jump ahead of a newer pending.
+        // Backfill bumps queue.updated_at, but claim orders by effective date
+        // (published_at, fetched_at fallback) — re-queuing an older failed
+        // item must not jump ahead of a newer pending.
         let (conn, path) = temp_db();
         let feed_id = db::insert_feed(
             &conn,
@@ -1652,8 +1654,8 @@ Final: {"tags":["Rust","Go"]}"#;
 
     #[test]
     fn backfill_zero_tag_redo_does_not_boost_old_over_newer_pending() {
-        // Default 补打 re-queues done-with-zero-tags. Claim still orders by
-        // fetched_at — an older 0-tag redo must not jump a newer pending.
+        // Default 补打 re-queues done-with-zero-tags. Claim orders by effective
+        // date — an older 0-tag redo must not jump a newer pending.
         let (conn, path) = temp_db();
         let feed_id = db::insert_feed(
             &conn,

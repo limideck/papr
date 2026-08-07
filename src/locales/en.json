@@ -595,7 +595,7 @@
       "done": "{{count}} done",
       "lastError": "Last error",
       "backfill": "Backfill",
-      "backfillDesc": "Queue articles that were never tagged, failed, or finished with zero tags (empty AI result). Articles that already have tags are skipped unless you force re-tag. Set days to 0 for the entire library (no date filter). Queue priority is newest fetch first — newly ingested articles cut ahead of an old backlog.",
+      "backfillDesc": "Queue articles that were never tagged, failed, or finished with zero tags (empty AI result). Articles that already have tags are skipped unless you force re-tag. Set days to 0 for the entire library (no date filter). Queue priority is newest published first (articles without a publish date fall back to fetch time) — newly ingested articles cut ahead of an old backlog.",
       "backfillDays": "Days",
       "backfillDaysHint": "0 = all untagged (entire library)",
       "backfillWindowHint": "In this window: {{untagged}} untagged / {{total}} articles",

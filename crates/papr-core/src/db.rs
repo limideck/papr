@@ -2329,8 +2329,7 @@ pub fn claim_auto_tag_job(conn: &Connection) -> AppResult<Option<(i64, i64)>> {
              FROM auto_tag_queue q
              JOIN articles a ON a.id = q.article_id
              WHERE q.status = 'pending'
-             ORDER BY datetime(a.fetched_at) DESC,
-                      datetime(a.published_at) DESC,
+             ORDER BY datetime(COALESCE(a.published_at, a.fetched_at)) DESC,
                       q.article_id DESC
              LIMIT 1",
             [],
