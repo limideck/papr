@@ -166,7 +166,7 @@ pub async fn refresh_core(
         };
         let concurrency =
             db::setting_parsed::<i64>(&conn, "net_concurrency", 6).clamp(1, 16) as usize;
-        let dedup = db::setting_flag(&conn, "dedup_enabled", false);
+        let dedup = db::setting_flag(&conn, "dedup_enabled", true);
         let rules = db::active_rules(&conn).unwrap_or_default();
         (feeds, newsletters, concurrency, dedup, rules)
     };

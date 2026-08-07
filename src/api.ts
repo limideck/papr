@@ -448,6 +448,7 @@ export interface AiUsageRow {
   promptTokens: number;
   completionTokens: number;
   reasoningTokens: number;
+  cacheHitTokens: number;
 }
 export interface AiUsageReport {
   total: AiUsageRow;

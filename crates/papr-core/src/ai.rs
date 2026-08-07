@@ -125,7 +125,7 @@ impl AiConfig {
             .unwrap_or_else(|| match provider {
                 Provider::Anthropic => "claude-sonnet-4-6".to_string(),
                 Provider::OpenAi => "gpt-4.1-mini".to_string(),
-                Provider::DeepSeek => "deepseek-chat".to_string(),
+                Provider::DeepSeek => "deepseek-v4-flash".to_string(),
             });
         let base_url = base_url
             .map(|u| u.trim().trim_end_matches('/').to_string())
@@ -187,14 +187,23 @@ impl Provider {
 /// `message_start` / `message_delta` events for Anthropic). Zero when a
 /// provider does not report usage — a local or free-tier endpoint often omits
 /// it. Used for AI usage accounting / estimated cost.
+///
+/// Cost follows DeepSeek's official split ([pricing](https://api-docs.deepseek.com/zh-cn/quick_start/pricing/)):
+/// cache-hit input + cache-miss input + output. Reasoning tokens are part of
+/// `completion_tokens` and billed at the output rate (no separate price).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     /// Portion of `completion_tokens` spent on chain-of-thought reasoning
     /// (DeepSeek-style `completion_tokens_details.reasoning_tokens`). Zero when
-    /// the provider does not break it out.
+    /// the provider does not break it out. Still billed as output.
     pub reasoning_tokens: u64,
+    /// Input tokens that hit the provider context cache
+    /// (`prompt_cache_hit_tokens` on DeepSeek / OpenAI-compatible;
+    /// `cache_read_input_tokens` on Anthropic). Billed at the cheaper
+    /// cache-hit rate. Remainder of `prompt_tokens` is cache-miss.
+    pub cache_hit_tokens: u64,
 }
 
 impl std::ops::AddAssign for TokenUsage {
@@ -202,6 +211,7 @@ impl std::ops::AddAssign for TokenUsage {
         self.prompt_tokens += rhs.prompt_tokens;
         self.completion_tokens += rhs.completion_tokens;
         self.reasoning_tokens += rhs.reasoning_tokens;
+        self.cache_hit_tokens += rhs.cache_hit_tokens;
     }
 }
 
@@ -239,7 +249,7 @@ pub async fn stream_chat(
     max_tokens: u32,
 ) -> AppResult<ChatOutcome> {
     if cfg.provider.is_openai_compatible() {
-        stream_openai(client, cfg, system, user, sink, max_tokens).await
+        stream_openai(client, cfg, system, user, sink, max_tokens, false).await
     } else {
         stream_anthropic(client, cfg, system, user, sink, max_tokens).await
     }
@@ -255,10 +265,43 @@ pub async fn complete_chat(
     user: &str,
     max_tokens: u32,
 ) -> AppResult<ChatOutcome> {
+    complete_chat_inner(client, cfg, system, user, max_tokens, false).await
+}
+
+/// Like [`complete_chat`], but asks OpenAI-compatible providers for a JSON
+/// object via `response_format: json_object`. Anthropic has no equivalent wire
+/// flag — it relies on the system prompt (already "JSON only" for tagging).
+pub async fn complete_chat_json(
+    client: &Client,
+    cfg: &AiConfig,
+    system: &str,
+    user: &str,
+    max_tokens: u32,
+) -> AppResult<ChatOutcome> {
+    complete_chat_inner(client, cfg, system, user, max_tokens, true).await
+}
+
+async fn complete_chat_inner(
+    client: &Client,
+    cfg: &AiConfig,
+    system: &str,
+    user: &str,
+    max_tokens: u32,
+    json_object: bool,
+) -> AppResult<ChatOutcome> {
     // A sink that discards deltas; `consume_sse` still accumulates the full text.
     let mut discard = |_: &str| true;
     if cfg.provider.is_openai_compatible() {
-        stream_openai(client, cfg, system, user, &mut discard, max_tokens).await
+        stream_openai(
+            client,
+            cfg,
+            system,
+            user,
+            &mut discard,
+            max_tokens,
+            json_object,
+        )
+        .await
     } else {
         stream_anthropic(client, cfg, system, user, &mut discard, max_tokens).await
     }
@@ -299,8 +342,9 @@ async fn stream_openai(
     user: &str,
     sink: &mut DeltaSink<'_>,
     max_tokens: u32,
+    json_object: bool,
 ) -> AppResult<ChatOutcome> {
-    let body = json!({
+    let mut body = json!({
         "model": cfg.model,
         "max_tokens": max_tokens,
         "stream": true,
@@ -309,6 +353,13 @@ async fn stream_openai(
             { "role": "user", "content": user },
         ],
     });
+    // Prefer structured JSON when the caller needs an object (auto-tag).
+    // Some local OpenAI-compatible servers ignore unknown fields; ones that
+    // reject `response_format` will surface a 4xx which the caller can treat
+    // as a hard failure / retry without the flag if needed.
+    if json_object {
+        body["response_format"] = json!({ "type": "json_object" });
+    }
     let mut req = client
         .post(format!("{}/chat/completions", cfg.base_url))
         .timeout(AI_REQUEST_TIMEOUT)
@@ -472,10 +523,14 @@ fn extract_delta(v: &Value, provider: Provider) -> Option<String> {
 fn extract_usage(v: &Value, provider: Provider) -> Option<TokenUsage> {
     match provider {
         Provider::Anthropic => match v["type"].as_str() {
-            Some("message_start") => Some(TokenUsage {
-                prompt_tokens: v["message"]["usage"]["input_tokens"].as_u64().unwrap_or(0),
-                ..TokenUsage::default()
-            }),
+            Some("message_start") => {
+                let u = &v["message"]["usage"];
+                Some(TokenUsage {
+                    prompt_tokens: u["input_tokens"].as_u64().unwrap_or(0),
+                    cache_hit_tokens: u["cache_read_input_tokens"].as_u64().unwrap_or(0),
+                    ..TokenUsage::default()
+                })
+            }
             Some("message_delta") => Some(TokenUsage {
                 completion_tokens: v["usage"]["output_tokens"].as_u64().unwrap_or(0),
                 ..TokenUsage::default()
@@ -485,12 +540,20 @@ fn extract_usage(v: &Value, provider: Provider) -> Option<TokenUsage> {
         Provider::OpenAi | Provider::DeepSeek => {
             let usage = v.get("usage")?;
             let completion = usage["completion_tokens"].as_u64().unwrap_or(0);
+            // DeepSeek (and OpenAI-compatible) expose cache hits as
+            // `prompt_cache_hit_tokens`. Fall back to
+            // `prompt_tokens_details.cached_tokens` when present.
+            let cache_hit = usage["prompt_cache_hit_tokens"]
+                .as_u64()
+                .or_else(|| usage["prompt_tokens_details"]["cached_tokens"].as_u64())
+                .unwrap_or(0);
             let usage = TokenUsage {
                 prompt_tokens: usage["prompt_tokens"].as_u64().unwrap_or(0),
                 completion_tokens: completion,
                 reasoning_tokens: usage["completion_tokens_details"]["reasoning_tokens"]
                     .as_u64()
                     .unwrap_or(0),
+                cache_hit_tokens: cache_hit,
             };
             (!usage.is_empty()).then_some(usage)
         }
@@ -509,12 +572,19 @@ mod tests {
             "usage": {
                 "prompt_tokens": 120,
                 "completion_tokens": 45,
+                "prompt_cache_hit_tokens": 80,
+                "prompt_cache_miss_tokens": 40,
                 "completion_tokens_details": { "reasoning_tokens": 30 }
             }
         });
         assert_eq!(
             extract_usage(&chunk, Provider::DeepSeek),
-            Some(TokenUsage { prompt_tokens: 120, completion_tokens: 45, reasoning_tokens: 30 })
+            Some(TokenUsage {
+                prompt_tokens: 120,
+                completion_tokens: 45,
+                reasoning_tokens: 30,
+                cache_hit_tokens: 80,
+            })
         );
     }
 
@@ -530,7 +600,15 @@ mod tests {
         let delta = json!({ "type": "message_delta", "usage": { "output_tokens": 12 } });
         let mut usage = extract_usage(&start, Provider::Anthropic).unwrap();
         usage += extract_usage(&delta, Provider::Anthropic).unwrap();
-        assert_eq!(usage, TokenUsage { prompt_tokens: 88, completion_tokens: 12, reasoning_tokens: 0 });
+        assert_eq!(
+            usage,
+            TokenUsage {
+                prompt_tokens: 88,
+                completion_tokens: 12,
+                reasoning_tokens: 0,
+                cache_hit_tokens: 0,
+            }
+        );
     }
 
     #[test]
@@ -738,7 +816,7 @@ mod tests {
         // format (it is OpenAI-compatible).
         let cfg = AiConfig::new(Some("deepseek".into()), Some("sk-key".into()), None, None)
             .unwrap();
-        assert_eq!(cfg.model, "deepseek-chat");
+        assert_eq!(cfg.model, "deepseek-v4-flash");
         assert_eq!(cfg.base_url, "https://api.deepseek.com");
         assert!(cfg.provider.is_openai_compatible());
     }

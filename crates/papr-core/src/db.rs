@@ -453,6 +453,54 @@ static MIGRATIONS: LazyLock<Migrations> = LazyLock::new(|| {
                 ON article_term_index(dict_version);
             "#,
         ),
+        // v27 — auto-tag claim index: workers filter by status then join
+        // articles for newest-first ordering; keep a dedicated status index.
+        M::up(
+            r#"
+            DROP INDEX IF EXISTS idx_auto_tag_queue_status;
+            CREATE INDEX idx_auto_tag_queue_status
+                ON auto_tag_queue(status, updated_at);
+            "#,
+        ),
+        // v28 — DeepSeek-style cache-hit accounting: input tokens that hit the
+        // provider context cache are billed cheaper than cache-miss input.
+        M::up(
+            r#"
+            ALTER TABLE ai_usage ADD COLUMN cache_hit_tokens INTEGER NOT NULL DEFAULT 0;
+            "#,
+        ),
+        // v29 — global article URL uniqueness ("smart dedupe"). Multiple feeds
+        // often push the same story link; previously only a soft EXISTS check
+        // gated by `dedup_enabled` (default off) prevented duplicates, so
+        // cross-feed same-URL rows piled up. Clean existing duplicates keeping
+        // the earliest-fetched row (lowest id), replace the non-unique URL
+        // index with a partial UNIQUE index (empty/NULL URLs stay unrestricted),
+        // and turn the setting on for databases that never set it.
+        M::up(
+            r#"
+            DELETE FROM articles
+            WHERE id IN (
+                SELECT id FROM (
+                    SELECT a.id AS id
+                    FROM articles a
+                    WHERE a.url IS NOT NULL AND a.url != ''
+                      AND a.id NOT IN (
+                          SELECT MIN(id) FROM articles
+                          WHERE url IS NOT NULL AND url != ''
+                          GROUP BY url
+                      )
+                )
+            );
+
+            DROP INDEX IF EXISTS idx_articles_url;
+            CREATE UNIQUE INDEX idx_articles_url
+                ON articles(url)
+                WHERE url IS NOT NULL AND url != '';
+
+            INSERT OR IGNORE INTO settings(key, value)
+                VALUES ('dedup_enabled', '1');
+            "#,
+        ),
     ])
 });
 
@@ -1217,10 +1265,13 @@ fn rule_matches(rule: &Rule, feed_id: i64, a: &NewArticle) -> bool {
 /// inflate the "N new articles" figure and disagree with the sidebar's unread
 /// count (the same overcount `add_feed` guards against).
 ///
-/// When `dedup` is on, an article whose URL already exists (in any feed) is
-/// skipped — collapsing the same story pushed by multiple feeds. Enabled
-/// `rules` are evaluated first: a `skip` match drops the article entirely,
-/// while `read` / `star` matches pre-set the article's state on insert.
+/// Cross-feed URL first-win: a non-empty URL that already exists (in any feed)
+/// is skipped — the earliest-fetched row keeps its `feed_id`. Empty/NULL URLs
+/// are unrestricted. This is always applied (backed by a partial UNIQUE index);
+/// `dedup` is retained for call-site compatibility and mirrors the
+/// `dedup_enabled` setting callers pass in. Enabled `rules` are evaluated
+/// first: a `skip` match drops the article entirely, while `read` / `star`
+/// matches pre-set the article's state on insert.
 pub fn upsert_article(
     conn: &Connection,
     feed_id: i64,
@@ -1228,8 +1279,18 @@ pub fn upsert_article(
     dedup: bool,
     rules: &[Rule],
 ) -> AppResult<bool> {
+    // Trim so whitespace-only links don't occupy the unique URL slot, and so
+    // `" https://…"` matches an already-stored `"https://…"`.
+    let url = a
+        .url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty());
+    // First-win URL dedupe. Always enforced for non-empty URLs (unique index);
+    // when `dedup` is false the soft EXISTS check is skipped but
+    // `ON CONFLICT DO NOTHING` still collapses a racing duplicate insert.
     if dedup {
-        if let Some(url) = a.url.as_deref().filter(|u| !u.is_empty()) {
+        if let Some(url) = url {
             let exists: bool = conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM articles WHERE url = ?1)",
                 params![url],
@@ -1271,14 +1332,16 @@ pub fn upsert_article(
     // together — a partial insert leaves an unsearchable or enclosure-less
     // article. Wrap them in a transaction so a mid-loop failure rolls back.
     let tx = conn.unchecked_transaction()?;
+    // Bare ON CONFLICT DO NOTHING covers both UNIQUE(feed_id, guid) and the
+    // partial unique URL index — first-win skip for either key.
     let n = tx.execute(
         "INSERT INTO articles
             (feed_id, guid, url, title, author, summary, content_html, body_text,
              image_url, published_at, is_read, is_starred)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-         ON CONFLICT(feed_id, guid) DO NOTHING",
+         ON CONFLICT DO NOTHING",
         params![
-            feed_id, a.guid, a.url, a.title, a.author, a.summary,
+            feed_id, a.guid, url, a.title, a.author, a.summary,
             a.content_html, a.body_text, a.image_url, a.published_at,
             start_read, start_starred
         ],
@@ -1297,19 +1360,23 @@ pub fn upsert_article(
             params![id, e.url, e.mime_type, e.length],
         )?;
     }
-    // Enqueue for AI auto-tagging inside the same transaction so a crash
-    // between insert and enqueue cannot leave an untagged article stranded
-    // outside the queue. The worker no-ops when auto_tag_enabled is off.
-    tx.execute(
-        "INSERT INTO auto_tag_queue(article_id, status, attempts, last_error, updated_at)
-         VALUES (?1, 'pending', 0, NULL, datetime('now'))
-         ON CONFLICT(article_id) DO UPDATE SET
-             status = 'pending',
-             attempts = 0,
-             last_error = NULL,
-             updated_at = datetime('now')",
-        params![id],
-    )?;
+    // Enqueue for AI auto-tagging only when at least one tag feature is on.
+    // Avoids growing a useless backlog while both toggles are off. Same
+    // transaction as the insert so a crash cannot strand an untagged row.
+    let tag_enabled = setting_flag(&*tx, "auto_tag_enabled", false)
+        || setting_flag(&*tx, "ai_tag_enabled", false);
+    if tag_enabled {
+        tx.execute(
+            "INSERT INTO auto_tag_queue(article_id, status, attempts, last_error, updated_at)
+             VALUES (?1, 'pending', 0, NULL, datetime('now'))
+             ON CONFLICT(article_id) DO UPDATE SET
+                 status = 'pending',
+                 attempts = 0,
+                 last_error = NULL,
+                 updated_at = datetime('now')",
+            params![id],
+        )?;
+    }
     // Word-cloud terms: tokenize title+summary once so the cloud API can
     // aggregate from `article_terms` instead of re-scanning text per request.
     // Failures are logged inside the helper and must not roll back ingest.
@@ -1451,19 +1518,19 @@ pub fn list_articles(
     // `datetime()` normalises each side to a single comparable form. Backed
     // by `idx_articles_sort`, an expression index over the same wrapped
     // expression (v12) — the planner uses it for both directions, no sort.
-    if searching {
-        sql.push_str(" ORDER BY fts.rank ");
-    } else {
-        sql.push_str(" ORDER BY ");
-        sql.push_str(article_order(oldest_first));
-        sql.push(' ');
-    }
+    //
+    // Search only filters the set (FTS MATCH); the browse sort toggle still
+    // owns ORDER BY. Ranking by `fts.rank` here ignored `oldest_first`, so a
+    // "最新优先" list filtered by a term could put older hits above newer ones.
+    sql.push_str(" ORDER BY ");
+    sql.push_str(article_order(oldest_first));
+    sql.push(' ');
     sql.push_str("LIMIT ? OFFSET ?");
     binds.push(Value::Integer(limit));
     binds.push(Value::Integer(offset));
 
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt
+    let mut rows = stmt
         .query_map(params_from_iter(binds), |r| {
             Ok(ArticleSummary {
                 id: r.get(0)?,
@@ -1479,9 +1546,11 @@ pub fn list_articles(
                 is_read: r.get(10)?,
                 is_starred: r.get(11)?,
                 read_later: r.get(12)?,
+                tags: Vec::new(),
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
+    attach_article_tags(conn, &mut rows)?;
     Ok(rows)
 }
 
@@ -2032,13 +2101,63 @@ pub fn article_tag_count(conn: &Connection, article_id: i64, kind: &str) -> AppR
 // ─────────────────────────── auto-tag queue ───────────────────────────
 
 pub const AUTO_TAG_STATUS_PENDING: &str = "pending";
+pub const AUTO_TAG_STATUS_PROCESSING: &str = "processing";
 pub const AUTO_TAG_STATUS_DONE: &str = "done";
 pub const AUTO_TAG_STATUS_FAILED: &str = "failed";
 
-/// Enqueue (or re-enqueue) an article for auto-tagging. Idempotent: a pending
-/// row is left alone; done/failed rows are reset to pending.
-pub fn enqueue_auto_tag(conn: &Connection, article_id: i64) -> AppResult<()> {
-    conn.execute(
+/// Skip re-enqueue of recently completed jobs unless force/backfill.
+const AUTO_TAG_RECENT_DONE_HOURS: i64 = 24;
+
+/// Enqueue (or re-enqueue) an article for auto-tagging.
+///
+/// Skips when the row is already `done` within the last 24h (avoids churn).
+/// Pending/processing rows are left alone; failed/stale-done rows reset to
+/// pending. Returns whether a row was inserted or reset.
+pub fn enqueue_auto_tag(conn: &Connection, article_id: i64) -> AppResult<bool> {
+    enqueue_auto_tag_inner(conn, article_id, false)
+}
+
+/// Force-enqueue (admin backfill): always reset to pending, ignoring the
+/// recent-done skip so operators can re-tag on demand.
+pub fn enqueue_auto_tag_force(conn: &Connection, article_id: i64) -> AppResult<bool> {
+    enqueue_auto_tag_inner(conn, article_id, true)
+}
+
+fn enqueue_auto_tag_inner(
+    conn: &Connection,
+    article_id: i64,
+    force: bool,
+) -> AppResult<bool> {
+    if !force {
+        let recent_done: bool = conn
+            .query_row(
+                "SELECT 1 FROM auto_tag_queue
+                 WHERE article_id = ?1
+                   AND status = 'done'
+                   AND datetime(updated_at) >= datetime('now', ?2)",
+                params![article_id, format!("-{AUTO_TAG_RECENT_DONE_HOURS} hours")],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if recent_done {
+            return Ok(false);
+        }
+    }
+    // Leave an in-flight claim alone so we do not double-schedule it.
+    let in_flight: bool = conn
+        .query_row(
+            "SELECT 1 FROM auto_tag_queue
+             WHERE article_id = ?1 AND status IN ('pending', 'processing')",
+            params![article_id],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if in_flight {
+        return Ok(false);
+    }
+    let n = conn.execute(
         "INSERT INTO auto_tag_queue(article_id, status, attempts, last_error, updated_at)
          VALUES (?1, 'pending', 0, NULL, datetime('now'))
          ON CONFLICT(article_id) DO UPDATE SET
@@ -2048,10 +2167,11 @@ pub fn enqueue_auto_tag(conn: &Connection, article_id: i64) -> AppResult<()> {
              updated_at = datetime('now')",
         params![article_id],
     )?;
-    Ok(())
+    Ok(n > 0)
 }
 
 /// Enqueue articles published (or fetched) within the last `days` days.
+/// Force path: resets done/failed rows so backfill re-runs tagging.
 /// Returns the number of rows newly set to pending.
 pub fn enqueue_auto_tag_backfill(conn: &Connection, days: i64) -> AppResult<usize> {
     let days = days.max(1);
@@ -2066,24 +2186,90 @@ pub fn enqueue_auto_tag_backfill(conn: &Connection, days: i64) -> AppResult<usiz
              status = 'pending',
              attempts = 0,
              last_error = NULL,
-             updated_at = datetime('now')",
+             updated_at = datetime('now')
+         WHERE auto_tag_queue.status NOT IN ('pending', 'processing')",
         params![modifier],
     )?;
     Ok(n)
 }
 
-/// Claim the oldest pending queue row. Returns `(article_id, attempts)`.
+/// Atomically claim one pending job → `processing`.
+///
+/// **Newest-first priority:** order by article
+/// `datetime(COALESCE(published_at, fetched_at)) DESC` (then `article_id DESC`).
+/// Fresh inserts and recent news jump ahead of a deep old backlog. We do *not*
+/// use `queue.created_at` — backfill re-enqueue keeps the original queue
+/// `created_at`, and catch-up imports of ancient items would otherwise starve
+/// newly published articles. Content date matches "tag newer content first".
+///
+/// Returns `(article_id, attempts)`, or `None` if the queue is empty / lost a
+/// race (another worker claimed the same row).
 pub fn claim_auto_tag_job(conn: &Connection) -> AppResult<Option<(i64, i64)>> {
-    Ok(conn
+    let row: Option<(i64, i64)> = conn
         .query_row(
-            "SELECT article_id, attempts FROM auto_tag_queue
-             WHERE status = 'pending'
-             ORDER BY created_at ASC, article_id ASC
+            "SELECT q.article_id, q.attempts
+             FROM auto_tag_queue q
+             JOIN articles a ON a.id = q.article_id
+             WHERE q.status = 'pending'
+             ORDER BY datetime(COALESCE(a.published_at, a.fetched_at)) DESC,
+                      q.article_id DESC
              LIMIT 1",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
-        .optional()?)
+        .optional()?;
+    let Some((article_id, attempts)) = row else {
+        return Ok(None);
+    };
+    // CAS: only transition pending → processing so two workers cannot share a job.
+    let n = conn.execute(
+        "UPDATE auto_tag_queue
+         SET status = 'processing', updated_at = datetime('now')
+         WHERE article_id = ?1 AND status = 'pending'",
+        params![article_id],
+    )?;
+    if n == 0 {
+        return Ok(None);
+    }
+    Ok(Some((article_id, attempts)))
+}
+
+/// Return stuck `processing` rows to `pending` (crash / restart recovery).
+/// When `older_than_minutes` is `None`, reclaim every processing row.
+pub fn reclaim_stale_auto_tag_jobs(
+    conn: &Connection,
+    older_than_minutes: Option<i64>,
+) -> AppResult<usize> {
+    let n = if let Some(mins) = older_than_minutes {
+        let mins = mins.max(1);
+        conn.execute(
+            "UPDATE auto_tag_queue
+             SET status = 'pending', updated_at = datetime('now')
+             WHERE status = 'processing'
+               AND datetime(updated_at) <= datetime('now', ?1)",
+            params![format!("-{mins} minutes")],
+        )?
+    } else {
+        conn.execute(
+            "UPDATE auto_tag_queue
+             SET status = 'pending', updated_at = datetime('now')
+             WHERE status = 'processing'",
+            [],
+        )?
+    };
+    Ok(n)
+}
+
+/// Release a claimed job back to pending without burning an attempt
+/// (e.g. feature disabled mid-flight).
+pub fn release_auto_tag_job(conn: &Connection, article_id: i64) -> AppResult<()> {
+    conn.execute(
+        "UPDATE auto_tag_queue
+         SET status = 'pending', updated_at = datetime('now')
+         WHERE article_id = ?1 AND status = 'processing'",
+        params![article_id],
+    )?;
+    Ok(())
 }
 
 pub fn mark_auto_tag_done(conn: &Connection, article_id: i64) -> AppResult<()> {
@@ -2129,11 +2315,41 @@ pub fn mark_auto_tag_failure(
     Ok(())
 }
 
+/// True when every enabled taxonomy is already at its per-article cap
+/// (nothing useful left for the LLM to add).
+pub fn article_at_auto_tag_caps(
+    conn: &Connection,
+    article_id: i64,
+    interest_on: bool,
+    ai_on: bool,
+    interest_max: i64,
+    ai_max: i64,
+) -> AppResult<bool> {
+    if !interest_on && !ai_on {
+        return Ok(true);
+    }
+    if interest_on {
+        let n = article_tag_count(conn, article_id, crate::models::TAG_KIND_INTEREST)?;
+        if n < interest_max {
+            return Ok(false);
+        }
+    }
+    if ai_on {
+        let n = article_tag_count(conn, article_id, crate::models::TAG_KIND_AI)?;
+        if n < ai_max {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AutoTagQueueStatus {
     pub pending: i64,
+    pub processing: i64,
     pub failed: i64,
+    pub done: i64,
     pub last_error: Option<String>,
 }
 
@@ -2143,8 +2359,18 @@ pub fn auto_tag_queue_status(conn: &Connection) -> AppResult<AutoTagQueueStatus>
         [],
         |r| r.get(0),
     )?;
+    let processing: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM auto_tag_queue WHERE status = 'processing'",
+        [],
+        |r| r.get(0),
+    )?;
     let failed: i64 = conn.query_row(
         "SELECT COUNT(*) FROM auto_tag_queue WHERE status = 'failed'",
+        [],
+        |r| r.get(0),
+    )?;
+    let done: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM auto_tag_queue WHERE status = 'done'",
         [],
         |r| r.get(0),
     )?;
@@ -2160,7 +2386,9 @@ pub fn auto_tag_queue_status(conn: &Connection) -> AppResult<AutoTagQueueStatus>
         .optional()?;
     Ok(AutoTagQueueStatus {
         pending,
+        processing,
         failed,
+        done,
         last_error,
     })
 }
@@ -2177,6 +2405,62 @@ pub fn tags_for_article(conn: &Connection, article_id: i64) -> AppResult<Vec<Tag
         .query_map(params![article_id], map_tag_row)?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+/// Batch-load tags for many articles in one query. Used by list endpoints so
+/// the middle-column article list can render chips without N+1 round-trips.
+pub fn tags_for_articles(
+    conn: &Connection,
+    article_ids: &[i64],
+) -> AppResult<std::collections::HashMap<i64, Vec<Tag>>> {
+    let mut out: std::collections::HashMap<i64, Vec<Tag>> =
+        std::collections::HashMap::with_capacity(article_ids.len());
+    if article_ids.is_empty() {
+        return Ok(out);
+    }
+    let placeholders = article_ids
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT at.article_id, t.id, t.name, t.color, t.position, t.kind, 0
+         FROM tags t JOIN article_tags at ON at.tag_id = t.id
+         WHERE at.article_id IN ({placeholders})
+         ORDER BY at.article_id, t.kind, t.position, t.name COLLATE NOCASE"
+    );
+    let binds: Vec<Value> = article_ids.iter().copied().map(Value::Integer).collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(binds), |r| {
+        let article_id: i64 = r.get(0)?;
+        let tag = Tag {
+            id: r.get(1)?,
+            name: r.get(2)?,
+            color: r.get(3)?,
+            position: r.get(4)?,
+            kind: r.get(5)?,
+            article_count: r.get(6)?,
+        };
+        Ok((article_id, tag))
+    })?;
+    for row in rows {
+        let (article_id, tag) = row?;
+        out.entry(article_id).or_default().push(tag);
+    }
+    Ok(out)
+}
+
+/// Fill `ArticleSummary.tags` for a page of list rows (one batch query).
+pub fn attach_article_tags(conn: &Connection, rows: &mut [ArticleSummary]) -> AppResult<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<i64> = rows.iter().map(|a| a.id).collect();
+    let mut by_id = tags_for_articles(conn, &ids)?;
+    for a in rows.iter_mut() {
+        a.tags = by_id.remove(&a.id).unwrap_or_default();
+    }
+    Ok(())
 }
 
 // ─────────────────────────── filter rules ───────────────────────────
@@ -2559,6 +2843,18 @@ pub fn storage_stats(conn: &Connection) -> AppResult<(i64, i64, i64)> {
 
 // ─────────────────────────── ai usage ───────────────────────────
 
+/// Official DeepSeek V4 Flash prices (CNY per million tokens).
+/// Source: <https://api-docs.deepseek.com/zh-cn/quick_start/pricing/>
+pub const DEFAULT_AI_PRICE_CACHE_HIT_PER_M: f64 = 0.02;
+pub const DEFAULT_AI_PRICE_CACHE_MISS_PER_M: f64 = 1.0;
+pub const DEFAULT_AI_PRICE_OUTPUT_PER_M: f64 = 2.0;
+
+/// Setting keys for per-million-token prices (CNY). Defaults match
+/// `deepseek-v4-flash` official pricing.
+pub const SETTING_AI_PRICE_CACHE_HIT: &str = "ai_price_cache_hit_per_m";
+pub const SETTING_AI_PRICE_CACHE_MISS: &str = "ai_price_input_per_m";
+pub const SETTING_AI_PRICE_OUTPUT: &str = "ai_price_output_per_m";
+
 /// One aggregate bucket of AI token usage.
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -2573,6 +2869,8 @@ pub struct AiUsageRow {
     pub completion_tokens: i64,
     /// Portion of `completion_tokens` spent on chain-of-thought reasoning.
     pub reasoning_tokens: i64,
+    /// Input tokens billed at the cache-hit rate.
+    pub cache_hit_tokens: i64,
 }
 
 /// AI usage aggregated over a trailing window.
@@ -2591,24 +2889,27 @@ pub fn record_ai_usage(
     feature: &str,
     provider: &str,
     model: &str,
-    prompt_tokens: u64,
-    completion_tokens: u64,
-    reasoning_tokens: u64,
+    usage: crate::ai::TokenUsage,
 ) -> AppResult<()> {
-    if prompt_tokens == 0 && completion_tokens == 0 {
+    if usage.is_empty() {
         return Ok(());
     }
+    // Clamp cache hits to prompt size so a buggy provider can't inflate the
+    // cheap bucket past total input.
+    let cache_hit = usage.cache_hit_tokens.min(usage.prompt_tokens);
     conn.execute(
         "INSERT INTO ai_usage
-             (feature, provider, model, prompt_tokens, completion_tokens, reasoning_tokens)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             (feature, provider, model, prompt_tokens, completion_tokens,
+              reasoning_tokens, cache_hit_tokens)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             feature,
             provider,
             model,
-            prompt_tokens as i64,
-            completion_tokens as i64,
-            reasoning_tokens as i64
+            usage.prompt_tokens as i64,
+            usage.completion_tokens as i64,
+            usage.reasoning_tokens as i64,
+            cache_hit as i64,
         ],
     )?;
     Ok(())
@@ -2625,11 +2926,12 @@ pub fn ai_usage_stats(conn: &Connection, days: i64) -> AppResult<AiUsageStats> {
         prompt_tokens: 0,
         completion_tokens: 0,
         reasoning_tokens: 0,
+        cache_hit_tokens: 0,
     };
     let mut by_feature = Vec::new();
     let mut stmt = conn.prepare(
         "SELECT feature, COUNT(*), SUM(prompt_tokens), SUM(completion_tokens),
-                SUM(reasoning_tokens)
+                SUM(reasoning_tokens), SUM(cache_hit_tokens)
          FROM ai_usage
          WHERE created_at >= datetime('now', ?1)
          GROUP BY feature
@@ -2642,6 +2944,7 @@ pub fn ai_usage_stats(conn: &Connection, days: i64) -> AppResult<AiUsageStats> {
             prompt_tokens: r.get(2)?,
             completion_tokens: r.get(3)?,
             reasoning_tokens: r.get(4)?,
+            cache_hit_tokens: r.get(5)?,
         })
     })?;
     for row in rows {
@@ -2650,9 +2953,28 @@ pub fn ai_usage_stats(conn: &Connection, days: i64) -> AppResult<AiUsageStats> {
         total.prompt_tokens += row.prompt_tokens;
         total.completion_tokens += row.completion_tokens;
         total.reasoning_tokens += row.reasoning_tokens;
+        total.cache_hit_tokens += row.cache_hit_tokens;
         by_feature.push(row);
     }
     Ok(AiUsageStats { total, by_feature })
+}
+
+/// Estimate CNY cost from aggregated usage using DeepSeek-style pricing:
+/// `cache_hit × hit + (prompt − cache_hit) × miss + completion × output`.
+/// Reasoning tokens are included in `completion_tokens` and share the output
+/// rate. Defaults are official `deepseek-v4-flash` yuan prices.
+pub fn estimate_ai_cost_cny(conn: &Connection, stats: &AiUsageStats) -> f64 {
+    let hit_per_m: f64 =
+        setting_parsed(conn, SETTING_AI_PRICE_CACHE_HIT, DEFAULT_AI_PRICE_CACHE_HIT_PER_M);
+    let miss_per_m: f64 =
+        setting_parsed(conn, SETTING_AI_PRICE_CACHE_MISS, DEFAULT_AI_PRICE_CACHE_MISS_PER_M);
+    let out_per_m: f64 =
+        setting_parsed(conn, SETTING_AI_PRICE_OUTPUT, DEFAULT_AI_PRICE_OUTPUT_PER_M);
+    let t = &stats.total;
+    let cache_hit = t.cache_hit_tokens.max(0) as f64;
+    let cache_miss = (t.prompt_tokens - t.cache_hit_tokens).max(0) as f64;
+    let completion = t.completion_tokens.max(0) as f64;
+    cache_hit / 1e6 * hit_per_m + cache_miss / 1e6 * miss_per_m + completion / 1e6 * out_per_m
 }
 
 /// Daily article counts for the last `days` calendar days (inclusive of today).
@@ -3023,7 +3345,10 @@ mod tests {
         .unwrap();
         let article = NewArticle {
             guid: "g1".into(),
-            url: Some("https://example.com/a1".into()),
+            // URL follows the guid so helper seeds that use
+            // `https://example.com/{guid}` (a1, a2, …) never collide with the
+            // fixture under the partial unique URL index.
+            url: Some("https://example.com/g1".into()),
             title: "An Article".into(),
             author: None,
             summary: None,
@@ -4238,8 +4563,10 @@ mod tests {
         assert_eq!(cleanup_old_articles(&conn, 30).unwrap(), 1);
         assert_eq!(guid_count(&conn, feed_id, "archived"), 0, "purged by retention");
 
-        // The next refresh re-fetches the still-in-feed item. dedup is off (the
-        // default), so only the tombstone can suppress the re-insertion.
+        // The next refresh re-fetches the still-in-feed item. Pass dedup=false
+        // so only the tombstone (not the soft URL check) can suppress it — the
+        // purged row's URL is free again, so the unique index alone would not
+        // block a re-insert.
         let refetched = NewArticle {
             guid: "archived".into(),
             url: Some("https://example.com/archived".into()),
@@ -4304,6 +4631,207 @@ mod tests {
             upsert_article(&conn, feed_b, &a, false, &[]).unwrap(),
             "the same guid under a different feed is not tombstoned"
         );
+    }
+
+    // ── smart dedupe (cross-feed URL first-win) ──────────────────────
+
+    fn url_count(conn: &Connection, url: &str) -> i64 {
+        conn.query_row(
+            "SELECT count(*) FROM articles WHERE url = ?1",
+            params![url],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn upsert_article_url_dedup_keeps_first_feed_across_feeds() {
+        // Two subscriptions push the same story link. Smart dedupe keeps the
+        // first-fetched row (and its feed_id); the later feed's insert is a
+        // no-op — no second row, no reassignment.
+        let (conn, fixture) = test_db();
+        let feed_a: i64 = conn
+            .query_row("SELECT feed_id FROM articles WHERE id = ?1", [fixture], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let feed_b = insert_feed(
+            &conn,
+            "https://other.example/feed.xml",
+            None,
+            "Other",
+            None,
+            SourceType::Rss,
+            None,
+        )
+        .unwrap();
+
+        let shared = "https://example.com/shared-story";
+        let first = NewArticle {
+            guid: "guid-a".into(),
+            url: Some(shared.into()),
+            title: "First win".into(),
+            author: None,
+            summary: None,
+            content_html: None,
+            body_text: "from A".into(),
+            image_url: None,
+            published_at: Some("2026-01-01T00:00:00+00:00".into()),
+            enclosures: Vec::new(),
+        };
+        let second = NewArticle {
+            guid: "guid-b".into(),
+            url: Some(shared.into()),
+            title: "Later feed copy".into(),
+            author: None,
+            summary: Some("newer summary".into()),
+            content_html: None,
+            body_text: "from B".into(),
+            image_url: None,
+            published_at: Some("2026-06-01T00:00:00+00:00".into()),
+            enclosures: Vec::new(),
+        };
+
+        assert!(upsert_article(&conn, feed_a, &first, true, &[]).unwrap());
+        assert!(
+            !upsert_article(&conn, feed_b, &second, true, &[]).unwrap(),
+            "same URL from another feed must not insert as new"
+        );
+        assert_eq!(url_count(&conn, shared), 1, "exactly one row per URL");
+
+        let (kept_feed, kept_title, kept_guid): (i64, String, String) = conn
+            .query_row(
+                "SELECT feed_id, title, guid FROM articles WHERE url = ?1",
+                params![shared],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(kept_feed, feed_a, "first-fetched feed keeps the row");
+        assert_eq!(kept_title, "First win");
+        assert_eq!(kept_guid, "guid-a");
+    }
+
+    #[test]
+    fn upsert_article_allows_multiple_empty_urls() {
+        // The partial unique index excludes NULL/empty URLs so guid-less or
+        // link-less items can still coexist.
+        let (conn, fixture) = test_db();
+        let feed_id: i64 = conn
+            .query_row("SELECT feed_id FROM articles WHERE id = ?1", [fixture], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let mk = |guid: &str| NewArticle {
+            guid: guid.into(),
+            url: None,
+            title: guid.into(),
+            author: None,
+            summary: None,
+            content_html: None,
+            body_text: String::new(),
+            image_url: None,
+            published_at: None,
+            enclosures: Vec::new(),
+        };
+        assert!(upsert_article(&conn, feed_id, &mk("empty-1"), true, &[]).unwrap());
+        assert!(upsert_article(&conn, feed_id, &mk("empty-2"), true, &[]).unwrap());
+        let n: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM articles WHERE url IS NULL AND guid LIKE 'empty-%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn upsert_article_url_dedup_even_when_setting_flag_off() {
+        // Unique index is the backstop: even if a caller passes dedup=false
+        // (legacy newsletter path), a second feed cannot create a duplicate URL.
+        let (conn, fixture) = test_db();
+        let feed_a: i64 = conn
+            .query_row("SELECT feed_id FROM articles WHERE id = ?1", [fixture], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let feed_b = insert_feed(
+            &conn,
+            "https://b.example/feed.xml",
+            None,
+            "B",
+            None,
+            SourceType::Rss,
+            None,
+        )
+        .unwrap();
+        let url = "https://example.com/always-unique";
+        let a = NewArticle {
+            guid: "a".into(),
+            url: Some(url.into()),
+            title: "A".into(),
+            author: None,
+            summary: None,
+            content_html: None,
+            body_text: String::new(),
+            image_url: None,
+            published_at: None,
+            enclosures: Vec::new(),
+        };
+        let b = NewArticle {
+            guid: "b".into(),
+            url: Some(url.into()),
+            title: "B".into(),
+            author: None,
+            summary: None,
+            content_html: None,
+            body_text: String::new(),
+            image_url: None,
+            published_at: None,
+            enclosures: Vec::new(),
+        };
+        assert!(upsert_article(&conn, feed_a, &a, false, &[]).unwrap());
+        assert!(!upsert_article(&conn, feed_b, &b, false, &[]).unwrap());
+        assert_eq!(url_count(&conn, url), 1);
+    }
+
+    #[test]
+    fn migration_collapses_duplicate_urls_keeping_earliest() {
+        // Apply migrations through v28 (pre–URL-unique), plant two rows with
+        // the same URL, then finish v29 and confirm the later id is gone.
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        // v28 is the migration before URL uniqueness (0-based index 27).
+        MIGRATIONS.to_version(&mut conn, 28).unwrap();
+        register_functions(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO feeds(id, feed_url, title, source_type)
+             VALUES (1, 'https://a.example/feed', 'A', 'rss'),
+                    (2, 'https://b.example/feed', 'B', 'rss')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO articles(id, feed_id, guid, url, title, body_text, fetched_at)
+             VALUES (10, 1, 'g-early', 'https://example.com/dup', 'Early', '', '2026-01-01 00:00:00'),
+                    (20, 2, 'g-late',  'https://example.com/dup', 'Late',  '', '2026-02-01 00:00:00')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(url_count(&conn, "https://example.com/dup"), 2);
+
+        MIGRATIONS.to_latest(&mut conn).unwrap();
+        assert_eq!(url_count(&conn, "https://example.com/dup"), 1);
+        let kept: (i64, String) = conn
+            .query_row(
+                "SELECT id, title FROM articles WHERE url = 'https://example.com/dup'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(kept, (10, "Early".into()));
+        let flag = setting_flag(&conn, "dedup_enabled", false);
+        assert!(flag, "migration seeds dedup_enabled=1 when unset");
     }
 
     // ── article-list chronological ordering ──────────────────────────
@@ -4382,6 +4910,90 @@ mod tests {
             oldest_guids,
             [dated_id, dateless_id],
             "oldest-first: the earlier-published dated article must come first"
+        );
+    }
+
+    #[test]
+    fn list_articles_search_respects_chronological_sort() {
+        // FTS filters the result set; the newest/oldest toggle must still
+        // control ORDER BY. Ranking by `fts.rank` alone put older high-scoring
+        // hits above newer ones while the UI still showed 最新优先.
+        let (conn, fixture) = test_db();
+        let feed_id: i64 = conn
+            .query_row("SELECT feed_id FROM articles WHERE id = ?1", [fixture], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute("DELETE FROM articles WHERE id = ?1", [fixture])
+            .unwrap();
+
+        let older = NewArticle {
+            guid: "china-old".into(),
+            url: None,
+            title: "China older hit".into(),
+            author: None,
+            summary: None,
+            content_html: None,
+            body_text: "about China".into(),
+            image_url: None,
+            published_at: Some("2025-07-29T12:00:00+00:00".into()),
+            enclosures: Vec::new(),
+        };
+        let newer = NewArticle {
+            guid: "china-new".into(),
+            url: None,
+            title: "China newer hit".into(),
+            author: None,
+            summary: None,
+            content_html: None,
+            body_text: "about China".into(),
+            image_url: None,
+            published_at: Some("2026-05-12T12:00:00+00:00".into()),
+            enclosures: Vec::new(),
+        };
+        upsert_article(&conn, feed_id, &older, false, &[]).unwrap();
+        upsert_article(&conn, feed_id, &newer, false, &[]).unwrap();
+        let older_id: i64 = conn
+            .query_row("SELECT id FROM articles WHERE guid = 'china-old'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let newer_id: i64 = conn
+            .query_row("SELECT id FROM articles WHERE guid = 'china-new'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+
+        let newest = list_articles(
+            &conn,
+            &ArticleQuery::All,
+            false,
+            Some("China"),
+            false,
+            50,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            newest.iter().map(|a| a.id).collect::<Vec<_>>(),
+            [newer_id, older_id],
+            "newest-first search must order by article date, not fts.rank"
+        );
+
+        let oldest = list_articles(
+            &conn,
+            &ArticleQuery::All,
+            false,
+            Some("China"),
+            true,
+            50,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            oldest.iter().map(|a| a.id).collect::<Vec<_>>(),
+            [older_id, newer_id],
+            "oldest-first search must mirror chronological order"
         );
     }
 
@@ -4860,23 +5472,65 @@ mod tests {
 
     #[test]
     fn ai_usage_records_only_nonzero_rows_and_aggregates() {
+        use crate::ai::TokenUsage;
+
         let mut conn = Connection::open_in_memory().unwrap();
         MIGRATIONS.to_latest(&mut conn).unwrap();
 
         // Zero-token calls (machine translation, providers without usage) are
         // skipped so the ledger stays a meaningful LLM accounting table.
-        record_ai_usage(&conn, "translate", "", "", 0, 0, 0).unwrap();
+        record_ai_usage(
+            &conn,
+            "translate",
+            "",
+            "",
+            TokenUsage::default(),
+        )
+        .unwrap();
         let rows: i64 = conn
             .query_row("SELECT COUNT(*) FROM ai_usage", [], |r| r.get(0))
             .unwrap();
         assert_eq!(rows, 0);
 
-        record_ai_usage(&conn, "summarize", "deepseek", "deepseek-v4-flash", 120, 45, 30)
-            .unwrap();
-        record_ai_usage(&conn, "ask", "deepseek", "deepseek-v4-flash", 300, 80, 50)
-            .unwrap();
-        record_ai_usage(&conn, "summarize", "deepseek", "deepseek-v4-flash", 90, 20, 0)
-            .unwrap();
+        record_ai_usage(
+            &conn,
+            "summarize",
+            "deepseek",
+            "deepseek-v4-flash",
+            TokenUsage {
+                prompt_tokens: 120,
+                completion_tokens: 45,
+                reasoning_tokens: 30,
+                cache_hit_tokens: 80,
+            },
+        )
+        .unwrap();
+        record_ai_usage(
+            &conn,
+            "ask",
+            "deepseek",
+            "deepseek-v4-flash",
+            TokenUsage {
+                prompt_tokens: 300,
+                completion_tokens: 80,
+                reasoning_tokens: 50,
+                cache_hit_tokens: 0,
+            },
+        )
+        .unwrap();
+        record_ai_usage(
+            &conn,
+            "summarize",
+            "deepseek",
+            "deepseek-v4-flash",
+            TokenUsage {
+                prompt_tokens: 90,
+                completion_tokens: 20,
+                reasoning_tokens: 0,
+                cache_hit_tokens: 40,
+            },
+        )
+        .unwrap();
 
         let stats = ai_usage_stats(&conn, 30).unwrap();
         assert_eq!(stats.by_feature.len(), 2);
@@ -4888,12 +5542,19 @@ mod tests {
         assert_eq!(summarize.prompt_tokens, 210);
         assert_eq!(summarize.completion_tokens, 65);
         assert_eq!(summarize.reasoning_tokens, 30);
+        assert_eq!(summarize.cache_hit_tokens, 120);
 
         let t = &stats.total;
         assert_eq!(t.calls, 3);
         assert_eq!(t.prompt_tokens, 510);
         assert_eq!(t.completion_tokens, 145);
         assert_eq!(t.reasoning_tokens, 80);
+        assert_eq!(t.cache_hit_tokens, 120);
+
+        // DeepSeek V4 Flash defaults: hit 0.02 + miss 1 + out 2 (CNY / M).
+        // hit=120, miss=390, out=145 → 0.0000024 + 0.00039 + 0.00029 = 0.0006824
+        let cost = estimate_ai_cost_cny(&conn, &stats);
+        assert!((cost - 0.0006824).abs() < 1e-12);
 
         // Rows outside the window are excluded.
         conn.execute(

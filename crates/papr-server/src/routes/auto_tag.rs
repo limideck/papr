@@ -20,7 +20,9 @@ pub async fn status(State(state): State<AppState>, user: AuthUser) -> ApiResult<
         "interestEnabled": interest_enabled,
         "aiEnabled": ai_enabled,
         "pending": queue.pending,
+        "processing": queue.processing,
         "failed": queue.failed,
+        "done": queue.done,
         "lastError": queue.last_error,
     })))
 }
@@ -37,6 +39,9 @@ fn default_days() -> i64 {
 }
 
 /// `POST /api/auto-tag/backfill` — enqueue recent articles for tagging (admin).
+///
+/// Force path: resets done/failed rows in the window so tagging re-runs
+/// (ignores the recent-done skip used by routine enqueue).
 pub async fn backfill(
     State(state): State<AppState>,
     user: AuthUser,

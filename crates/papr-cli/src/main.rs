@@ -962,7 +962,7 @@ async fn cmd_subscribe(path: &Path, url: &str, folder: Option<i64>) -> Result<St
     // A failure to load rules is a real DB error — surface it rather than
     // silently ingesting with no rules applied.
     let rules = db::active_rules(&conn).map_err(db_err)?;
-    let dedup = db::setting_flag(&conn, "dedup_enabled", false);
+    let dedup = db::setting_flag(&conn, "dedup_enabled", true);
     let mut new_count = 0usize;
     let mut failed = 0usize;
     for article in &parsed.articles {

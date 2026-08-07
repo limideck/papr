@@ -136,6 +136,10 @@ pub struct ArticleSummary {
     pub is_read: bool,
     pub is_starred: bool,
     pub read_later: bool,
+    /// Tags attached to this article (interest and/or AI). Populated by the
+    /// list query so the middle column can render chips without N+1 fetches.
+    #[serde(default)]
+    pub tags: Vec<Tag>,
 }
 
 /// The full article shown in the reading pane.

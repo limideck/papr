@@ -7,7 +7,7 @@
 use crate::error::AppResult;
 use crate::models::*;
 use rusqlite::{params, params_from_iter, types::Value, Connection};
-use crate::db::PREVIEW_SNIPPET_CHARS;
+use crate::db::{attach_article_tags, PREVIEW_SNIPPET_CHARS};
 
 fn state_join(user_id: i64) -> (String, Value) {
     (
@@ -142,20 +142,19 @@ pub fn list_articles_for_user(
     }
     sql.push_str("WHERE ");
     sql.push_str(&where_clauses.join(" AND "));
-    if searching {
-        sql.push_str(" ORDER BY fts.rank ");
-    } else {
-        sql.push_str(" ORDER BY ");
-        sql.push_str(article_order(oldest_first));
-        sql.push(' ');
-    }
+    // Search filters via FTS MATCH; ORDER BY still follows the browse sort
+    // toggle (same as `db::list_articles`). Do not rank by `fts.rank` here —
+    // that ignored `oldest_first` and broke newest-first under search.
+    sql.push_str(" ORDER BY ");
+    sql.push_str(article_order(oldest_first));
+    sql.push(' ');
     sql.push_str("LIMIT ? OFFSET ?");
     binds.push(Value::Integer(limit));
     binds.push(Value::Integer(offset));
     all_binds.extend(binds);
 
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt
+    let mut rows = stmt
         .query_map(params_from_iter(all_binds), |r| {
             Ok(ArticleSummary {
                 id: r.get(0)?,
@@ -171,9 +170,11 @@ pub fn list_articles_for_user(
                 is_read: r.get::<_, i64>(10)? != 0,
                 is_starred: r.get::<_, i64>(11)? != 0,
                 read_later: r.get::<_, i64>(12)? != 0,
+                tags: Vec::new(),
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
+    attach_article_tags(conn, &mut rows)?;
     Ok(rows)
 }
 

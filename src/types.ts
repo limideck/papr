@@ -210,6 +210,8 @@ export interface ArticleSummary {
   isRead: boolean;
   isStarred: boolean;
   readLater: boolean;
+  /** Present on list payloads; empty/omitted on older caches. */
+  tags?: Tag[];
 }
 
 export interface ArticleDetail {

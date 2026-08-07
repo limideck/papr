@@ -139,7 +139,7 @@ async fn add_feed_inner(
     if let Some(fav) = &favicon {
         db::update_feed_meta(&conn, feed_id, None, None, None, Some(fav)).map_err(ApiError::from)?;
     }
-    let dedup = db::setting_flag(&conn, "dedup_enabled", false);
+    let dedup = db::setting_flag(&conn, "dedup_enabled", true);
     let rules = db::active_rules(&conn).unwrap_or_default();
     for article in &parsed.articles {
         let _ = db::upsert_article(&conn, feed_id, article, dedup, &rules);

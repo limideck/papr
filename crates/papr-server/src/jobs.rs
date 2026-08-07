@@ -13,15 +13,31 @@ use std::time::Duration;
 const REFRESH_TICK_SECS: u64 = 60;
 /// Feed-source index sync interval (6 hours, matching FO behaviour).
 const FEED_SOURCE_TICK_SECS: u64 = 6 * 60 * 60;
-/// Auto-tag worker poll interval when idle / between jobs.
-const AUTO_TAG_TICK_SECS: u64 = 5;
+/// Auto-tag worker poll interval when idle (queue empty or tagging disabled).
+const AUTO_TAG_IDLE_SECS: u64 = 5;
+/// Reclaim `processing` rows older than this (crashed worker).
+const AUTO_TAG_STALE_MINUTES: i64 = 15;
+/// Default concurrent auto-tag workers. Override with `PAPR_AUTO_TAG_CONCURRENCY`.
+const DEFAULT_AUTO_TAG_CONCURRENCY: usize = 3;
 /// Word-cloud term backfill poll interval when draining a backlog.
 const WORDCLOUD_BACKFILL_TICK_SECS: u64 = 2;
+
+fn auto_tag_concurrency() -> usize {
+    std::env::var("PAPR_AUTO_TAG_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_AUTO_TAG_CONCURRENCY)
+        .clamp(1, 16)
+}
 
 pub fn spawn_background_jobs(state: AppState) {
     tokio::spawn(refresh_loop(state.clone()));
     tokio::spawn(feed_source_loop(state.clone()));
-    tokio::spawn(auto_tag_loop(state.clone()));
+    let n = auto_tag_concurrency();
+    tracing::info!(workers = n, "starting auto-tag workers");
+    for worker_id in 0..n {
+        tokio::spawn(auto_tag_worker(state.clone(), worker_id));
+    }
     tokio::spawn(wordcloud_backfill_loop(state));
 }
 
@@ -78,32 +94,49 @@ async fn feed_source_loop(state: AppState) {
     }
 }
 
-async fn auto_tag_loop(state: AppState) {
-    tokio::time::sleep(Duration::from_secs(10)).await;
-    let mut ticker = tokio::time::interval(Duration::from_secs(AUTO_TAG_TICK_SECS));
-    loop {
-        ticker.tick().await;
+/// One concurrent auto-tag worker.
+///
+/// Continuous drain: after finishing a job (ok or hard fail), claim the next
+/// immediately. Sleep only when the queue is empty or tagging is disabled.
+async fn auto_tag_worker(state: AppState, worker_id: usize) {
+    // Stagger startup so workers don't all contend on the first claim.
+    tokio::time::sleep(Duration::from_secs(10 + worker_id as u64)).await;
+    if worker_id == 0 {
+        let conn = state.db.lock().await;
+        match db::reclaim_stale_auto_tag_jobs(&conn, Some(AUTO_TAG_STALE_MINUTES)) {
+            Ok(n) if n > 0 => tracing::info!(reclaimed = n, "reclaimed stale auto-tag jobs"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("auto-tag reclaim failed: {e}"),
+        }
+    }
 
+    loop {
         let enabled = {
             let conn = state.db.lock().await;
             db::setting_flag(&conn, "auto_tag_enabled", false)
                 || db::setting_flag(&conn, "ai_tag_enabled", false)
         };
         if !enabled {
+            tokio::time::sleep(Duration::from_secs(AUTO_TAG_IDLE_SECS)).await;
             continue;
         }
 
         let job = {
             let conn = state.db.lock().await;
+            // Cheap periodic reclaim so a crashed peer does not leave jobs stuck.
+            if worker_id == 0 {
+                let _ = db::reclaim_stale_auto_tag_jobs(&conn, Some(AUTO_TAG_STALE_MINUTES));
+            }
             match db::claim_auto_tag_job(&conn) {
                 Ok(j) => j,
                 Err(e) => {
-                    tracing::warn!("auto-tag claim failed: {e}");
+                    tracing::warn!(worker_id, "auto-tag claim failed: {e}");
                     None
                 }
             }
         };
         let Some((article_id, _attempts)) = job else {
+            tokio::time::sleep(Duration::from_secs(AUTO_TAG_IDLE_SECS)).await;
             continue;
         };
 
@@ -113,22 +146,29 @@ async fn auto_tag_loop(state: AppState) {
                 if let Err(e) = db::mark_auto_tag_done(&conn, article_id) {
                     tracing::warn!(article_id, "auto-tag mark done failed: {e}");
                 } else {
-                    tracing::info!(article_id, "auto-tag complete");
+                    tracing::debug!(worker_id, article_id, "auto-tag complete");
                 }
+                // Backlog remains → loop immediately (no idle sleep).
             }
             Err(e) => {
-                // Disabled mid-flight: leave pending; do not burn attempts.
+                // Disabled mid-flight: release claim; do not burn attempts.
                 if matches!(&e, AppError::Coded("autoTagDisabled")) {
+                    let conn = state.db.lock().await;
+                    if let Err(rel) = db::release_auto_tag_job(&conn, article_id) {
+                        tracing::warn!(article_id, "auto-tag release failed: {rel}");
+                    }
+                    tokio::time::sleep(Duration::from_secs(AUTO_TAG_IDLE_SECS)).await;
                     continue;
                 }
                 let detail = e.to_string();
-                tracing::warn!(article_id, error = %detail, "auto-tag failed");
+                tracing::warn!(worker_id, article_id, error = %detail, "auto-tag failed");
                 let conn = state.db.lock().await;
                 if let Err(mark_err) =
                     db::mark_auto_tag_failure(&conn, article_id, &detail, MAX_ATTEMPTS)
                 {
                     tracing::warn!(article_id, "auto-tag mark failure failed: {mark_err}");
                 }
+                // Keep draining after hard failures.
             }
         }
     }

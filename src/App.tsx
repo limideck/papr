@@ -451,7 +451,6 @@ export default function App() {
             onAddFeed={() => setAddFeed(true)}
             onExplore={() => setExplore(true)}
             onOpenSettings={openSettings}
-            onSearchClick={() => setCpOpen(true)}
             onRefresh={doRefresh}
             refreshing={refreshing}
             onToast={showToast}

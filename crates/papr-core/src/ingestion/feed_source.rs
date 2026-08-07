@@ -534,7 +534,7 @@ pub async fn scan(
                     let conn = db.lock().await;
                     let _ = db::update_feed_meta(&conn, id, Some(&title), None, None, None);
                     let rules = db::active_rules(&conn).unwrap_or_default();
-                    let dedup = db::setting_flag(&conn, "dedup_enabled", false);
+                    let dedup = db::setting_flag(&conn, "dedup_enabled", true);
                     for article in &parsed.articles {
                         let _ = db::upsert_article(&conn, id, article, dedup, &rules);
                     }

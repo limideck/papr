@@ -1480,6 +1480,7 @@ function AdvancedSection({
           settingKey="dedup_enabled"
           label={t("settings.advanced.dedup")}
           desc={t("settings.advanced.dedupDesc")}
+          fallback={true}
         />
       </div>
       <DangerZone onToast={onToast} />
@@ -2054,6 +2055,9 @@ function AiUsageGroup() {
           <Row label={t("settings.advanced.aiUsagePrompt")}>
             <span className="s-value">{fmt(total.promptTokens)}</span>
           </Row>
+          <Row label={t("settings.advanced.aiUsageCacheHit")}>
+            <span className="s-value">{fmt(total.cacheHitTokens ?? 0)}</span>
+          </Row>
           <Row label={t("settings.advanced.aiUsageCompletion")}>
             <span className="s-value">{fmt(total.completionTokens)}</span>
           </Row>
@@ -2064,7 +2068,7 @@ function AiUsageGroup() {
             label={t("settings.advanced.aiUsageCost")}
             desc={t("settings.advanced.aiUsageCostDesc")}
           >
-            <span className="s-value">${cost.toFixed(4)}</span>
+            <span className="s-value">¥{cost.toFixed(4)}</span>
           </Row>
 
           {report.data!.byFeature.length > 0 && (
@@ -2093,43 +2097,62 @@ function AiUsageGroup() {
   );
 }
 
-/** Per-million-token price inputs (USD) used to estimate AI cost. */
+/** Per-million-token price inputs (CNY). Defaults match deepseek-v4-flash. */
 function AiPriceInputs({ onChanged }: { onChanged: () => void }) {
   const { t } = useTranslation();
-  const [prices, setPrices] = useState<Record<string, string>>({});
+  // Official deepseek-v4-flash CNY / M tokens:
+  // cache hit 0.02 · cache miss 1 · output 2
+  const defaults = {
+    cacheHit: "0.02",
+    cacheMiss: "1",
+    output: "2",
+  };
+  const [prices, setPrices] = useState<Record<string, string>>(defaults);
 
   useEffect(() => {
     Promise.all([
+      api.getSetting("ai_price_cache_hit_per_m"),
       api.getSetting("ai_price_input_per_m"),
       api.getSetting("ai_price_output_per_m"),
-      api.getSetting("ai_price_reasoning_per_m"),
-    ]).then(([i, o, r]) => {
-      setPrices({
-        input: i || "0",
-        output: o || "0",
-        reasoning: r || "0",
-      });
+    ]).then(([hit, miss, out]) => {
+      const next = {
+        cacheHit: hit || defaults.cacheHit,
+        cacheMiss: miss || defaults.cacheMiss,
+        output: out || defaults.output,
+      };
+      setPrices(next);
+      // Persist official defaults when unset so cost estimates and the
+      // settings form share the same deepseek-v4-flash numbers.
+      const writes: Promise<unknown>[] = [];
+      if (!hit) writes.push(api.setSetting("ai_price_cache_hit_per_m", defaults.cacheHit));
+      if (!miss) writes.push(api.setSetting("ai_price_input_per_m", defaults.cacheMiss));
+      if (!out) writes.push(api.setSetting("ai_price_output_per_m", defaults.output));
+      if (writes.length) {
+        Promise.all(writes)
+          .then(onChanged)
+          .catch((e) => reportError(e));
+      }
     });
   }, []);
 
-  const blur = (key: "input" | "output" | "reasoning") => {
+  const blur = (key: "cacheHit" | "cacheMiss" | "output") => {
     const v = prices[key];
-    api
-      .setSetting(
-        key === "input"
+    const settingKey =
+      key === "cacheHit"
+        ? "ai_price_cache_hit_per_m"
+        : key === "cacheMiss"
           ? "ai_price_input_per_m"
-          : key === "output"
-            ? "ai_price_output_per_m"
-            : "ai_price_reasoning_per_m",
-        /^\d+(\.\d+)?$/.test(v) ? v : "0",
-      )
+          : "ai_price_output_per_m";
+    const fallback = defaults[key];
+    api
+      .setSetting(settingKey, /^\d+(\.\d+)?$/.test(v) ? v : fallback)
       .then(onChanged)
       .catch((e) => reportError(e));
   };
 
   const input = (
     labelKey: string,
-    key: "input" | "output" | "reasoning",
+    key: "cacheHit" | "cacheMiss" | "output",
     ph: string,
   ) => (
     <Row label={t(labelKey)} desc={t("settings.advanced.aiPricePerM")}>
@@ -2147,9 +2170,13 @@ function AiPriceInputs({ onChanged }: { onChanged: () => void }) {
 
   return (
     <>
-      {input("settings.advanced.aiPriceInput", "input", "0.27")}
-      {input("settings.advanced.aiPriceOutput", "output", "1.10")}
-      {input("settings.advanced.aiPriceReasoning", "reasoning", "0.0")}
+      {input("settings.advanced.aiPriceCacheHit", "cacheHit", defaults.cacheHit)}
+      {input(
+        "settings.advanced.aiPriceCacheMiss",
+        "cacheMiss",
+        defaults.cacheMiss,
+      )}
+      {input("settings.advanced.aiPriceOutput", "output", defaults.output)}
     </>
   );
 }
@@ -2371,6 +2398,40 @@ function UsersSection({ onToast }: { onToast: (m: string) => void }) {
 }
 
 /* ── tag management: AI tags | interest tags (admin) ─────── */
+const TAG_LIST_PAGE_SIZE = 20;
+
+type TagSortMode = "alpha" | "count";
+type TagSortDir = "asc" | "desc";
+
+function defaultTagSortDir(mode: TagSortMode): TagSortDir {
+  return mode === "count" ? "desc" : "asc";
+}
+
+function sortTagsList(
+  list: Tag[],
+  mode: TagSortMode,
+  dir: TagSortDir,
+): Tag[] {
+  const sorted = [...list];
+  const mul = dir === "asc" ? 1 : -1;
+  if (mode === "alpha") {
+    sorted.sort(
+      (a, b) =>
+        mul *
+        a.name.localeCompare(b.name, undefined, { sensitivity: "base" }),
+    );
+  } else {
+    sorted.sort((a, b) => {
+      const byCount = (a.articleCount - b.articleCount) * mul;
+      if (byCount !== 0) return byCount;
+      return a.name.localeCompare(b.name, undefined, {
+        sensitivity: "base",
+      });
+    });
+  }
+  return sorted;
+}
+
 function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
   const { t } = useTranslation();
   const qc = useQueryClient();
@@ -2388,9 +2449,13 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
     onSubmit: (v: string) => void;
   } | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<Tag | null>(null);
+  const [tagSort, setTagSort] = useState<{
+    mode: TagSortMode;
+    dir: TagSortDir;
+  }>({ mode: "count", dir: "desc" });
+  const [page, setPage] = useState(0);
 
   const tags = useQuery({ queryKey: ["tags"], queryFn: () => api.listTags() });
-
   const status = useQuery({
     queryKey: ["auto-tag-status"],
     queryFn: api.getAutoTagStatus,
@@ -2511,14 +2576,45 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
     }
   };
 
+  const setTagSortMode = (mode: TagSortMode) => {
+    setTagSort((prev) =>
+      prev.mode === mode
+        ? { mode, dir: prev.dir === "asc" ? "desc" : "asc" }
+        : { mode, dir: defaultTagSortDir(mode) },
+    );
+    setPage(0);
+  };
+
+  const switchTab = (next: "ai" | "interest") => {
+    setTab(next);
+    setPage(0);
+  };
+
   const st = status.data;
   const allTags = tags.data ?? [];
   const interestList = allTags.filter(
     (tg) => (tg.kind ?? "interest") === "interest",
   );
   const aiList = allTags.filter((tg) => tg.kind === "ai");
+  const activeList = tab === "ai" ? aiList : interestList;
+  const sortedList = sortTagsList(activeList, tagSort.mode, tagSort.dir);
+  const totalPages = Math.max(
+    1,
+    Math.ceil(sortedList.length / TAG_LIST_PAGE_SIZE),
+  );
+  const safePage = Math.min(page, totalPages - 1);
+  const pageList = sortedList.slice(
+    safePage * TAG_LIST_PAGE_SIZE,
+    (safePage + 1) * TAG_LIST_PAGE_SIZE,
+  );
 
-  const renderTagRows = (list: Tag[], emptyKey: string, allowCreate: boolean) => (
+  // After delete (or other list shrinks), pull back if the current page
+  // would be empty past the last page.
+  useEffect(() => {
+    if (page !== safePage) setPage(safePage);
+  }, [page, safePage]);
+
+  const renderTagRows = (emptyKey: string, allowCreate: boolean) => (
     <div className="settings-group">
       <div
         style={{
@@ -2541,72 +2637,138 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
               : t("settings.autoTag.vocabularyDesc")}
           </p>
         </div>
-        {allowCreate && (
-          <button
-            className="s-btn primary"
-            type="button"
-            onClick={createInterestTag}
-          >
-            <Icon name="plus" size={12} /> {t("common.add")}
-          </button>
-        )}
+        <div className="s-tag-list-actions">
+          {sortedList.length > 0 && (
+            <span
+              className="s-tag-sort"
+              role="group"
+              aria-label={t("settings.autoTag.sortBy")}
+            >
+              <button
+                type="button"
+                className={tagSort.mode === "alpha" ? "active" : ""}
+                onClick={() => setTagSortMode("alpha")}
+                aria-pressed={tagSort.mode === "alpha"}
+                title={t("settings.autoTag.sortAlphaHint")}
+              >
+                {tagSort.mode === "alpha" && tagSort.dir === "desc"
+                  ? "Z-A ↓"
+                  : "A-Z ↑"}
+              </button>
+              <span className="s-tag-sort-sep" aria-hidden="true">
+                ·
+              </span>
+              <button
+                type="button"
+                className={tagSort.mode === "count" ? "active" : ""}
+                onClick={() => setTagSortMode("count")}
+                aria-pressed={tagSort.mode === "count"}
+                title={t("settings.autoTag.sortCountHint")}
+              >
+                {t("settings.autoTag.sortCount")}{" "}
+                {tagSort.mode === "count" && tagSort.dir === "asc" ? "↑" : "↓"}
+              </button>
+            </span>
+          )}
+          {allowCreate && (
+            <button
+              className="s-btn primary"
+              type="button"
+              onClick={createInterestTag}
+            >
+              <Icon name="plus" size={12} /> {t("common.add")}
+            </button>
+          )}
+        </div>
       </div>
-      {list.length === 0 ? (
+      {sortedList.length === 0 ? (
         <p className="settings-group-desc">{t(emptyKey)}</p>
       ) : (
-        <div className="s-interest-tags">
-          {list.map((tag) => (
-            <div key={tag.id} className="s-interest-tag-row">
-              <span
-                className="s-interest-tag-dot"
-                style={{ background: tagColor(tag.color) }}
-                aria-hidden
-              />
-              <span className="s-interest-tag-name">{tag.name}</span>
-              <span className="s-interest-tag-count">
-                {t("settings.autoTag.articleCount", {
-                  count: tag.articleCount,
+        <>
+          <div className="s-interest-tags">
+            {pageList.map((tag) => (
+              <div key={tag.id} className="s-interest-tag-row">
+                <span
+                  className="s-interest-tag-dot"
+                  style={{ background: tagColor(tag.color) }}
+                  aria-hidden
+                />
+                <span className="s-interest-tag-name">{tag.name}</span>
+                <span className="s-interest-tag-count">
+                  {t("settings.autoTag.articleCount", {
+                    count: tag.articleCount,
+                  })}
+                </span>
+                <div className="s-interest-tag-swatches" role="group">
+                  {Object.entries(TAG_PALETTE).map(([key, color]) => (
+                    <button
+                      key={key}
+                      type="button"
+                      className={`s-interest-tag-swatch ${
+                        tag.color === key ? "on" : ""
+                      }`}
+                      style={{ background: color }}
+                      title={key}
+                      aria-label={key}
+                      aria-pressed={tag.color === key}
+                      onClick={() => recolorTag(tag, key)}
+                    />
+                  ))}
+                </div>
+                <button
+                  className="icon-btn"
+                  type="button"
+                  title={
+                    tag.kind === "ai"
+                      ? t("settings.autoTag.renameAiTag")
+                      : t("settings.autoTag.renameTag")
+                  }
+                  onClick={() => renameTag(tag)}
+                >
+                  <Icon name="settings" size={13} />
+                </button>
+                <button
+                  className="icon-btn"
+                  type="button"
+                  title={t("common.delete")}
+                  onClick={() => setConfirmDelete(tag)}
+                >
+                  <Icon name="trash" size={13} />
+                </button>
+              </div>
+            ))}
+          </div>
+          {totalPages > 1 && (
+            <div className="s-tag-pager">
+              <span className="s-tag-pager-label">
+                {t("settings.autoTag.pageOf", {
+                  current: safePage + 1,
+                  total: totalPages,
                 })}
               </span>
-              <div className="s-interest-tag-swatches" role="group">
-                {Object.entries(TAG_PALETTE).map(([key, color]) => (
-                  <button
-                    key={key}
-                    type="button"
-                    className={`s-interest-tag-swatch ${
-                      tag.color === key ? "on" : ""
-                    }`}
-                    style={{ background: color }}
-                    title={key}
-                    aria-label={key}
-                    aria-pressed={tag.color === key}
-                    onClick={() => recolorTag(tag, key)}
-                  />
-                ))}
-              </div>
               <button
-                className="icon-btn"
                 type="button"
-                title={
-                  tag.kind === "ai"
-                    ? t("settings.autoTag.renameAiTag")
-                    : t("settings.autoTag.renameTag")
-                }
-                onClick={() => renameTag(tag)}
+                className="s-btn"
+                disabled={safePage <= 0}
+                onClick={() => setPage((p) => Math.max(0, p - 1))}
+                aria-label={t("settings.autoTag.prevPage")}
               >
-                <Icon name="settings" size={13} />
+                {t("settings.autoTag.prevPage")}
               </button>
               <button
-                className="icon-btn"
                 type="button"
-                title={t("common.delete")}
-                onClick={() => setConfirmDelete(tag)}
+                className="s-btn"
+                disabled={safePage >= totalPages - 1}
+                onClick={() =>
+                  setPage((p) => Math.min(totalPages - 1, p + 1))
+                }
+                aria-label={t("settings.autoTag.nextPage")}
               >
-                <Icon name="trash" size={13} />
+                {t("settings.autoTag.nextPage")}
               </button>
             </div>
-          ))}
-        </div>
+          )}
+        </>
       )}
     </div>
   );
@@ -2619,7 +2781,7 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
           role="tab"
           aria-selected={tab === "ai"}
           className={tab === "ai" ? "on" : ""}
-          onClick={() => setTab("ai")}
+          onClick={() => switchTab("ai")}
         >
           {t("settings.autoTag.tabAi")}
         </button>
@@ -2628,7 +2790,7 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
           role="tab"
           aria-selected={tab === "interest"}
           className={tab === "interest" ? "on" : ""}
-          onClick={() => setTab("interest")}
+          onClick={() => switchTab("interest")}
         >
           {t("settings.autoTag.tabInterest")}
         </button>
@@ -2636,7 +2798,7 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
 
       {tab === "ai" ? (
         <>
-          {renderTagRows(aiList, "settings.autoTag.aiVocabularyEmpty", false)}
+          {renderTagRows("settings.autoTag.aiVocabularyEmpty", false)}
           <div className="settings-group">
             <Row
               label={t("settings.autoTag.aiEnabled")}
@@ -2672,11 +2834,7 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
         </>
       ) : (
         <>
-          {renderTagRows(
-            interestList,
-            "settings.autoTag.vocabularyEmpty",
-            true,
-          )}
+          {renderTagRows("settings.autoTag.vocabularyEmpty", true)}
           <div className="settings-group">
             <Row
               label={t("settings.autoTag.enabled")}

@@ -6,7 +6,6 @@ import { useAuth } from "../auth";
 import { useUi } from "../store";
 import { useArticleActions } from "../hooks/articleActions";
 import { withUndo, reportError } from "../toast";
-import { modCombo } from "../lib/platform";
 import { tagColor, TAG_PALETTE } from "../lib/tagColors";
 import type { ArticleQuery, Feed, Folder, Tag } from "../types";
 import Icon, { type IconName } from "./Icon";
@@ -20,7 +19,6 @@ interface Props {
   /** Opens the Add-feed dialog on its Explore tab. */
   onExplore: () => void;
   onOpenSettings: (section?: string) => void;
-  onSearchClick: () => void;
   /** Refresh feeds. With no scope refreshes everything (the toolbar button);
    *  pass `{ feedId }` or `{ folderId }` for the per-source context menus. */
   onRefresh: (scope?: { feedId?: number; folderId?: number }) => void;
@@ -87,7 +85,6 @@ export default function Sidebar({
   onAddFeed,
   onExplore,
   onOpenSettings,
-  onSearchClick,
   onRefresh,
   refreshing,
   onToast,
@@ -99,11 +96,18 @@ export default function Sidebar({
   const actions = useArticleActions();
   const query = useUi((s) => s.query);
   const select = useUi((s) => s.select);
+  const listSearch = useUi((s) => s.listSearch);
   const setListSearch = useUi((s) => s.setListSearch);
   const showCounts = useUi((s) => s.prefs.showSidebarCounts);
   const unreadOnly = useUi((s) => s.prefs.sidebarUnreadOnly);
   const setPref = useUi((s) => s.setPref);
   const [sideTab, setSideTab] = useState<"feeds" | "cloud" | "tags">("feeds");
+  // Draft until Enter — keeps typing independent of listSearch, but stays in
+  // sync when the list filter changes elsewhere (word cloud / clear chips).
+  const [searchDraft, setSearchDraft] = useState(listSearch ?? "");
+  useEffect(() => {
+    setSearchDraft(listSearch ?? "");
+  }, [listSearch]);
 
   const feeds = useQuery({ queryKey: ["feeds"], queryFn: api.listFeeds });
   const folders = useQuery({ queryKey: ["folders"], queryFn: api.listFolders });
@@ -679,6 +683,17 @@ export default function Sidebar({
     setListSearch(next);
   };
 
+  /** Sidebar search → middle-column list filter (same path as word-cloud terms). */
+  const applySidebarSearch = () => {
+    const term = searchDraft.trim();
+    if (!term) {
+      setListSearch(null);
+      return;
+    }
+    select({ kind: "all" }, t("smart.all"));
+    setListSearch(term);
+  };
+
   /** Tag row used on Feeds (preview) and Tags (full list, reorderable). */
   const tagRow = (tag: Tag, opts: { reorderable: boolean; alwaysCount: boolean }) => (
     <div
@@ -836,17 +851,22 @@ export default function Sidebar({
         </div>
       ) : (
         <>
-      <div
-        className="sidebar-search"
-        role="button"
-        tabIndex={0}
-        onClick={onSearchClick}
-        onKeyDown={onActivate(onSearchClick)}
-      >
+      <label className="sidebar-search">
         <Icon name="search" size={13} />
-        <span>{t("sidebar.searchArticles")}</span>
-        <kbd>{modCombo("K")}</kbd>
-      </div>
+        <input
+          type="search"
+          value={searchDraft}
+          placeholder={t("sidebar.searchArticles")}
+          aria-label={t("sidebar.searchArticles")}
+          onChange={(e) => setSearchDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              applySidebarSearch();
+            }
+          }}
+        />
+      </label>
 
       <div className="sidebar-scroll">
         <div className="sb-section-title">

@@ -208,9 +208,7 @@ pub async fn summarize(
                 "summarize",
                 provider,
                 &model,
-                outcome.usage.prompt_tokens,
-                outcome.usage.completion_tokens,
-                outcome.usage.reasoning_tokens,
+                outcome.usage,
             );
         }
     })
@@ -278,9 +276,7 @@ pub async fn ask(
                 "ask",
                 provider,
                 &model,
-                outcome.usage.prompt_tokens,
-                outcome.usage.completion_tokens,
-                outcome.usage.reasoning_tokens,
+                outcome.usage,
             );
         }
     })
@@ -325,9 +321,7 @@ pub async fn digest(
                 "digest",
                 provider,
                 &model,
-                outcome.usage.prompt_tokens,
-                outcome.usage.completion_tokens,
-                outcome.usage.reasoning_tokens,
+                outcome.usage,
             );
         }
     })
@@ -424,9 +418,7 @@ pub async fn translate(
                     "translate",
                     provider,
                     &model,
-                    usage.prompt_tokens,
-                    usage.completion_tokens,
-                    usage.reasoning_tokens,
+                    usage,
                 );
             }
             Ok(final_html)
@@ -577,9 +569,7 @@ pub async fn translate_preview(
             "translate-preview",
             provider,
             &model,
-            usage.prompt_tokens,
-            usage.completion_tokens,
-            usage.reasoning_tokens,
+            usage,
         );
     }
     Ok(Json(ArticlePreviewTranslation {
@@ -607,8 +597,8 @@ fn default_usage_days() -> i64 {
 pub struct AiUsageReport {
     #[serde(flatten)]
     stats: db::AiUsageStats,
-    /// Estimated cost in USD over the window, from the configured
-    /// per-million-token prices (all default to 0 — a local or free endpoint).
+    /// Estimated cost in CNY over the window, from DeepSeek-style
+    /// per-million-token prices (defaults: deepseek-v4-flash official rates).
     estimated_cost: f64,
 }
 
@@ -621,15 +611,8 @@ pub async fn usage(
 ) -> ApiResult<Json<AiUsageReport>> {
     let conn = state.db.lock().await;
     let stats = db::ai_usage_stats(&conn, q.days).map_err(ApiError::from)?;
-    // Per-million-token prices, in USD. Defaults to zero so a free / local
-    // provider reports $0 without any configuration.
-    let input_per_m: f64 = db::setting_parsed(&conn, "ai_price_input_per_m", 0.0);
-    let output_per_m: f64 = db::setting_parsed(&conn, "ai_price_output_per_m", 0.0);
-    let reasoning_per_m: f64 = db::setting_parsed(&conn, "ai_price_reasoning_per_m", 0.0);
-    let t = &stats.total;
-    let non_reasoning = (t.completion_tokens - t.reasoning_tokens).max(0) as f64;
-    let estimated_cost = t.prompt_tokens as f64 / 1e6 * input_per_m
-        + non_reasoning / 1e6 * output_per_m
-        + t.reasoning_tokens as f64 / 1e6 * reasoning_per_m;
+    // DeepSeek-style CNY estimate: cache-hit + cache-miss + output.
+    // Defaults are official deepseek-v4-flash prices.
+    let estimated_cost = db::estimate_ai_cost_cny(&conn, &stats);
     Ok(Json(AiUsageReport { stats, estimated_cost }))
 }

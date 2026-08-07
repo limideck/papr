@@ -175,7 +175,7 @@ pub async fn add_feed(
     if let Some(fav) = &favicon {
         db::update_feed_meta(&conn, feed_id, None, None, None, Some(fav))?;
     }
-    let dedup = db::setting_flag(&conn, "dedup_enabled", false);
+    let dedup = db::setting_flag(&conn, "dedup_enabled", true);
     let rules = db::active_rules(&conn).unwrap_or_default();
     for article in &parsed.articles {
         db::upsert_article(&conn, feed_id, article, dedup, &rules)?;
@@ -796,9 +796,7 @@ pub async fn ai_summarize(
             "summarize",
             cfg.provider_name(),
             cfg.model(),
-            outcome.usage.prompt_tokens,
-            outcome.usage.completion_tokens,
-            outcome.usage.reasoning_tokens,
+            outcome.usage,
         )?;
     }
     Ok(())
@@ -853,9 +851,7 @@ pub async fn ai_ask(
             "ask",
             cfg.provider_name(),
             cfg.model(),
-            outcome.usage.prompt_tokens,
-            outcome.usage.completion_tokens,
-            outcome.usage.reasoning_tokens,
+            outcome.usage,
         )?;
     }
     Ok(())
@@ -901,9 +897,7 @@ pub async fn ai_digest(
             "digest",
             cfg.provider_name(),
             cfg.model(),
-            outcome.usage.prompt_tokens,
-            outcome.usage.completion_tokens,
-            outcome.usage.reasoning_tokens,
+            outcome.usage,
         )?;
     }
     Ok(())
@@ -1035,9 +1029,7 @@ pub async fn translate_article_preview(
             "translate-preview",
             provider,
             &model,
-            usage.prompt_tokens,
-            usage.completion_tokens,
-            usage.reasoning_tokens,
+            usage,
         )?;
     }
 
@@ -1129,9 +1121,7 @@ pub async fn ai_translate(
             "translate",
             provider,
             &model,
-            usage.prompt_tokens,
-            usage.completion_tokens,
-            usage.reasoning_tokens,
+            usage,
         )?;
     }
     let _ = on_event.send(TranslateEvent::Done { html: final_html });
@@ -1537,13 +1527,14 @@ pub async fn add_newsletter_source(
     let conn = state.db.lock().await;
     let feed_id = db::insert_newsletter_source(&conn, &feed_url, &title, &cfg)?;
     let rules = db::active_rules(&conn).unwrap_or_default();
+    let dedup = db::setting_flag(&conn, "dedup_enabled", true);
     // `upsert_article` returns `true` only for genuinely new *unread* rows, so
     // articles a `read` rule pre-marked read are correctly excluded from the
     // returned `unread_count` (matching the sidebar's `list_feeds` count).
     let mut unread = 0i64;
     for raw in &messages {
         if let Some(parsed) = newsletter::email_to_article(raw) {
-            if db::upsert_article(&conn, feed_id, &parsed.article, false, &rules)? {
+            if db::upsert_article(&conn, feed_id, &parsed.article, dedup, &rules)? {
                 unread += 1;
             }
         }

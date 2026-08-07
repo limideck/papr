@@ -11,11 +11,13 @@ import { openUrl } from "../lib/openUrl";
 import { modCombo } from "../lib/platform";
 import { reportError, toast } from "../toast";
 import { clampToViewport } from "../lib/viewport";
-import type { ArticleSummary, Feed } from "../types";
+import { tagColor } from "../lib/tagColors";
+import type { ArticleSummary, Feed, Tag } from "../types";
 import Icon from "./Icon";
 import ContextMenu, { type MenuEntry } from "./ContextMenu";
 
 const PAGE = 60;
+const LIST_TAG_CAP = 4;
 
 interface Props {
   onToast: (msg: string) => void;
@@ -601,6 +603,7 @@ export default function ArticleList({ onToast }: Props) {
                     </div>
                     <h3 className="art-title">{a.title}</h3>
                     {a.snippet && <p className="art-snippet">{a.snippet}</p>}
+                    <ListTags tags={a.tags} />
                   </div>
                 </div>
               );
@@ -621,6 +624,28 @@ export default function ArticleList({ onToast }: Props) {
         />
       )}
 
+    </div>
+  );
+}
+
+/** Compact display-only chips under the list snippet (cap + overflow). */
+function ListTags({ tags }: { tags?: Tag[] }) {
+  if (!tags?.length) return null;
+  const visible = tags.slice(0, LIST_TAG_CAP);
+  const extra = tags.length - visible.length;
+  return (
+    <div className="art-tags" aria-hidden>
+      {visible.map((tag) => (
+        <span
+          key={tag.id}
+          className={`art-tag${tag.kind === "ai" ? " ai" : ""}`}
+          style={{ "--tag-c": tagColor(tag.color) } as React.CSSProperties}
+        >
+          <span className="tag-dot" />
+          {tag.name}
+        </span>
+      ))}
+      {extra > 0 && <span className="art-tag-more">+{extra}</span>}
     </div>
   );
 }
