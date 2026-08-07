@@ -359,6 +359,14 @@ async fn stream_openai(
     // as a hard failure / retry without the flag if needed.
     if json_object {
         body["response_format"] = json!({ "type": "json_object" });
+        // DeepSeek V4 enables thinking by default; reasoning tokens count
+        // against `max_tokens`. With a small budget (tagging), the model can
+        // spend the entire cap on chain-of-thought and return empty `content`
+        // — soft-empty success with zero tags. Disable thinking for JSON
+        // extraction; tagging is classification, not multi-step reasoning.
+        if cfg.provider == Provider::DeepSeek {
+            body["thinking"] = json!({ "type": "disabled" });
+        }
     }
     let mut req = client
         .post(format!("{}/chat/completions", cfg.base_url))

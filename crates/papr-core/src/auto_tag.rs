@@ -22,9 +22,10 @@ pub const DEFAULT_MAX_TAGS_PER_ARTICLE: i64 = 5;
 /// Failed jobs stop retrying after this many attempts.
 pub const MAX_ATTEMPTS: i64 = 3;
 
-/// Output token cap for tagging. JSON is tiny, but reasoning models may spend
-/// budget before the final object — leave a little headroom.
-pub const TAG_MAX_TOKENS: u32 = 256;
+/// Output token cap for tagging. JSON is tiny; keep modest headroom for a
+/// short object (DeepSeek thinking is disabled on the JSON path so this
+/// budget is for visible content, not chain-of-thought).
+pub const TAG_MAX_TOKENS: u32 = 512;
 
 /// Record a completed auto-tag call in the usage ledger. Only meaningful for
 /// LLM tagging — the queue is only ever populated for that path, and the db
@@ -65,12 +66,52 @@ pub fn normalize_tag_name(raw: &str) -> Option<String> {
 /// How model text maps to tags before apply.
 #[derive(Debug, PartialEq, Eq)]
 pub enum JsonParseOutcome<T> {
-    /// Parsed successfully (may be an empty tag list).
+    /// Parsed successfully (may be an empty tag list — including explicit `[]`).
     Ok(T),
-    /// Empty / prose / unusable — soft-skip (do not burn retries as hard failures).
+    /// Truly empty model output — soft-skip unless the article had content (then repair).
     SoftEmpty,
-    /// Looks like truncated/broken JSON — candidate for one repair call.
+    /// Truncated/broken JSON or non-JSON prose — candidate for one repair call.
     Invalid(String),
+}
+
+/// Invisible / zero-width Unicode that can sneak into feed titles and summaries.
+fn is_invisible_unicode(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200B}'..='\u{200D}' // ZWSP, ZWNJ, ZWJ
+            | '\u{FEFF}' // BOM / ZWNBSP
+            | '\u{00AD}' // soft hyphen
+            | '\u{034F}' // combining grapheme joiner
+            | '\u{2060}' // word joiner
+            | '\u{200E}'..='\u{200F}' // LTR/RTL marks
+            | '\u{202A}'..='\u{202E}' // bidi embeddings/overrides
+            | '\u{2066}'..='\u{2069}' // bidi isolates
+    )
+}
+
+fn looks_like_html_markup(s: &str) -> bool {
+    // Prefer a tag-ish `<` (`<p`, `</`, `<!`) over a bare comparison `a < b`.
+    let bytes = s.as_bytes();
+    bytes.windows(2).any(|w| {
+        w[0] == b'<'
+            && (w[1].is_ascii_alphabetic() || w[1] == b'/' || w[1] == b'!' || w[1] == b'?')
+    })
+}
+
+/// Sanitize title/summary before the LLM prompt: strip zero-width / invisible
+/// Unicode and residual HTML tags from feed summaries.
+pub fn sanitize_prompt_text(raw: &str) -> String {
+    let without_invisible: String = raw.chars().filter(|c| !is_invisible_unicode(*c)).collect();
+    let plain = if looks_like_html_markup(&without_invisible) {
+        crate::sanitize::html_to_text(&without_invisible)
+    } else {
+        without_invisible
+    };
+    plain.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn article_has_content(title: &str, summary: &str) -> bool {
+    !title.trim().is_empty() || !summary.trim().is_empty()
 }
 
 /// Strip markdown fences and common reasoning wrappers before JSON scan.
@@ -337,8 +378,8 @@ fn parse_tag_list_outcome(text: &str, object_keys: &[&str]) -> JsonParseOutcome<
         return JsonParseOutcome::Invalid("truncated or incomplete JSON in model response".into());
     }
 
-    // Prose, reasoning-only, "no tags", or balanced non-JSON braces → empty done.
-    JsonParseOutcome::SoftEmpty
+    // Prose / non-JSON → repair-worthy (not a soft success empty).
+    JsonParseOutcome::Invalid("non-JSON model response".into())
 }
 
 /// Parse closed-vocabulary interest suggestions from model output.
@@ -388,11 +429,12 @@ pub fn parse_combined_payload_outcome(
         return JsonParseOutcome::Invalid("truncated or incomplete JSON in model response".into());
     }
 
-    JsonParseOutcome::SoftEmpty
+    JsonParseOutcome::Invalid("non-JSON model response".into())
 }
 
 /// Parse closed-vocabulary interest suggestions from model output.
-/// Empty / non-JSON responses yield an empty list (soft success).
+/// Empty model text → empty list; explicit `{"tags":[]}` → empty list;
+/// prose / broken JSON → error (worker repairs via outcome API).
 pub fn parse_interest_payload(text: &str) -> AppResult<Vec<String>> {
     match parse_interest_payload_outcome(text) {
         JsonParseOutcome::Ok(v) => Ok(v),
@@ -426,19 +468,23 @@ pub fn parse_tag_payload(text: &str) -> AppResult<Vec<String>> {
 }
 
 pub fn prompt_interest(title: &str, summary: &str, existing: &[String]) -> (String, String) {
+    let title = sanitize_prompt_text(title);
+    let summary = sanitize_prompt_text(summary);
     let system = "You tag news articles for an RSS reader. \
 Reply with ONLY a JSON object, no markdown, no commentary. \
 Format: {\"tags\":[\"name1\",\"name2\"]}. \
 Choose ONLY from the existing-tags list (exact spelling). \
 Never invent or propose new tag names. \
+Match places, topics, and events named in the title/summary whenever they appear in the list. \
 Use at most 5 tags. \
-An empty tags array is fine when nothing in the list is relevant.";
+Return {\"tags\":[]} only when none of the listed tags genuinely apply — \
+not merely because the story is general news.";
     let existing_list = if existing.is_empty() {
         "(none yet)".to_string()
     } else {
         existing.join(", ")
     };
-    let summary = truncate_summary(summary);
+    let summary = truncate_summary(&summary);
     let user = format!(
         "Existing tags: {existing_list}\n\nTitle: {title}\n\nSummary: {summary}"
     );
@@ -446,20 +492,26 @@ An empty tags array is fine when nothing in the list is relevant.";
 }
 
 pub fn prompt_ai(title: &str, summary: &str, existing_ai: &[String]) -> (String, String) {
+    let title = sanitize_prompt_text(title);
+    let summary = sanitize_prompt_text(summary);
     let system = "You tag news articles for an RSS reader. \
 Reply with ONLY a JSON object, no markdown, no commentary. \
 Format: {\"tags\":[\"name1\",\"name2\"]}. \
-Suggest short topical tags (1-3 words each) from the title and summary. \
+Suggest short topical tags (1-3 words each) grounded in the title and summary — \
+places, topics, people, events (e.g. Spain, Migration, Ceuta). \
 Prefer reusing names from the existing-tags list when they fit (exact spelling). \
 You may invent new tag names when nothing suitable exists. \
+Clear news (geopolitics, migration, disasters, politics, business, science, sports) \
+MUST receive 2-5 tags. \
 Use at most 5 tags. \
-An empty tags array is fine when nothing useful applies.";
+Return {\"tags\":[]} only for empty or placeholder fluff with no identifiable topic — \
+never for a real news headline.";
     let existing_list = if existing_ai.is_empty() {
         "(none yet)".to_string()
     } else {
         existing_ai.join(", ")
     };
-    let summary = truncate_summary(summary);
+    let summary = truncate_summary(&summary);
     let user = format!(
         "Existing tags: {existing_list}\n\nTitle: {title}\n\nSummary: {summary}"
     );
@@ -472,12 +524,19 @@ pub fn prompt_combined(
     interest: &[String],
     existing_ai: &[String],
 ) -> (String, String) {
+    let title = sanitize_prompt_text(title);
+    let summary = sanitize_prompt_text(summary);
     let system = "You tag news articles for an RSS reader. \
 Reply with ONLY a JSON object, no markdown, no commentary. \
 Format: {\"interest\":[\"name1\"],\"tags\":[\"name2\"]}. \
-For \"interest\": choose ONLY from the interest-tags list (exact spelling); never invent. \
-For \"tags\": short topical free-form labels (1-3 words); prefer existing AI tags when they fit; new names are allowed. \
-Use at most 5 names in each array. Empty arrays are fine.";
+For \"interest\": choose ONLY from the interest-tags list (exact spelling); never invent; \
+match places/topics/events from the article when they appear in that list. \
+For \"tags\": short topical free-form labels (1-3 words) grounded in the title/summary; \
+prefer existing AI tags when they fit; new names are allowed. \
+Clear news stories MUST get useful free-form tags (2-5) even when no interest tags match. \
+Use at most 5 names in each array. \
+Empty arrays only when that taxonomy truly has nothing applicable — \
+not for ordinary news coverage.";
     let interest_list = if interest.is_empty() {
         "(none yet)".to_string()
     } else {
@@ -488,7 +547,7 @@ Use at most 5 names in each array. Empty arrays are fine.";
     } else {
         existing_ai.join(", ")
     };
-    let summary = truncate_summary(summary);
+    let summary = truncate_summary(&summary);
     let user = format!(
         "Interest tags: {interest_list}\nExisting AI tags: {ai_list}\n\nTitle: {title}\n\nSummary: {summary}"
     );
@@ -510,6 +569,7 @@ fn truncate_summary(summary: &str) -> String {
 }
 
 /// Title + summary (or body snippet fallback) for one article.
+/// Always title + summary/snippet only — never full HTML body.
 pub fn load_article_text(conn: &Connection, article_id: i64) -> AppResult<(String, String)> {
     Ok(conn.query_row(
         "SELECT title,
@@ -522,6 +582,13 @@ pub fn load_article_text(conn: &Connection, article_id: i64) -> AppResult<(Strin
         rusqlite::params![article_id],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?)
+}
+
+fn log_empty_ai_tags(article_id: i64, title: &str, tags: &[String]) {
+    if tags.is_empty() && !title.trim().is_empty() {
+        let preview: String = title.chars().take(80).collect();
+        log::debug!("auto-tag: empty AI tags for article {article_id} title={preview:?}");
+    }
 }
 
 /// Attach only suggested tags that case-insensitively match an existing name
@@ -615,6 +682,8 @@ fn load_job_context(conn: &Connection, article_id: i64) -> AppResult<JobContext>
     let interest_count = db::article_tag_count(conn, article_id, TAG_KIND_INTEREST)?;
     let ai_count = db::article_tag_count(conn, article_id, TAG_KIND_AI)?;
     let (title, summary) = load_article_text(conn, article_id)?;
+    let title = sanitize_prompt_text(&title);
+    let summary = sanitize_prompt_text(&summary);
     let interest_names: Vec<String> = db::list_tags(conn, Some(TAG_KIND_INTEREST))?
         .into_iter()
         .map(|t| t.name)
@@ -686,36 +755,62 @@ async fn tags_from_model<T, F>(
     user: &str,
     parse: F,
     soft_empty: T,
+    article_has_content: bool,
 ) -> AppResult<(T, ChatOutcome)>
 where
     F: Fn(&str) -> JsonParseOutcome<T>,
     T: Clone,
 {
     let mut outcome = complete_tag_json(client, cfg, system, user).await?;
-    match parse(&outcome.text) {
-        JsonParseOutcome::Ok(v) => Ok((v, outcome)),
-        JsonParseOutcome::SoftEmpty => Ok((soft_empty, outcome)),
-        JsonParseOutcome::Invalid(_) => {
-            // One cheap repair; if the repair call itself fails, soft-complete
-            // rather than burning the job into the permanent failed pile.
-            match repair_tag_json(client, cfg, system, &outcome.text).await {
-                Ok(repaired) => {
-                    outcome.usage += repaired.usage;
-                    let text = repaired.text;
-                    match parse(&text) {
-                        JsonParseOutcome::Ok(v) => {
-                            outcome.text = text;
-                            Ok((v, outcome))
-                        }
-                        JsonParseOutcome::SoftEmpty | JsonParseOutcome::Invalid(_) => {
-                            outcome.text = text;
-                            Ok((soft_empty, outcome))
-                        }
-                    }
+    let first = parse(&outcome.text);
+    // SoftEmpty is only a success when the article itself is empty fluff, or
+    // (via Ok) when the model returned explicit empty JSON. Blank/prose replies
+    // on a real headline get one repair attempt.
+    let needs_repair = match &first {
+        JsonParseOutcome::Ok(_) => false,
+        JsonParseOutcome::SoftEmpty => article_has_content,
+        JsonParseOutcome::Invalid(_) => true,
+    };
+    if !needs_repair {
+        return match first {
+            JsonParseOutcome::Ok(v) => Ok((v, outcome)),
+            JsonParseOutcome::SoftEmpty => Ok((soft_empty, outcome)),
+            JsonParseOutcome::Invalid(_) => unreachable!(),
+        };
+    }
+
+    match repair_tag_json(client, cfg, system, &outcome.text).await {
+        Ok(repaired) => {
+            outcome.usage += repaired.usage;
+            let text = repaired.text;
+            match parse(&text) {
+                JsonParseOutcome::Ok(v) => {
+                    outcome.text = text;
+                    Ok((v, outcome))
                 }
-                Err(_) => Ok((soft_empty, outcome)),
+                // Fluff article + still blank → soft-complete.
+                JsonParseOutcome::SoftEmpty if !article_has_content => {
+                    outcome.text = text;
+                    Ok((soft_empty, outcome))
+                }
+                // Real article still empty/broken after repair → hard fail so
+                // the worker retries instead of marking `done` with zero tags.
+                JsonParseOutcome::SoftEmpty => {
+                    Err(AppError::other(
+                        "auto-tag: empty model output after repair (likely thinking burned max_tokens)",
+                    ))
+                }
+                JsonParseOutcome::Invalid(msg) => {
+                    Err(AppError::other(format!(
+                        "auto-tag: unusable model output after repair: {msg}"
+                    )))
+                }
             }
         }
+        // Repair HTTP/API failure: soft-complete only for fluff articles;
+        // otherwise surface the error so attempts are burned visibly.
+        Err(_) if !article_has_content => Ok((soft_empty, outcome)),
+        Err(e) => Err(e),
     }
 }
 
@@ -749,6 +844,8 @@ pub async fn process_article(
         return Ok(());
     }
 
+    let has_content = article_has_content(&ctx.title, &ctx.summary);
+
     if run_interest && run_ai {
         let (system, user) = prompt_combined(
             &ctx.title,
@@ -763,6 +860,7 @@ pub async fn process_article(
             &user,
             parse_combined_payload_outcome,
             (Vec::new(), Vec::new()),
+            has_content,
         )
         .await?;
         let conn = db.lock().await;
@@ -776,6 +874,7 @@ pub async fn process_article(
             TAG_KIND_INTEREST,
         )?;
         apply_ai_tags(&conn, article_id, &ai_tags, ctx.ai_max)?;
+        log_empty_ai_tags(article_id, &ctx.title, &ai_tags);
         return Ok(());
     }
 
@@ -788,6 +887,7 @@ pub async fn process_article(
             &user,
             parse_interest_payload_outcome,
             Vec::new(),
+            has_content,
         )
         .await?;
         let conn = db.lock().await;
@@ -812,11 +912,13 @@ pub async fn process_article(
         &user,
         parse_ai_payload_outcome,
         Vec::new(),
+        has_content,
     )
     .await?;
     let conn = db.lock().await;
     record_outcome(&conn, &ctx.cfg, &outcome);
     apply_ai_tags(&conn, article_id, &suggested, ctx.ai_max)?;
+    log_empty_ai_tags(article_id, &ctx.title, &suggested);
     Ok(())
 }
 
@@ -877,7 +979,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_empty_and_prose_are_soft_empty() {
+    fn parse_empty_is_soft_empty_prose_is_invalid() {
         assert_eq!(
             parse_interest_payload_outcome(""),
             JsonParseOutcome::SoftEmpty
@@ -886,20 +988,20 @@ mod tests {
             parse_interest_payload_outcome("   "),
             JsonParseOutcome::SoftEmpty
         );
-        assert_eq!(
+        // Prose / refuse → Invalid so the worker can repair when article has content.
+        assert!(matches!(
             parse_interest_payload_outcome("Sorry, I cannot help with that."),
-            JsonParseOutcome::SoftEmpty
-        );
-        assert_eq!(
+            JsonParseOutcome::Invalid(_)
+        ));
+        assert!(matches!(
             parse_interest_payload_outcome("No relevant tags."),
-            JsonParseOutcome::SoftEmpty
-        );
-        assert_eq!(
+            JsonParseOutcome::Invalid(_)
+        ));
+        assert!(matches!(
             parse_interest_payload_outcome("none"),
-            JsonParseOutcome::SoftEmpty
-        );
-        // SoftEmpty maps to empty vec via the public parser (no hard error).
-        assert!(parse_interest_payload("no braces here").unwrap().is_empty());
+            JsonParseOutcome::Invalid(_)
+        ));
+        assert!(parse_interest_payload("no braces here").is_err());
         // Valid object with empty / null tags → Ok(empty), not a failure.
         assert_eq!(
             parse_interest_payload_outcome(r#"{"tags":[]}"#),
@@ -957,11 +1059,50 @@ Final: {"tags":["Rust","Go"]}"#;
     }
 
     #[test]
-    fn parse_prose_braces_are_soft_empty() {
-        // Balanced braces that are not JSON-like → soft empty, not repair.
-        assert_eq!(
+    fn parse_prose_braces_are_invalid() {
+        // Balanced braces that are not JSON-like → Invalid (repair), not soft empty.
+        assert!(matches!(
             parse_interest_payload_outcome("I looked at {the article} and found nothing."),
-            JsonParseOutcome::SoftEmpty
+            JsonParseOutcome::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn sanitize_prompt_strips_zwsp_and_html() {
+        let dirty = "identify the \u{200B}bodies of 80 migrants\u{200C}";
+        assert_eq!(
+            sanitize_prompt_text(dirty),
+            "identify the bodies of 80 migrants"
+        );
+        assert_eq!(
+            sanitize_prompt_text("<p>Spain &amp; Ceuta</p>"),
+            "Spain & Ceuta"
+        );
+        // Bare comparison must not be treated as HTML.
+        assert_eq!(sanitize_prompt_text("a < b and c > d"), "a < b and c > d");
+        assert_eq!(sanitize_prompt_text("  lots   of\n\nspace  "), "lots of space");
+    }
+
+    #[test]
+    fn prompt_ai_contains_cleaned_title_and_summary() {
+        let title = "Spain plans burials\u{200B}";
+        let summary = "<p>Police identify the \u{200C}bodies of 80 migrants in Ceuta.</p>";
+        let (system, user) = prompt_ai(title, summary, &[]);
+        assert!(system.contains("MUST receive 2-5 tags"));
+        assert!(system.contains("never for a real news headline"));
+        assert!(!user.contains('\u{200B}'));
+        assert!(!user.contains('\u{200C}'));
+        assert!(!user.contains("<p>"));
+        assert!(user.contains("Title: Spain plans burials"));
+        assert!(user.contains("Summary: Police identify the bodies of 80 migrants in Ceuta."));
+        // Parse still works on expected model output.
+        assert_eq!(
+            parse_ai_payload_outcome(r#"{"tags":["Spain","Migration","Ceuta"]}"#),
+            JsonParseOutcome::Ok(vec![
+                "Spain".into(),
+                "Migration".into(),
+                "Ceuta".into()
+            ])
         );
     }
 
