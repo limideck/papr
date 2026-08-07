@@ -84,3 +84,17 @@ pub async fn backfill(
         "enqueued": enqueued,
     })))
 }
+
+/// `POST /api/auto-tag/clear-queue` — soft pause: drop pending/processing/failed
+/// (keep `done`). Does not auto-backfill; admin re-enqueues via backfill.
+pub async fn clear_queue(
+    State(state): State<AppState>,
+    user: AuthUser,
+) -> ApiResult<Json<Value>> {
+    user.require_admin()?;
+    let conn = state.db.lock().await;
+    let cleared = db::clear_auto_tag_queue(&conn).map_err(ApiError::from)?;
+    Ok(Json(json!({
+        "cleared": cleared,
+    })))
+}

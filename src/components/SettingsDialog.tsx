@@ -2553,6 +2553,8 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
   const [backfillDays, setBackfillDays] = useState(7);
   const [backfillForce, setBackfillForce] = useState(false);
   const [backfillBusy, setBackfillBusy] = useState(false);
+  const [clearBusy, setClearBusy] = useState(false);
+  const [confirmClearQueue, setConfirmClearQueue] = useState(false);
   const [statusError, setStatusError] = useState(false);
   const [prompt, setPrompt] = useState<{
     title: string;
@@ -2700,6 +2702,20 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
       reportError(e);
     } finally {
       setBackfillBusy(false);
+    }
+  };
+
+  const runClearQueue = async () => {
+    setClearBusy(true);
+    try {
+      const res = await api.clearAutoTagQueue();
+      onToast(t("settings.autoTag.clearQueueDone", { count: res.cleared }));
+      void status.refetch();
+    } catch (e) {
+      reportError(e);
+    } finally {
+      setClearBusy(false);
+      setConfirmClearQueue(false);
     }
   };
 
@@ -3103,13 +3119,29 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
         >
           <Toggle checked={backfillForce} onChange={setBackfillForce} />
         </Row>
+        <p className="settings-group-desc" style={{ marginTop: 4 }}>
+          {t("settings.autoTag.clearQueueDesc")}
+        </p>
         <div
-          style={{ display: "flex", justifyContent: "flex-end", paddingTop: 8 }}
+          style={{
+            display: "flex",
+            justifyContent: "flex-end",
+            gap: 8,
+            paddingTop: 8,
+          }}
         >
+          <button
+            className="s-btn danger"
+            type="button"
+            disabled={clearBusy || backfillBusy}
+            onClick={() => setConfirmClearQueue(true)}
+          >
+            {t("settings.autoTag.clearQueue")}
+          </button>
           <button
             className="s-btn primary"
             type="button"
-            disabled={backfillBusy}
+            disabled={backfillBusy || clearBusy}
             onClick={() => void runBackfill()}
           >
             {t("settings.autoTag.backfillRun")}
@@ -3162,6 +3194,16 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
           danger
           onConfirm={() => void cleanupEmptyAiTags()}
           onClose={() => setConfirmCleanupEmpty(false)}
+        />
+      )}
+      {confirmClearQueue && (
+        <ConfirmDialog
+          title={t("settings.autoTag.clearQueue")}
+          message={t("settings.autoTag.clearQueueConfirm")}
+          confirmLabel={t("settings.autoTag.clearQueue")}
+          danger
+          onConfirm={() => void runClearQueue()}
+          onClose={() => setConfirmClearQueue(false)}
         />
       )}
     </>

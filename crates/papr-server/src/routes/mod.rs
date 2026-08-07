@@ -78,6 +78,7 @@ pub fn api_router() -> Router<AppState> {
         // auto-tag (admin)
         .route("/api/auto-tag/status", get(auto_tag::status))
         .route("/api/auto-tag/backfill", post(auto_tag::backfill))
+        .route("/api/auto-tag/clear-queue", post(auto_tag::clear_queue))
         // stats (admin)
         .route("/api/stats/overview", get(stats::overview))
         // tags

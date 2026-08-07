@@ -618,6 +618,10 @@
       "backfillRun": "开始补打",
       "backfillQueued": "已入队 {{count}} 篇文章",
       "backfillDone": "补打请求已提交",
+      "clearQueue": "清空队列",
+      "clearQueueDesc": "清空后可再点补打，按入库时间优先处理最新文章。",
+      "clearQueueConfirm": "将停止当前打标，并移除待处理、处理中与失败项；已完成记录会保留。清空后不会自动补打，需手动再点「开始补打」。",
+      "clearQueueDone": "已清空 {{count}} 条队列项",
       "saved": "已保存"
     },
     "stats": {

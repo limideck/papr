@@ -185,6 +185,12 @@ export const backfillAutoTag = (days: number, force = false) =>
     enqueued: res.enqueued ?? res.queued ?? res.count,
   }));
 
+/** Soft pause: drop pending/processing/failed; keep done. No auto-backfill. */
+export const clearAutoTagQueue = () =>
+  apiJson<{ cleared: number }>(`${API}/auto-tag/clear-queue`, {
+    method: "POST",
+  });
+
 /** Admin overview: totals, tagged coverage, queue, daily ingest. */
 export const getStatsOverview = (days = 30) =>
   apiJson<StatsOverview>(

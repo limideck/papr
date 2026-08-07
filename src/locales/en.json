@@ -596,6 +596,10 @@
       "backfillRun": "Run backfill",
       "backfillQueued": "Queued {{count}} articles",
       "backfillDone": "Backfill requested",
+      "clearQueue": "Clear queue",
+      "clearQueueDesc": "After clearing, run backfill again — newest by ingest time are processed first.",
+      "clearQueueConfirm": "This stops current tagging and removes pending, processing, and failed items. Done history is kept. Nothing is re-queued automatically — click Run backfill when ready.",
+      "clearQueueDone": "Cleared {{count}} queue items",
       "saved": "Saved"
     },
     "stats": {

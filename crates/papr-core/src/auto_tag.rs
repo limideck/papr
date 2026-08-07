@@ -1181,6 +1181,73 @@ Final: {"tags":["Rust","Go"]}"#;
     }
 
     #[test]
+    fn clear_queue_drops_active_keeps_done() {
+        let (conn, path) = temp_db();
+        db::set_setting(&conn, "auto_tag_enabled", "1").unwrap();
+        let feed_id = db::insert_feed(
+            &conn,
+            "https://example.com/feed-clear.xml",
+            None,
+            "Example",
+            None,
+            SourceType::Rss,
+            None,
+        )
+        .unwrap();
+        let mk = |guid: &str, title: &str| NewArticle {
+            guid: guid.into(),
+            url: Some(format!("https://example.com/{guid}")),
+            title: title.into(),
+            author: None,
+            summary: None,
+            content_html: None,
+            body_text: "".into(),
+            image_url: None,
+            published_at: None,
+            enclosures: vec![],
+        };
+        assert!(db::upsert_article(&conn, feed_id, &mk("c1", "Pending"), false, &[]).unwrap());
+        assert!(db::upsert_article(&conn, feed_id, &mk("c2", "Processing"), false, &[]).unwrap());
+        assert!(db::upsert_article(&conn, feed_id, &mk("c3", "Failed"), false, &[]).unwrap());
+        assert!(db::upsert_article(&conn, feed_id, &mk("c4", "Done"), false, &[]).unwrap());
+
+        let pending_id = db::claim_auto_tag_job(&conn).unwrap().unwrap().0; // newest first
+        // Leave one processing; release another path: mark one failed, one done.
+        let ids: Vec<i64> = conn
+            .prepare("SELECT article_id FROM auto_tag_queue ORDER BY article_id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(ids.len(), 4);
+        // One is already processing (claimed). Pick others for failed/done/pending.
+        let mut rest: Vec<i64> = ids.into_iter().filter(|&id| id != pending_id).collect();
+        let done_id = rest.pop().unwrap();
+        let failed_id = rest.pop().unwrap();
+        // `rest` still has one pending.
+        db::mark_auto_tag_done(&conn, done_id).unwrap();
+        db::mark_auto_tag_failure(&conn, failed_id, "x", 1).unwrap();
+
+        let before = db::auto_tag_queue_status(&conn).unwrap();
+        assert_eq!(before.pending, 1);
+        assert_eq!(before.processing, 1);
+        assert_eq!(before.failed, 1);
+        assert_eq!(before.done, 1);
+
+        let cleared = db::clear_auto_tag_queue(&conn).unwrap();
+        assert_eq!(cleared, 3);
+        let after = db::auto_tag_queue_status(&conn).unwrap();
+        assert_eq!(after.pending, 0);
+        assert_eq!(after.processing, 0);
+        assert_eq!(after.failed, 0);
+        assert_eq!(after.done, 1);
+        assert_eq!(db::clear_auto_tag_queue(&conn).unwrap(), 0);
+
+        remove_temp_db(conn, path);
+    }
+
+    #[test]
     fn backfill_requeues_done_untagged_skips_tagged() {
         let (conn, path) = temp_db();
         db::set_setting(&conn, "auto_tag_enabled", "1").unwrap();

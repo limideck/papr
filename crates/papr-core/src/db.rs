@@ -2512,6 +2512,25 @@ pub fn auto_tag_queue_status(conn: &Connection) -> AppResult<AutoTagQueueStatus>
     })
 }
 
+/// Soft pause / restart: delete backlog and in-flight work, keep `done` history.
+///
+/// Removes rows with status in (`pending`, `processing`, `failed`). Keeping
+/// `done` preserves tagged history so a later default backfill does not
+/// needlessly re-enqueue every already-tagged article (0-tag `done` can still
+/// be re-queued by backfill). In-flight workers that finish after a clear will
+/// no-op on mark-done/failure if the row is gone.
+///
+/// Does **not** enqueue anything — the admin must run backfill manually.
+/// Returns the number of rows deleted.
+pub fn clear_auto_tag_queue(conn: &Connection) -> AppResult<usize> {
+    let n = conn.execute(
+        "DELETE FROM auto_tag_queue
+         WHERE status IN ('pending', 'processing', 'failed')",
+        [],
+    )?;
+    Ok(n)
+}
+
 /// Tags attached to one article (article_count left at 0 — unused per-article).
 pub fn tags_for_article(conn: &Connection, article_id: i64) -> AppResult<Vec<Tag>> {
     let mut stmt = conn.prepare(
