@@ -3069,24 +3069,32 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
         <p className="settings-group-desc">
           {t("settings.autoTag.backfillDesc")}
         </p>
-        <Row label={t("settings.autoTag.backfillDays")}>
+        <Row
+          label={t("settings.autoTag.backfillDays")}
+          desc={t("settings.autoTag.backfillDaysHint")}
+        >
           <input
             className="s-text-input"
             type="number"
-            min={1}
+            min={0}
             max={365}
             value={backfillDays}
             onChange={(e) =>
-              setBackfillDays(clampSetting(e.target.value, 7, 1, 365))
+              setBackfillDays(clampSetting(e.target.value, 7, 0, 365))
             }
           />
         </Row>
         {st?.articlesInWindow != null && st.untaggedInWindow != null && (
           <p className="settings-group-desc" style={{ marginTop: -4 }}>
-            {t("settings.autoTag.backfillWindowHint", {
-              untagged: st.untaggedInWindow,
-              total: st.articlesInWindow,
-            })}
+            {t(
+              backfillDays === 0
+                ? "settings.autoTag.backfillWindowHintAll"
+                : "settings.autoTag.backfillWindowHint",
+              {
+                untagged: st.untaggedInWindow,
+                total: st.articlesInWindow,
+              },
+            )}
           </p>
         )}
         <Row

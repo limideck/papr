@@ -10,7 +10,8 @@ use serde_json::{json, Value};
 
 #[derive(Deserialize)]
 pub struct StatusQuery {
-    /// Window for tagged/untagged hint (same basis as backfill). Default 7.
+    /// Window for tagged/untagged hint (same basis as backfill).
+    /// `0` = entire library. Default 7.
     #[serde(default = "default_days")]
     pub days: i64,
 }
@@ -22,7 +23,7 @@ pub async fn status(
     Query(q): Query<StatusQuery>,
 ) -> ApiResult<Json<Value>> {
     user.require_admin()?;
-    let days = q.days.clamp(1, 365);
+    let days = q.days.clamp(0, 365);
     let conn = state.db.lock().await;
     let interest_enabled = db::setting_flag(&conn, "auto_tag_enabled", false);
     let ai_enabled = db::setting_flag(&conn, "ai_tag_enabled", false);
@@ -46,7 +47,8 @@ pub async fn status(
 
 #[derive(Deserialize)]
 pub struct BackfillBody {
-    /// Re-enqueue articles from the last N days (default 7, min 1, max 365).
+    /// Re-enqueue articles from the last N days (default 7, max 365).
+    /// `0` = entire library (no date filter).
     #[serde(default = "default_days")]
     pub days: i64,
     /// When true, also reset `done` jobs that already have tags.
@@ -59,18 +61,19 @@ fn default_days() -> i64 {
     7
 }
 
-/// `POST /api/auto-tag/backfill` — enqueue recent articles for tagging (admin).
+/// `POST /api/auto-tag/backfill` — enqueue articles for tagging (admin).
 ///
 /// Default: never-queued, `failed`, and queue rows with **zero tags**
 /// (including soft-empty `done`). Skips `done` articles that already have tags.
 /// `force: true` also resets those tagged `done` rows.
+/// `days: 0` scans the whole library (no publish/fetch date window).
 pub async fn backfill(
     State(state): State<AppState>,
     user: AuthUser,
     Json(body): Json<BackfillBody>,
 ) -> ApiResult<Json<Value>> {
     user.require_admin()?;
-    let days = body.days.clamp(1, 365);
+    let days = body.days.clamp(0, 365);
     let conn = state.db.lock().await;
     let enqueued =
         db::enqueue_auto_tag_backfill(&conn, days, body.force).map_err(ApiError::from)?;

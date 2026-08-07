@@ -1277,9 +1277,9 @@ Final: {"tags":["Rust","Go"]}"#;
     }
 
     #[test]
-    fn claim_prefers_newest_article() {
-        // Newest-first: COALESCE(published_at, fetched_at) DESC so a deep old
-        // backlog cannot starve freshly published inserts.
+    fn claim_prefers_newer_fetched_over_newer_published() {
+        // Primary sort is fetched_at DESC: an older-fetched article with a
+        // newer published_at must NOT jump ahead of a just-ingested item.
         let (conn, path) = temp_db();
         let feed_id = db::insert_feed(
             &conn,
@@ -1292,10 +1292,22 @@ Final: {"tags":["Rust","Go"]}"#;
         )
         .unwrap();
 
-        let older = NewArticle {
-            guid: "old".into(),
-            url: Some("https://example.com/old".into()),
-            title: "Old".into(),
+        let older_fetch = NewArticle {
+            guid: "old-fetch".into(),
+            url: Some("https://example.com/old-fetch".into()),
+            title: "Old fetch, new publish".into(),
+            author: None,
+            summary: None,
+            content_html: None,
+            body_text: "".into(),
+            image_url: None,
+            published_at: Some("2026-08-06T00:00:00+00:00".into()),
+            enclosures: vec![],
+        };
+        let newer_fetch = NewArticle {
+            guid: "new-fetch".into(),
+            url: Some("https://example.com/new-fetch".into()),
+            title: "New fetch, old publish".into(),
             author: None,
             summary: None,
             content_html: None,
@@ -1304,43 +1316,189 @@ Final: {"tags":["Rust","Go"]}"#;
             published_at: Some("2020-01-01T00:00:00+00:00".into()),
             enclosures: vec![],
         };
-        let newer = NewArticle {
-            guid: "new".into(),
-            url: Some("https://example.com/new".into()),
-            title: "New".into(),
-            author: None,
-            summary: None,
-            content_html: None,
-            body_text: "".into(),
-            image_url: None,
-            published_at: Some("2026-08-01T00:00:00+00:00".into()),
-            enclosures: vec![],
-        };
-        assert!(db::upsert_article(&conn, feed_id, &older, false, &[]).unwrap());
-        assert!(db::upsert_article(&conn, feed_id, &newer, false, &[]).unwrap());
+        assert!(db::upsert_article(&conn, feed_id, &older_fetch, false, &[]).unwrap());
+        assert!(db::upsert_article(&conn, feed_id, &newer_fetch, false, &[]).unwrap());
         let old_id: i64 = conn
-            .query_row("SELECT id FROM articles WHERE guid = 'old'", [], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM articles WHERE guid = 'old-fetch'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         let new_id: i64 = conn
-            .query_row("SELECT id FROM articles WHERE guid = 'new'", [], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM articles WHERE guid = 'new-fetch'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        // Ingest gated off — enqueue explicitly so both are pending.
+        // Pin fetched_at so the newer-publish article is clearly older-fetched.
+        conn.execute(
+            "UPDATE articles SET fetched_at = '2026-08-01 10:00:00' WHERE id = ?1",
+            rusqlite::params![old_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE articles SET fetched_at = '2026-08-07 12:00:00' WHERE id = ?1",
+            rusqlite::params![new_id],
+        )
+        .unwrap();
         db::enqueue_auto_tag(&conn, old_id).unwrap();
         db::enqueue_auto_tag(&conn, new_id).unwrap();
 
         let first = db::claim_auto_tag_job(&conn).unwrap().unwrap();
-        assert_eq!(first.0, new_id, "newest article must be claimed first");
+        assert_eq!(
+            first.0, new_id,
+            "newer fetched_at must be claimed first even with older published_at"
+        );
         let second = db::claim_auto_tag_job(&conn).unwrap().unwrap();
         assert_eq!(second.0, old_id);
-        // Claimed rows are processing — no double claim.
         assert!(db::claim_auto_tag_job(&conn).unwrap().is_none());
 
         remove_temp_db(conn, path);
     }
 
     #[test]
+    fn claim_new_ingest_cuts_ahead_of_pending_backlog() {
+        // While A is still pending, B ingested later must jump the queue.
+        let (conn, path) = temp_db();
+        let feed_id = db::insert_feed(
+            &conn,
+            "https://example.com/feed-cutin.xml",
+            None,
+            "Example",
+            None,
+            SourceType::Rss,
+            None,
+        )
+        .unwrap();
+
+        let a = NewArticle {
+            guid: "a-backlog".into(),
+            url: Some("https://example.com/a-backlog".into()),
+            title: "Backlog A".into(),
+            author: None,
+            summary: None,
+            content_html: None,
+            body_text: "".into(),
+            image_url: None,
+            published_at: Some("2026-08-06T00:00:00+00:00".into()),
+            enclosures: vec![],
+        };
+        assert!(db::upsert_article(&conn, feed_id, &a, false, &[]).unwrap());
+        let a_id: i64 = conn
+            .query_row(
+                "SELECT id FROM articles WHERE guid = 'a-backlog'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "UPDATE articles SET fetched_at = '2026-08-01 08:00:00' WHERE id = ?1",
+            rusqlite::params![a_id],
+        )
+        .unwrap();
+        db::enqueue_auto_tag(&conn, a_id).unwrap();
+        assert_eq!(db::auto_tag_queue_status(&conn).unwrap().pending, 1);
+
+        let b = NewArticle {
+            guid: "b-fresh".into(),
+            url: Some("https://example.com/b-fresh".into()),
+            title: "Fresh B".into(),
+            author: None,
+            summary: None,
+            content_html: None,
+            body_text: "".into(),
+            image_url: None,
+            // Ancient publish date must not keep B behind A.
+            published_at: Some("2019-01-01T00:00:00+00:00".into()),
+            enclosures: vec![],
+        };
+        assert!(db::upsert_article(&conn, feed_id, &b, false, &[]).unwrap());
+        let b_id: i64 = conn
+            .query_row(
+                "SELECT id FROM articles WHERE guid = 'b-fresh'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "UPDATE articles SET fetched_at = '2026-08-07 15:00:00' WHERE id = ?1",
+            rusqlite::params![b_id],
+        )
+        .unwrap();
+        db::enqueue_auto_tag(&conn, b_id).unwrap();
+        assert_eq!(db::auto_tag_queue_status(&conn).unwrap().pending, 2);
+
+        let first = db::claim_auto_tag_job(&conn).unwrap().unwrap();
+        assert_eq!(
+            first.0, b_id,
+            "later-fetched B must cut ahead of still-pending earlier-fetched A"
+        );
+        let second = db::claim_auto_tag_job(&conn).unwrap().unwrap();
+        assert_eq!(second.0, a_id);
+
+        remove_temp_db(conn, path);
+    }
+
+    #[test]
+    fn backfill_days_zero_includes_ancient_untagged() {
+        // days=0 = whole library; ancient published_at outside any N-day window.
+        let (conn, path) = temp_db();
+        db::set_setting(&conn, "auto_tag_enabled", "1").unwrap();
+        let feed_id = db::insert_feed(
+            &conn,
+            "https://example.com/feed-ancient.xml",
+            None,
+            "Example",
+            None,
+            SourceType::Rss,
+            None,
+        )
+        .unwrap();
+        let ancient = NewArticle {
+            guid: "ancient".into(),
+            url: Some("https://example.com/ancient".into()),
+            title: "Ancient".into(),
+            author: None,
+            summary: None,
+            content_html: None,
+            body_text: "".into(),
+            image_url: None,
+            published_at: Some("2015-01-01T00:00:00+00:00".into()),
+            enclosures: vec![],
+        };
+        assert!(db::upsert_article(&conn, feed_id, &ancient, false, &[]).unwrap());
+        let id: i64 = conn
+            .query_row(
+                "SELECT id FROM articles WHERE guid = 'ancient'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // Clear ingest enqueue so backfill is what re-queues it.
+        conn.execute("DELETE FROM auto_tag_queue WHERE article_id = ?1", rusqlite::params![id])
+            .unwrap();
+
+        assert_eq!(
+            db::enqueue_auto_tag_backfill(&conn, 7, false).unwrap(),
+            0,
+            "7-day window must miss ancient publish date"
+        );
+        assert_eq!(db::enqueue_auto_tag_backfill(&conn, 0, false).unwrap(), 1);
+        assert_eq!(db::auto_tag_queue_status(&conn).unwrap().pending, 1);
+
+        let window = db::auto_tag_window_stats(&conn, 0).unwrap();
+        assert_eq!(window.days, 0);
+        assert_eq!(window.articles, 1);
+        assert_eq!(window.untagged, 1);
+
+        remove_temp_db(conn, path);
+    }
+
+    #[test]
     fn backfill_does_not_boost_old_over_newer_pending() {
-        // Backfill bumps queue.updated_at, but claim orders by article date —
+        // Backfill bumps queue.updated_at, but claim orders by fetched_at —
         // re-queuing an older failed item must not jump ahead of a newer pending.
         let (conn, path) = temp_db();
         let feed_id = db::insert_feed(
@@ -1394,6 +1552,16 @@ Final: {"tags":["Rust","Go"]}"#;
                 |r| r.get(0),
             )
             .unwrap();
+        conn.execute(
+            "UPDATE articles SET fetched_at = '2026-08-01 09:00:00' WHERE id = ?1",
+            rusqlite::params![old_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE articles SET fetched_at = '2026-08-06 09:00:00' WHERE id = ?1",
+            rusqlite::params![new_id],
+        )
+        .unwrap();
 
         db::enqueue_auto_tag(&conn, old_id).unwrap();
         let claimed = db::claim_auto_tag_job(&conn).unwrap().unwrap().0;
@@ -1418,7 +1586,7 @@ Final: {"tags":["Rust","Go"]}"#;
     #[test]
     fn backfill_zero_tag_redo_does_not_boost_old_over_newer_pending() {
         // Default 补打 re-queues done-with-zero-tags. Claim still orders by
-        // article date — an older 0-tag redo must not jump a newer pending.
+        // fetched_at — an older 0-tag redo must not jump a newer pending.
         let (conn, path) = temp_db();
         let feed_id = db::insert_feed(
             &conn,
@@ -1471,6 +1639,16 @@ Final: {"tags":["Rust","Go"]}"#;
                 |r| r.get(0),
             )
             .unwrap();
+        conn.execute(
+            "UPDATE articles SET fetched_at = '2026-08-01 09:00:00' WHERE id = ?1",
+            rusqlite::params![old_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE articles SET fetched_at = '2026-08-06 09:00:00' WHERE id = ?1",
+            rusqlite::params![new_id],
+        )
+        .unwrap();
 
         db::enqueue_auto_tag(&conn, old_id).unwrap();
         let claimed = db::claim_auto_tag_job(&conn).unwrap().unwrap().0;

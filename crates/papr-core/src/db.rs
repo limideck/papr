@@ -2191,7 +2191,12 @@ fn enqueue_auto_tag_inner(
     Ok(n > 0)
 }
 
-/// Enqueue articles published (or fetched) within the last `days` days.
+/// Enqueue articles for auto-tag backfill.
+///
+/// - `days > 0`: only articles whose `COALESCE(published_at, fetched_at)` falls
+///   within the last `days` days.
+/// - `days = 0`: **entire library** (no date filter) — for catching old
+///   publish-dated items that sit outside any N-day window.
 ///
 /// Default (`force = false`): never-queued, `failed`, and non-active queue rows
 /// whose article still has **zero** `article_tags` become pending. Soft-empty /
@@ -2206,8 +2211,7 @@ pub fn enqueue_auto_tag_backfill(
     days: i64,
     force: bool,
 ) -> AppResult<usize> {
-    let days = days.max(1);
-    let modifier = format!("-{days} days");
+    let days = days.clamp(0, 365);
     // ON CONFLICT DO UPDATE WHERE … — when the WHERE is false SQLite treats
     // the conflict like IGNORE (no update, not counted in changes()).
     let conflict_filter = if force {
@@ -2221,12 +2225,16 @@ pub fn enqueue_auto_tag_backfill(
                   WHERE at.article_id = auto_tag_queue.article_id
               )))"
     };
+    let date_filter = if days == 0 {
+        "1 = 1".to_string()
+    } else {
+        "datetime(COALESCE(a.published_at, a.fetched_at)) >= datetime('now', ?1)".to_string()
+    };
     let sql = format!(
         "INSERT INTO auto_tag_queue(article_id, status, attempts, last_error, updated_at)
          SELECT a.id, 'pending', 0, NULL, datetime('now')
          FROM articles a
-         WHERE datetime(COALESCE(a.published_at, a.fetched_at))
-               >= datetime('now', ?1)
+         WHERE {date_filter}
          ON CONFLICT(article_id) DO UPDATE SET
              status = 'pending',
              attempts = 0,
@@ -2234,12 +2242,18 @@ pub fn enqueue_auto_tag_backfill(
              updated_at = datetime('now')
          WHERE {conflict_filter}"
     );
-    let n = conn.execute(&sql, params![modifier])?;
+    let n = if days == 0 {
+        conn.execute(&sql, [])?
+    } else {
+        let modifier = format!("-{days} days");
+        conn.execute(&sql, params![modifier])?
+    };
     Ok(n)
 }
 
 /// Article coverage inside the backfill time window (published/fetched).
 ///
+/// `days = 0` means the whole library (same as backfill with no date filter).
 /// `untagged` = no rows in `article_tags` (matches what default backfill
 /// treats as still needing tags when status is `done`).
 #[derive(Debug, Clone, serde::Serialize)]
@@ -2252,26 +2266,41 @@ pub struct AutoTagWindowStats {
 }
 
 /// Count articles (and untagged subset) in the same window backfill uses.
+/// `days = 0` → entire library.
 pub fn auto_tag_window_stats(conn: &Connection, days: i64) -> AppResult<AutoTagWindowStats> {
-    let days = days.max(1);
-    let modifier = format!("-{days} days");
-    let articles: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM articles a
-         WHERE datetime(COALESCE(a.published_at, a.fetched_at))
-               >= datetime('now', ?1)",
-        params![modifier],
-        |r| r.get(0),
-    )?;
-    let untagged: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM articles a
-         WHERE datetime(COALESCE(a.published_at, a.fetched_at))
-               >= datetime('now', ?1)
-           AND NOT EXISTS (
-               SELECT 1 FROM article_tags at WHERE at.article_id = a.id
-           )",
-        params![modifier],
-        |r| r.get(0),
-    )?;
+    let days = days.clamp(0, 365);
+    let (articles, untagged) = if days == 0 {
+        let articles: i64 = conn.query_row("SELECT COUNT(*) FROM articles", [], |r| r.get(0))?;
+        let untagged: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM articles a
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM article_tags at WHERE at.article_id = a.id
+             )",
+            [],
+            |r| r.get(0),
+        )?;
+        (articles, untagged)
+    } else {
+        let modifier = format!("-{days} days");
+        let articles: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM articles a
+             WHERE datetime(COALESCE(a.published_at, a.fetched_at))
+                   >= datetime('now', ?1)",
+            params![modifier],
+            |r| r.get(0),
+        )?;
+        let untagged: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM articles a
+             WHERE datetime(COALESCE(a.published_at, a.fetched_at))
+                   >= datetime('now', ?1)
+               AND NOT EXISTS (
+                   SELECT 1 FROM article_tags at WHERE at.article_id = a.id
+               )",
+            params![modifier],
+            |r| r.get(0),
+        )?;
+        (articles, untagged)
+    };
     Ok(AutoTagWindowStats {
         days,
         articles,
@@ -2282,12 +2311,14 @@ pub fn auto_tag_window_stats(conn: &Connection, days: i64) -> AppResult<AutoTagW
 
 /// Atomically claim one pending job → `processing`.
 ///
-/// **Newest-first priority:** order by article
-/// `datetime(COALESCE(published_at, fetched_at)) DESC` (then `article_id DESC`).
-/// Fresh inserts and recent news jump ahead of a deep old backlog. We do *not*
-/// use `queue.created_at` — backfill re-enqueue keeps the original queue
-/// `created_at`, and catch-up imports of ancient items would otherwise starve
-/// newly published articles. Content date matches "tag newer content first".
+/// **Ingest-first priority** (so live fetch can cut in while a backlog drains):
+/// 1. `fetched_at DESC` — just-ingested articles jump ahead of older-fetched
+///    pending jobs, even when their `published_at` is ancient.
+/// 2. `published_at DESC` — within the same fetch batch, prefer newer content.
+/// 3. `article_id DESC` — stable tie-break.
+///
+/// We do *not* use `queue.created_at` / `queue.updated_at` — backfill re-enqueue
+/// would otherwise let ancient catch-up starve newly collected articles.
 ///
 /// Returns `(article_id, attempts)`, or `None` if the queue is empty / lost a
 /// race (another worker claimed the same row).
@@ -2298,7 +2329,8 @@ pub fn claim_auto_tag_job(conn: &Connection) -> AppResult<Option<(i64, i64)>> {
              FROM auto_tag_queue q
              JOIN articles a ON a.id = q.article_id
              WHERE q.status = 'pending'
-             ORDER BY datetime(COALESCE(a.published_at, a.fetched_at)) DESC,
+             ORDER BY datetime(a.fetched_at) DESC,
+                      datetime(a.published_at) DESC,
                       q.article_id DESC
              LIMIT 1",
             [],
