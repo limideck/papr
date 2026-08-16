@@ -2165,6 +2165,16 @@ button { font-family: inherit; }
 }
 
 /* About */
+.s-about-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.s-about-wrap > .s-tag-mgmt-tabs {
+  margin-bottom: 8px;
+  max-width: 280px;
+}
 .s-about {
   text-align: center;
   padding: 40px 20px;
@@ -2202,6 +2212,88 @@ button { font-family: inherit; }
   max-width: 420px;
   margin: 0 auto;
 }
+
+/* About → Help (bundled user guide markdown) */
+.s-about-help {
+  text-align: left;
+  min-width: 0;
+}
+.s-about-help-note {
+  margin: 0 0 14px;
+  padding: 8px 12px;
+  font-size: 12px;
+  color: var(--muted);
+  background: var(--hover);
+  border-radius: 8px;
+  line-height: 1.5;
+}
+.s-about-help-body {
+  font-size: 13px;
+  line-height: 1.65;
+  color: var(--ink-2);
+}
+.s-about-help-body h1 {
+  font-size: 17px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+  margin: 0 0 10px;
+}
+.s-about-help-body h2 {
+  font-size: 14px;
+  font-weight: 650;
+  color: var(--ink);
+  margin: 1.4em 0 0.5em;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--hair);
+}
+.s-about-help-body h3 {
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--ink);
+  margin: 1.1em 0 0.4em;
+}
+.s-about-help-body p { margin: 0 0 0.75em; }
+.s-about-help-body ul,
+.s-about-help-body ol {
+  padding-left: 1.25em;
+  margin: 0 0 0.85em;
+}
+.s-about-help-body li { margin: 0.3em 0; }
+.s-about-help-body hr {
+  border: 0;
+  border-top: 1px solid var(--hair);
+  margin: 1.2em 0;
+}
+.s-about-help-body table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+  margin: 0 0 1em;
+  overflow-x: auto;
+  display: block;
+}
+.s-about-help-body th,
+.s-about-help-body td {
+  border: 1px solid var(--hair);
+  padding: 6px 8px;
+  text-align: left;
+  vertical-align: top;
+}
+.s-about-help-body th {
+  background: var(--hover);
+  color: var(--ink);
+  font-weight: 600;
+}
+.s-about-help-body code {
+  font-family: var(--mono);
+  font-size: 0.9em;
+  background: var(--hover);
+  padding: 1px 5px;
+  border-radius: 4px;
+  color: var(--ink);
+}
+.s-about-help-body strong { color: var(--ink); font-weight: 600; }
 
 /* ═══════════ Backend integration additions ═══════════ */
 

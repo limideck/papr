@@ -315,7 +315,7 @@
       "shortcuts": "キーボードショートカット",
       "notifications": "新着記事の通知とバッジ",
       "advanced": "キャッシュ、ネットワーク、実験的機能",
-      "about": "バージョン情報とクレジット",
+      "about": "バージョン情報とヘルプ",
       "wordcloud": "表示名を編集できるエンティティ辞書（共有シード + ローカル COW）"
     },
     "general": {
@@ -749,6 +749,9 @@
       }
     },
     "about": {
+      "tabAbout": "情報",
+      "tabHelp": "ヘルプ",
+      "helpLangNote": "このガイドは現在中国語のみです。",
       "tagline": "静かな紙のような RSS リーダー",
       "creditsFonts": "Inter Tight by Rasmus Andersson · Newsreader by Production Type",
       "creditsRender": "CJK テキストは PingFang SC で表示 · アクセントカラーは OKLCH 色空間から採用",

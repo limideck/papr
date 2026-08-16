@@ -2,10 +2,7 @@
 
 面向 Papr 读者与管理员：如何在侧边栏搜索文章、用词云发现热点、用兴趣 / AI 标签整理专题，以及怎样把中英别名配好、搜得更准。
 
-技术细节（运算符完整契约、同义词展开设计）见：
-
-- [搜索语法](search.md)
-- [搜索同义词展开](search-synonyms.md)
+更细的技术说明（运算符完整契约、同义词展开设计）见仓库文档 `docs/search.md`、`docs/search-synonyms.md`。
 
 ---
 
@@ -28,7 +25,7 @@
 
 ### 常用运算符
 
-与 [搜索语法](search.md) 一致（大小写不敏感）：
+与仓库 `docs/search.md` 中的搜索语法一致（大小写不敏感）：
 
 | 写法 | 含义 | 例子 |
 | --- | --- | --- |
@@ -39,7 +36,7 @@
 | `( … )` | 分组 | `(Trump OR Biden) china` |
 | `title:a` / `body:a` / `feed:Name` | 限定栏位 | `title:Trump`、`feed:Reuters` |
 
-侧边栏搜索框旁的 **?** 有简要提示；完整语法以 `docs/search.md` 为准。
+侧边栏搜索框旁的 **?** 有简要提示；更完整的运算符说明见仓库 `docs/search.md`。
 
 ### 同义词展开（词云实体）
 
@@ -222,8 +219,8 @@
 
 ---
 
-## 相关文档
+## 相关文档（仓库）
 
-- [搜索语法（完整契约）](search.md)
-- [搜索同义词展开（设计说明）](search-synonyms.md)
-- [CLI](cli.md) — 命令行 `papr search`（默认召回 OR；加 `--and` 与界面一致）
+- `docs/search.md` — 搜索语法完整契约
+- `docs/search-synonyms.md` — 搜索同义词展开设计说明
+- `docs/cli.md` — 命令行 `papr search`（默认召回 OR；加 `--and` 与界面一致）

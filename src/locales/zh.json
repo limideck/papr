@@ -316,7 +316,7 @@
       "shortcuts": "键盘快捷键",
       "notifications": "新文章提醒与角标",
       "advanced": "缓存、网络、实验功能",
-      "about": "版本信息与致谢"
+      "about": "版本信息与使用说明"
     },
     "general": {
       "refresh": "刷新",
@@ -788,6 +788,9 @@
       }
     },
     "about": {
+      "tabAbout": "关于",
+      "tabHelp": "帮助",
+      "helpLangNote": "本指南目前仅提供中文。",
       "tagline": "把信息流，变回一份安静的读物",
       "creditsFonts": "Inter Tight by Rasmus Andersson · Newsreader by Production Type",
       "creditsRender": "中文显示由 PingFang SC 渲染 · 强调色取自 OKLCH 色彩空间",

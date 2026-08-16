@@ -1,5 +1,5 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { cloneElement, isValidElement, useEffect, useRef, useState } from "react";
+import { cloneElement, isValidElement, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import * as api from "../api";
 import { useAuth } from "../auth";
@@ -12,6 +12,7 @@ import { modKey, modCombo } from "../lib/platform";
 import { reportError } from "../toast";
 import { downloadFile } from "../lib/download";
 import { NO_AUTOCORRECT } from "../lib/inputProps";
+import { renderMarkdown } from "../lib/markdown";
 import type { Feed, Rule, RuleAction, RuleField, RulePreview, Tag, TagAlias } from "../types";
 import { tagColor, TAG_PALETTE } from "../lib/tagColors";
 import Icon, { type IconName } from "./Icon";
@@ -20,6 +21,8 @@ import PromptDialog from "./PromptDialog";
 import FeedAvatar from "./FeedAvatar";
 import FeedSourcesAdmin from "./FeedSourcesAdmin";
 import WordCloudConfigAdmin from "./WordCloudConfigAdmin";
+// Bundled at build time so web + desktop work without fetching GitHub / docs URL.
+import userGuideMd from "../../docs/user-search-and-tags.md?raw";
 
 interface Props {
   onClose: () => void;
@@ -3757,26 +3760,66 @@ function RuleEditor({
 }
 
 /* ── about ───────────────────────────────────────────────── */
+type AboutTab = "about" | "help";
+
 function AboutSection() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const version = useAppVersion();
+  const [tab, setTab] = useState<AboutTab>("about");
+  const helpHtml = useMemo(() => renderMarkdown(userGuideMd), []);
+  const showHelpLangNote = !i18n.language.startsWith("zh");
+
   return (
-    <div className="s-about">
-      <div className="mark">
-        <Icon name="papr" size={34} color="#fff" />
+    <div className="s-about-wrap">
+      <div className="s-tag-mgmt-tabs" role="tablist" aria-label={t("settings.nav.about")}>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === "about"}
+          className={tab === "about" ? "on" : ""}
+          onClick={() => setTab("about")}
+        >
+          {t("settings.about.tabAbout")}
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === "help"}
+          className={tab === "help" ? "on" : ""}
+          onClick={() => setTab("help")}
+        >
+          {t("settings.about.tabHelp")}
+        </button>
       </div>
-    
-      <p className="tagline">{t("settings.about.tagline")}</p>
-      <div className="version">
-        Version{version && ` ${version}`}
-      </div>
-      <p className="credits">
-        {/* {t("settings.about.creditsFonts")} */}
-        {/* <br />
-        {t("settings.about.creditsRender")}
-        <br />
-        {t("settings.about.creditsThanks")} */}
-      </p>
+
+      {tab === "about" ? (
+        <div className="s-about" role="tabpanel">
+          <div className="mark">
+            <Icon name="papr" size={34} color="#fff" />
+          </div>
+          <p className="tagline">{t("settings.about.tagline")}</p>
+          <div className="version">
+            Version{version && ` ${version}`}
+          </div>
+          <p className="credits">
+            {/* {t("settings.about.creditsFonts")} */}
+            {/* <br />
+            {t("settings.about.creditsRender")}
+            <br />
+            {t("settings.about.creditsThanks")} */}
+          </p>
+        </div>
+      ) : (
+        <div className="s-about-help" role="tabpanel">
+          {showHelpLangNote && (
+            <p className="s-about-help-note">{t("settings.about.helpLangNote")}</p>
+          )}
+          <div
+            className="s-about-help-body"
+            dangerouslySetInnerHTML={{ __html: helpHtml }}
+          />
+        </div>
+      )}
     </div>
   );
 }

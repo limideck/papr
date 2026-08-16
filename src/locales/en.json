@@ -316,7 +316,7 @@
       "shortcuts": "Keyboard shortcuts",
       "notifications": "New article alerts and badges",
       "advanced": "Cache, network, experimental features",
-      "about": "Version info and credits"
+      "about": "Version info and help"
     },
     "general": {
       "refresh": "Refresh",
@@ -749,6 +749,9 @@
       }
     },
     "about": {
+      "tabAbout": "About",
+      "tabHelp": "Help",
+      "helpLangNote": "This guide is currently available in Chinese only.",
       "tagline": "A quiet, paper-like RSS reader",
       "creditsFonts": "Inter Tight by Rasmus Andersson · Newsreader by Production Type",
       "creditsRender": "CJK text rendered with PingFang SC · accent colors from the OKLCH color space",
