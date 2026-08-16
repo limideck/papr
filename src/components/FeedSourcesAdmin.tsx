@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next";
 import { useQueryClient } from "@tanstack/react-query";
 import * as api from "../api";
 import { errorText } from "../lib/errors";
+import { ApiError } from "../lib/http";
 import { NO_AUTOCORRECT } from "../lib/inputProps";
 import type { FeedSource, FeedSourceScanResult } from "../types";
 import Icon from "./Icon";
@@ -49,6 +50,8 @@ export default function FeedSourcesAdmin() {
   const [error, setError] = useState("");
   const [scan, setScan] = useState<FeedSourceScanResult | null>(null);
   const [scanningId, setScanningId] = useState<number | "all" | null>(null);
+  const [editingFolderId, setEditingFolderId] = useState<number | null>(null);
+  const [folderDraft, setFolderDraft] = useState("");
 
   const reload = async () => {
     try {
@@ -74,14 +77,43 @@ export default function FeedSourcesAdmin() {
     setBusy(true);
     setError("");
     setScan(null);
+    const existing = new Set(sources.map((s) => normalizeIndexUrl(s.baseUrl)));
+    let added = 0;
+    let skipped = 0;
     try {
       for (const url of urls) {
-        await api.addFeedSource(url);
+        if (existing.has(url)) {
+          skipped += 1;
+          continue;
+        }
+        try {
+          await api.addFeedSource(url);
+          existing.add(url);
+          added += 1;
+        } catch (err) {
+          // Already in DB (e.g. list stale) — skip and continue the batch.
+          if (err instanceof ApiError && err.code === "indexUrlExists") {
+            skipped += 1;
+            existing.add(url);
+            continue;
+          }
+          throw err;
+        }
       }
       setText("");
       await reload();
       qc.invalidateQueries({ queryKey: ["folders"] });
       qc.invalidateQueries({ queryKey: ["feeds"] });
+      if (added === 0 && skipped > 0) {
+        setError(t("error.indexUrlExists"));
+      } else if (skipped > 0) {
+        setScan({
+          addedCount: added,
+          skipped,
+          added: [],
+          stale: [],
+        });
+      }
     } catch (err) {
       setError(errorText(err));
     } finally {
@@ -116,6 +148,39 @@ export default function FeedSourcesAdmin() {
     try {
       await api.removeFeedSource(id);
       await reload();
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const beginRenameFolder = (s: FeedSource) => {
+    if (s.folderId == null) return;
+    setEditingFolderId(s.folderId);
+    setFolderDraft(s.folderName ?? "");
+    setError("");
+  };
+
+  const cancelRenameFolder = () => {
+    setEditingFolderId(null);
+    setFolderDraft("");
+  };
+
+  const saveRenameFolder = async (folderId: number) => {
+    const name = folderDraft.trim();
+    if (!name) {
+      setError(t("feedSources.folderNameRequired"));
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      await api.renameFolder(folderId, name);
+      setEditingFolderId(null);
+      setFolderDraft("");
+      await reload();
+      qc.invalidateQueries({ queryKey: ["folders"] });
     } catch (err) {
       setError(errorText(err));
     } finally {
@@ -182,44 +247,97 @@ export default function FeedSourcesAdmin() {
         <div className="feed-sources-empty">{t("feedSources.empty")}</div>
       ) : (
         <ul className="feed-sources-list">
-          {sources.map((s) => (
-            <li key={s.id}>
-              <div className="feed-sources-item-main">
-                <a href={s.baseUrl} target="_blank" rel="noopener noreferrer">
-                  {s.baseUrl}
-                </a>
-                <span className="feed-sources-meta">
-                  {s.folderName
-                    ? `${t("feedSources.folder", { name: s.folderName })} · `
-                    : ""}
-                  {t("feedSources.feedCount", { count: s.feedCount })}
-                  {s.lastCheckedAt
-                    ? ` · ${new Date(s.lastCheckedAt).toLocaleString()}`
-                    : ""}
-                </span>
-              </div>
-              <div className="feed-sources-item-actions">
-                <button
-                  type="button"
-                  className="s-btn"
-                  disabled={busy || scanningId != null}
-                  onClick={() => onScan(s.id)}
-                  title={t("feedSources.scan")}
-                >
-                  <Icon name="refresh" size={12} />
-                </button>
-                <button
-                  type="button"
-                  className="s-btn"
-                  disabled={busy}
-                  onClick={() => onRemove(s.id)}
-                  title={t("common.remove")}
-                >
-                  <Icon name="trash" size={12} />
-                </button>
-              </div>
-            </li>
-          ))}
+          {sources.map((s) => {
+            const editing =
+              s.folderId != null && editingFolderId === s.folderId;
+            return (
+              <li key={s.id}>
+                <div className="feed-sources-item-main">
+                  <a href={s.baseUrl} target="_blank" rel="noopener noreferrer">
+                    {s.baseUrl}
+                  </a>
+                  {editing ? (
+                    <form
+                      className="feed-sources-rename"
+                      onSubmit={(e) => {
+                        e.preventDefault();
+                        if (s.folderId != null) void saveRenameFolder(s.folderId);
+                      }}
+                    >
+                      <label className="feed-sources-rename-label">
+                        <span>{t("feedSources.folderLabel")}</span>
+                        <input
+                          type="text"
+                          value={folderDraft}
+                          onChange={(e) => setFolderDraft(e.target.value)}
+                          placeholder={t("feedSources.folderNamePlaceholder")}
+                          autoFocus
+                          disabled={busy}
+                          {...NO_AUTOCORRECT}
+                        />
+                      </label>
+                      <button
+                        type="submit"
+                        className="s-btn primary"
+                        disabled={busy || !folderDraft.trim()}
+                      >
+                        {t("common.save")}
+                      </button>
+                      <button
+                        type="button"
+                        className="s-btn"
+                        disabled={busy}
+                        onClick={cancelRenameFolder}
+                      >
+                        {t("common.cancel")}
+                      </button>
+                    </form>
+                  ) : (
+                    <span className="feed-sources-meta">
+                      {s.folderName
+                        ? `${t("feedSources.folder", { name: s.folderName })} · `
+                        : ""}
+                      {t("feedSources.feedCount", { count: s.feedCount })}
+                      {s.lastCheckedAt
+                        ? ` · ${new Date(s.lastCheckedAt).toLocaleString()}`
+                        : ""}
+                    </span>
+                  )}
+                </div>
+                <div className="feed-sources-item-actions">
+                  {s.folderId != null && !editing && (
+                    <button
+                      type="button"
+                      className="s-btn"
+                      disabled={busy}
+                      onClick={() => beginRenameFolder(s)}
+                      title={t("feedSources.renameFolder")}
+                    >
+                      <Icon name="pencil" size={12} />
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    className="s-btn"
+                    disabled={busy || scanningId != null}
+                    onClick={() => onScan(s.id)}
+                    title={t("feedSources.scan")}
+                  >
+                    <Icon name="refresh" size={12} />
+                  </button>
+                  <button
+                    type="button"
+                    className="s-btn"
+                    disabled={busy}
+                    onClick={() => onRemove(s.id)}
+                    title={t("common.remove")}
+                  >
+                    <Icon name="trash" size={12} />
+                  </button>
+                </div>
+              </li>
+            );
+          })}
         </ul>
       )}
 

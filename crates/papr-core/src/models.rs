@@ -99,6 +99,26 @@ pub struct Tag {
     pub kind: String,
     /// How many articles currently carry this tag.
     pub article_count: i64,
+    /// How many of those articles are unread for the current viewer.
+    /// Treated as the sidebar "update" count (new content waiting to be read).
+    #[serde(default)]
+    pub unread_count: i64,
+}
+
+/// Synonym that resolves to a canonical [`Tag`] during auto-tag matching.
+///
+/// Uniqueness is per `(kind, alias)` (case-insensitive). v1 UI maintains
+/// interest aliases only; the table can hold either kind.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TagAlias {
+    pub id: i64,
+    pub alias: String,
+    pub tag_id: i64,
+    /// Denormalized from the target tag for UNIQUE / lookups.
+    pub kind: String,
+    /// Canonical tag display name (joined for Settings UI).
+    pub tag_name: String,
 }
 
 /// A keyword filter applied to incoming articles at ingestion time.

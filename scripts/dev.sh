@@ -14,7 +14,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-export PORT="${PORT:-8080}"
+export PORT="${PORT:-8111}"
 export PAPR_DB="${PAPR_DB:-$REPO_ROOT/papr.db}"
 export RUST_LOG="${RUST_LOG:-info}"
 

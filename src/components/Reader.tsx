@@ -8,7 +8,15 @@ import { usePlayer } from "../player";
 import { useTranslationJobs } from "../translation";
 import { useArticleActions } from "../hooks/articleActions";
 import { renderMarkdown } from "../lib/markdown";
-import { copyText } from "../lib/clipboard";
+import { copyRichText } from "../lib/clipboard";
+import { downloadBlob } from "../lib/download";
+import {
+  articleFilename,
+  articleMetaLines,
+  formatArticleHtml,
+  formatArticlePlain,
+} from "../lib/articleExport";
+import { articleToDocx } from "../lib/docx";
 import { imageDataUrl } from "../lib/imageBytes";
 import { fullDate } from "../lib/feedMeta";
 import { openUrl } from "../lib/openUrl";
@@ -188,17 +196,13 @@ export default function Reader({ onToast }: Props) {
   const defaultOpenMode = useUi((s) => s.prefs.defaultOpenMode);
 
   const [scrolled, setScrolled] = useState(false);
-  // Which body to show when an extraction exists follows the default open
-  // mode: "reader" (the default) shows the feed's own content and extraction
-  // is opt-in via the toolbar button; "extracted" shows the full text.
+  // Which body to show when an extraction exists follows the open mode:
+  // "reader" keeps the feed body; "extracted" prefers full text (and may
+  // auto-extract on open).
   const [showExtracted, setShowExtracted] = useState(
     defaultOpenMode === "extracted",
   );
   const [showTranslation, setShowTranslation] = useState(false);
-  // Reading vs. the article's original web page, shown in an in-app iframe.
-  // Sites that set X-Frame-Options / CSP frame-ancestors refuse to load this
-  // way — the in-frame hint points those back to "open in browser".
-  const [viewMode, setViewMode] = useState<"reader" | "web">("reader");
   const [tagPick, setTagPick] = useState<{ x: number; y: number } | null>(null);
   // Full-screen image viewer: the article's image srcs + the one to open on
   // (issue #87). Null when closed.
@@ -254,7 +258,6 @@ export default function Reader({ onToast }: Props) {
   useEffect(() => {
     setShowExtracted(useUi.getState().prefs.defaultOpenMode === "extracted");
     setShowTranslation(false);
-    setViewMode("reader");
     setScrolled(false);
     setTagPick(null);
     setHeroBroken(false);
@@ -272,23 +275,9 @@ export default function Reader({ onToast }: Props) {
     if (!a || openMode === undefined || openModeAppliedRef.current === a.id)
       return;
     openModeAppliedRef.current = a.id;
-    if (openMode === "web" && a.url) setViewMode("web");
+    if (openMode === "web" && a.url) openUrl(a.url);
     else setShowExtracted(openMode === "extracted");
   }, [a, openMode]);
-
-  // Web substitute for the former native page_view: open the original URL in
-  // a new browser tab when the user switches into "web" mode.
-  const articleUrl = a?.url ?? null;
-  const openedWebRef = useRef<string | null>(null);
-  useEffect(() => {
-    if (viewMode !== "web" || !articleUrl) {
-      openedWebRef.current = null;
-      return;
-    }
-    if (openedWebRef.current === articleUrl) return;
-    openedWebRef.current = articleUrl;
-    openUrl(articleUrl);
-  }, [viewMode, articleUrl]);
 
   // Recover article-body images the webview fails to load, then hide the
   // stragglers. The webview sends no Referer (see sanitize.rs) — right for
@@ -437,7 +426,6 @@ export default function Reader({ onToast }: Props) {
   const startTranslate = useTranslationJobs((s) => s.translate);
   const job = useTranslationJobs((s) => (id != null ? s.jobs[id] : undefined));
 
-  const hasExtracted = !!a?.extractedHtml;
   const canTranslate = !!(a?.extractedHtml || a?.contentHtml);
   const baseBody =
     (showExtracted && a?.extractedHtml ? a.extractedHtml : a?.contentHtml) || "";
@@ -578,25 +566,52 @@ export default function Reader({ onToast }: Props) {
   }, [markReadIfAtFoot, showExtracted, a?.extractedHtml, a?.contentHtml]);
 
 
-  const copyLink = () => {
-    if (!a?.url) return;
-    void copyText(a.url).then((ok) =>
-      onToast(ok ? t("reader.linkCopied") : t("reader.linkCopyFailed")),
+  // Prefer the translation when one is on screen; otherwise the feed/extracted
+  // body. Skip the transient "Translating…" placeholder so copy/export never
+  // grab that stub, and use unproxied HTML (no inlined data: images).
+  const exportBodyHtml =
+    showTranslation && translatedBody ? translatedBody : baseBody;
+  const exportSource = a
+    ? {
+        title: a.title,
+        author: a.author,
+        url: a.url,
+        feedTitle: a.feedTitle,
+        publishedLabel: a.publishedAt ? fullDate(a.publishedAt) : null,
+      }
+    : null;
+  const copyArticle = () => {
+    if (!exportSource) return;
+    const plain = formatArticlePlain(exportSource, exportBodyHtml);
+    const html = formatArticleHtml(exportSource, exportBodyHtml);
+    void copyRichText(plain, html).then((ok) =>
+      onToast(ok ? t("reader.articleCopied") : t("reader.articleCopyFailed")),
     );
   };
-  const share = () => {
-    if (!a?.url) return;
-    if (navigator.share) {
-      navigator.share({ title: a.title, url: a.url }).catch((e) => {
-        // A user-cancelled share rejects with AbortError — only fall back to
-        // copying the link on a genuine failure (e.g. share unsupported).
-        if ((e as Error)?.name !== "AbortError") copyLink();
-      });
-    } else {
-      copyLink();
-    }
+  const exportWord = () => {
+    if (!exportSource) return;
+    // Prefer proxied HTML (already-inlined data: images) when it matches the
+    // export body; otherwise resolve remotes via the backend fetch-image path
+    // so hotlink-protected hosts still embed in Word.
+    const html =
+      proxiedBody?.source === exportBodyHtml ? proxiedBody.html : exportBodyHtml;
+    void (async () => {
+      try {
+        const blob = await articleToDocx({
+          title: exportSource.title,
+          metaLines: articleMetaLines(exportSource),
+          bodyHtml: html,
+          resolveImage: (src) =>
+            api.fetchImage(src, a?.url).catch(() => null),
+        });
+        downloadBlob(blob, articleFilename(exportSource.title, "docx"));
+        onToast(t("reader.wordExported"));
+      } catch (e) {
+        reportError(e);
+        onToast(t("reader.wordExportFailed"));
+      }
+    })();
   };
-
   // Article-body clicks: an image opens the full-screen viewer (issue #87), with
   // the article's other images available for ← / → navigation; anything else
   // falls through to the link handler (in-page anchors, external links).
@@ -696,8 +711,8 @@ export default function Reader({ onToast }: Props) {
     );
   }
 
-  // `hasExtracted`, `canTranslate`, `body`, `displayBody` and the translation
-  // state are computed above (before the early returns) so the image-proxy and
+  // `canTranslate`, `body`, `displayBody` and the translation state are
+  // computed above (before the early returns) so the image-proxy and
   // recovery effects can depend on them.
 
   // Translate into `lang` with `eng` and show the result. Defaults come from
@@ -712,7 +727,7 @@ export default function Reader({ onToast }: Props) {
   const ytId = a.sourceType === "youtube" ? youtubeId(a.url) : null;
 
   return (
-    <div className="reader" role="main">
+    <div className={`reader ${aiOpen ? "ai-open" : ""}`} role="main">
       <div className={`reader-toolbar ${scrolled ? "scrolled" : ""}`}>
         <button
           className={`tb-btn ${a.isStarred ? "on" : ""}`}
@@ -746,30 +761,20 @@ export default function Reader({ onToast }: Props) {
           <Icon name="tag" size={16} />
         </button>
         <button
-          className={`tb-btn ${hasExtracted && showExtracted ? "on" : ""} ${
-            extract.isPending ? "spinning" : ""
-          }`}
-          onClick={() =>
-            hasExtracted ? setShowExtracted((v) => !v) : extract.mutate(a.id)
-          }
-          // Extraction needs the source URL; without one (and nothing
-          // extracted yet) the button can only error, so disable it.
-          disabled={extract.isPending || (!hasExtracted && !a.url)}
-          title={hasExtracted ? t("reader.tbToggleFullText") : t("reader.tbExtractFullText")}
-          aria-label={hasExtracted ? t("reader.tbToggleFullText") : t("reader.tbExtractFullText")}
-          aria-pressed={hasExtracted ? showExtracted : undefined}
-          aria-busy={extract.isPending}
+          className="tb-btn"
+          title={t("reader.tbCopyArticle")}
+          aria-label={t("reader.tbCopyArticle")}
+          onClick={copyArticle}
         >
-          <Icon name="text" size={16} />
+          <Icon name="copy" size={16} />
         </button>
         <button
           className="tb-btn"
-          title={t("reader.tbShare")}
-          aria-label={t("reader.tbShare")}
-          onClick={share}
-          disabled={!a.url}
+          title={t("reader.tbExportWord")}
+          aria-label={t("reader.tbExportWord")}
+          onClick={exportWord}
         >
-          <Icon name="share" size={16} />
+          <Icon name="file-text" size={16} />
         </button>
         <HighlightLayer
           // Keyed by article id so the export menu / popovers reset cleanly
@@ -803,16 +808,6 @@ export default function Reader({ onToast }: Props) {
         >
           <Icon name="globe" size={16} />
         </button>
-        {/* {a.url && (
-          <button
-            className="tb-btn"
-            title={t("reader.tbCopyLink")}
-            aria-label={t("reader.tbCopyLink")}
-            onClick={copyLink}
-          >
-            <Icon name="copy" size={16} />
-          </button>
-        )} */}
         <button
           className={`tb-btn ${focusMode ? "on" : ""}`}
           title={t("reader.tbFocusMode")}
@@ -822,17 +817,6 @@ export default function Reader({ onToast }: Props) {
         >
           <Icon name={focusMode ? "eye-off" : "focus"} size={16} />
         </button>
-        {a.url && (
-          <button
-            className={`tb-btn ${viewMode === "web" ? "on" : ""}`}
-            title={t("reader.tbWebView")}
-            aria-label={t("reader.tbWebView")}
-            aria-pressed={viewMode === "web"}
-            onClick={() => setViewMode((v) => (v === "web" ? "reader" : "web"))}
-          >
-            <Icon name="eye" size={16} />
-          </button>
-        )}
         {a.url && (
           <button
             className="tb-btn"
@@ -845,29 +829,9 @@ export default function Reader({ onToast }: Props) {
         )}
       </div>
 
-      {viewMode === "web" && a.url ? (
-        <div className="reader-webview">
-          <div className="reader-webview-bar">
-            <span className="reader-webview-url">{a.url}</span>
-            <button
-              className="reader-webview-open"
-              onClick={() => openUrl(a.url!)}
-            >
-              {t("reader.tbOpenInBrowser")}
-            </button>
-          </div>
-          <div className="reader-webview-host reader-webview-fallback">
-            <p>{t("reader.webOpenedTab")}</p>
-            <button
-              type="button"
-              className="s-btn primary"
-              onClick={() => openUrl(a.url!)}
-            >
-              {t("reader.tbOpenInBrowser")}
-            </button>
-          </div>
-        </div>
-      ) : (
+      {/* Article + AI summary share a row so the drawer reserves width instead
+          of overlaying the body (tags, images, text). */}
+      <div className="reader-main">
       <div
         className="reader-scroll"
         ref={scrollRef}
@@ -1088,15 +1052,6 @@ export default function Reader({ onToast }: Props) {
           />
         </article>
       </div>
-      )}
-
-      {lightbox && (
-        <Lightbox
-          srcs={lightbox.srcs}
-          index={lightbox.index}
-          onClose={() => setLightbox(null)}
-        />
-      )}
 
       <AIDrawer
         // Keyed by article id so switching articles remounts the drawer:
@@ -1107,6 +1062,15 @@ export default function Reader({ onToast }: Props) {
         article={a}
         onClose={() => setAiOpen(false)}
       />
+      </div>
+
+      {lightbox && (
+        <Lightbox
+          srcs={lightbox.srcs}
+          index={lightbox.index}
+          onClose={() => setLightbox(null)}
+        />
+      )}
 
       {tagPick && (
         <TagPicker

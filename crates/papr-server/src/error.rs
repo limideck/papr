@@ -38,14 +38,19 @@ impl From<AppError> for ApiError {
         let status = match &error {
             AppError::Coded("unauthorized") => StatusCode::UNAUTHORIZED,
             AppError::Coded("forbidden") => StatusCode::FORBIDDEN,
+            AppError::Coded("entityNotFound") => StatusCode::NOT_FOUND,
             AppError::Coded("alreadySubscribed")
             | AppError::Coded("emptyFolderName")
             | AppError::Coded("folderNameExists")
             | AppError::Coded("passwordTooShort")
             | AppError::Coded("emptyUsername")
             | AppError::Coded("invalidIndexUrl")
+            | AppError::Coded("indexUrlExists")
             | AppError::Coded("noFeedFound")
-            | AppError::Coded("badImageUrl") => StatusCode::BAD_REQUEST,
+            | AppError::Coded("badImageUrl")
+            | AppError::Coded("emptyCanonical")
+            | AppError::Coded("emptyPatch")
+            | AppError::Coded("entityIdExists") => StatusCode::BAD_REQUEST,
             AppError::Db(_) | AppError::Migration(_) => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::BAD_REQUEST,
         };

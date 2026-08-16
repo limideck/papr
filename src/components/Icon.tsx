@@ -8,11 +8,12 @@ export type IconName =
   | "inbox" | "circle" | "unread" | "star" | "star-fill" | "bookmark"
   | "bookmark-fill" | "clock" | "tag" | "folder" | "rss" | "search"
   | "plus" | "check" | "check-all" | "sort" | "sparkle" | "sparkle-fill"
-  | "open" | "share" | "send" | "more" | "refresh" | "settings" | "chevron-down"
+  | "open" | "send" | "more" | "refresh" | "settings" | "chevron-down"
   | "chevron-right" | "globe" | "focus" | "arrow-down" | "arrow-up"
   | "eye" | "eye-off" | "trash" | "mute" | "pin" | "x" | "command"
-  | "copy" | "list" | "grid" | "text" | "alert" | "papr"
-  | "play" | "pause" | "skip-back" | "skip-fwd" | "headphones";
+  | "copy" | "list" | "grid" | "pencil" | "alert" | "papr"
+  | "play" | "pause" | "skip-back" | "skip-fwd" | "headphones"
+  | "file-text";
 
 interface Props {
   name: IconName;
@@ -89,8 +90,6 @@ export default function Icon({
       return <svg {...p}><path d="M11.4 2.6a.65.65 0 0 1 1.2 0l1.55 4.13a2 2 0 0 0 1.17 1.17l4.13 1.55a.65.65 0 0 1 0 1.2l-4.13 1.55a2 2 0 0 0-1.17 1.17l-1.55 4.13a.65.65 0 0 1-1.2 0l-1.55-4.13a2 2 0 0 0-1.17-1.17L4.55 11.6a.65.65 0 0 1 0-1.2l4.13-1.55a2 2 0 0 0 1.17-1.17z" fill={color} stroke="none" /><path d="M19 14v3M20.5 15.5h-3M5 4v3M6.5 5.5h-3" /></svg>;
     case "open":
       return <svg {...p}><path d="M15 3h6v6M21 3l-9 9M18 13v5a3 3 0 0 1-3 3H6a3 3 0 0 1-3-3V9a3 3 0 0 1 3-3h5" /></svg>;
-    case "share":
-      return <svg {...p}><path d="M12 15V3M8.5 6.5 12 3l3.5 3.5M5 13v5a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-5" /></svg>;
     case "send":
       return <svg {...p}><path d="M21.5 2.5 10.5 13.5M21.5 2.5l-7 19-4-8.5-8.5-4z" /></svg>;
     case "more":
@@ -131,8 +130,8 @@ export default function Icon({
       return <svg {...p}><path d="M8 6h13M8 12h13M8 18h13" /><circle cx="3.5" cy="6" r="1.1" fill={color} stroke="none" /><circle cx="3.5" cy="12" r="1.1" fill={color} stroke="none" /><circle cx="3.5" cy="18" r="1.1" fill={color} stroke="none" /></svg>;
     case "grid":
       return <svg {...p}><rect x="3" y="3" width="7.5" height="7.5" rx="2" /><rect x="13.5" y="3" width="7.5" height="7.5" rx="2" /><rect x="3" y="13.5" width="7.5" height="7.5" rx="2" /><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="2" /></svg>;
-    case "text":
-      return <svg {...p}><path d="M4 7V4h16v3M12 4v16M9 20h6" /></svg>;
+    case "pencil":
+      return <svg {...p}><path d="M17 3a2.4 2.4 0 0 1 3.4 3.4L8.5 18.3 3 19.5l1.2-5.5z" /><path d="M15 5l4 4" /></svg>;
     case "alert":
       return <svg {...p}><path d="M10.3 3.9 2.4 18a2 2 0 0 0 1.7 3h15.8a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" /><path d="M12 9v4" /><circle cx="12" cy="17" r="0.5" fill={color} stroke="none" /></svg>;
     case "play":
@@ -145,6 +144,8 @@ export default function Icon({
       return <svg {...p}><path d="M13 5a7 7 0 1 0 6.32 4" /><path d="M19 3.5 19.5 9 14 8.5" /></svg>;
     case "headphones":
       return <svg {...p}><path d="M4 14v-2a8 8 0 0 1 16 0v2" /><rect x="2.5" y="13" width="4.5" height="7" rx="2.2" /><rect x="17" y="13" width="4.5" height="7" rx="2.2" /></svg>;
+    case "file-text":
+      return <svg {...p}><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" /><path d="M14 3v5h5M9 13h6M9 17h6" /></svg>;
     case "papr":
       return <svg {...p}><path d="M6 3h7l5 5v12a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z" /><path d="M13 3v4a1 1 0 0 0 1 1h4" /><path d="M8 13.5a3.5 3.5 0 0 1 3.5 3.5M8 11a6 6 0 0 1 6 6" /><circle cx="8" cy="17" r="1.1" fill={color} stroke="none" /></svg>;
     default:

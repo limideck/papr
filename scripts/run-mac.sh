@@ -39,7 +39,7 @@ if [ ! -f "$ENV_FILE" ]; then
   else
     cat > "$ENV_FILE" <<ENVEOF
 PAPR_DB=$MAC_ROOT/data/papr.db
-PORT=8080
+PORT=8111
 PAPR_STATIC_DIR=$MAC_ROOT/dist
 PAPR_ADMIN_USER=admin
 PAPR_ADMIN_PASSWORD=changeme

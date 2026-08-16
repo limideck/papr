@@ -32,9 +32,12 @@ import type {
   SmartCounts,
   StatsOverview,
   Tag,
+  TagAlias,
   TagKind,
   TranslateEvent,
   WordCloudEntities,
+  WordCloudEntitiesSource,
+  WordCloudEntity,
   WordCloudResult,
   WordCloudStopwords,
 } from "./types";
@@ -311,9 +314,12 @@ export const listArticles = (
   oldestFirst: boolean,
   limit: number,
   offset: number,
+  sortByRelevance = true,
 ) =>
   apiJson<ArticleSummary[]>(
-    `${API}/articles${articleListParams(query, unreadOnly, search, oldestFirst, limit, offset)}`,
+    `${API}/articles${articleListParams(query, unreadOnly, search, oldestFirst, limit, offset, {
+      sortByRelevance: search ? sortByRelevance : undefined,
+    })}`,
   );
 
 export const articleIndex = (
@@ -562,6 +568,25 @@ export const setArticleTag = (articleId: number, tagId: number, on: boolean) =>
     body: JSON.stringify({ on }),
   });
 
+export const listTagAliases = (opts?: { tagId?: number; kind?: TagKind }) => {
+  const params: Record<string, string | number> = {};
+  if (opts?.tagId != null) params.tag_id = opts.tagId;
+  if (opts?.kind) params.kind = opts.kind;
+  return apiJson<TagAlias[]>(`${API}/tags/aliases${qs(params)}`);
+};
+export const createTagAlias = (tagId: number, alias: string) =>
+  apiJson<number | { id: number }>(`${API}/tags/aliases`, {
+    method: "POST",
+    body: JSON.stringify({ tagId, alias }),
+  }).then(unwrapId);
+export const renameTagAlias = (id: number, alias: string) =>
+  apiJson<void>(`${API}/tags/aliases/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ alias }),
+  });
+export const deleteTagAlias = (id: number) =>
+  apiJson<void>(`${API}/tags/aliases/${id}`, { method: "DELETE" });
+
 /** Run interest + AI auto-tag on one article (sync). Returns updated tags. */
 export const autoTagArticle = (articleId: number) =>
   apiJson<{ ok: boolean; tags: Tag[] }>(
@@ -707,6 +732,86 @@ export async function getWordCloudStopwords(): Promise<WordCloudStopwords> {
 
 export async function getWordCloudEntities(): Promise<WordCloudEntities> {
   return apiJson(`${API}/wordcloud/entities`);
+}
+
+export type PatchWordCloudEntityBody = {
+  canonical?: string;
+  aliases?: string[];
+};
+
+export type PatchWordCloudEntityResult = {
+  ok: boolean;
+  entity: WordCloudEntity;
+  version: number;
+  source?: WordCloudEntitiesSource;
+  path?: string;
+  writable?: boolean;
+  seedDir?: string;
+  cowDir?: string;
+  dictVersion?: number;
+  dictBumped?: boolean;
+};
+
+/** Admin: update entity display canonical (and optional aliases). Triggers COW on first edit. */
+export async function patchWordCloudEntity(
+  id: string,
+  body: PatchWordCloudEntityBody,
+): Promise<PatchWordCloudEntityResult> {
+  const raw = await apiJson<Record<string, unknown>>(
+    `${API}/wordcloud/entities/${encodeURIComponent(id)}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    },
+  );
+  return {
+    ok: Boolean(raw.ok),
+    entity: raw.entity as WordCloudEntity,
+    version: Number(raw.version ?? 1),
+    source: raw.source as WordCloudEntitiesSource | undefined,
+    path: typeof raw.path === "string" ? raw.path : undefined,
+    writable: typeof raw.writable === "boolean" ? raw.writable : undefined,
+    seedDir: typeof raw.seedDir === "string" ? raw.seedDir : undefined,
+    cowDir: typeof raw.cowDir === "string" ? raw.cowDir : undefined,
+    dictVersion:
+      typeof raw.dictVersion === "number" ? raw.dictVersion : undefined,
+    dictBumped:
+      typeof raw.dictBumped === "boolean" ? raw.dictBumped : undefined,
+  };
+}
+
+export type CreateWordCloudEntityBody = {
+  id?: string;
+  canonical: string;
+  group?: string;
+  aliases?: string[];
+};
+
+/** Admin: create / promote a residual cloud term to an entity (COW on first write). */
+export async function createWordCloudEntity(
+  body: CreateWordCloudEntityBody,
+): Promise<PatchWordCloudEntityResult> {
+  const raw = await apiJson<Record<string, unknown>>(
+    `${API}/wordcloud/entities`,
+    {
+      method: "POST",
+      body: JSON.stringify(body),
+    },
+  );
+  return {
+    ok: Boolean(raw.ok),
+    entity: raw.entity as WordCloudEntity,
+    version: Number(raw.version ?? 1),
+    source: raw.source as WordCloudEntitiesSource | undefined,
+    path: typeof raw.path === "string" ? raw.path : undefined,
+    writable: typeof raw.writable === "boolean" ? raw.writable : undefined,
+    seedDir: typeof raw.seedDir === "string" ? raw.seedDir : undefined,
+    cowDir: typeof raw.cowDir === "string" ? raw.cowDir : undefined,
+    dictVersion:
+      typeof raw.dictVersion === "number" ? raw.dictVersion : undefined,
+    dictBumped:
+      typeof raw.dictBumped === "boolean" ? raw.dictBumped : undefined,
+  };
 }
 
 export type WordCloudIndexStatus = {

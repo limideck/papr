@@ -358,14 +358,16 @@ pub async fn list_articles(
     oldest_first: bool,
     limit: i64,
     offset: i64,
+    sort_by_relevance: Option<bool>,
 ) -> AppResult<Vec<ArticleSummary>> {
     let conn = state.read().await;
-    db::list_articles(
+    db::list_articles_sorted(
         &conn,
         &query,
         unread_only,
         search.as_deref(),
         oldest_first,
+        sort_by_relevance.unwrap_or(true),
         limit,
         offset,
     )
@@ -1327,6 +1329,42 @@ pub async fn set_tag_color(
 pub async fn delete_tag(state: State<'_, AppState>, id: i64) -> AppResult<()> {
     let conn = state.db.lock().await;
     db::delete_tag(&conn, id)
+}
+
+#[tauri::command]
+pub async fn list_tag_aliases(
+    state: State<'_, AppState>,
+    tag_id: Option<i64>,
+    kind: Option<String>,
+) -> AppResult<Vec<TagAlias>> {
+    let conn = state.read().await;
+    db::list_tag_aliases(&conn, tag_id, kind.as_deref())
+}
+
+#[tauri::command]
+pub async fn create_tag_alias(
+    state: State<'_, AppState>,
+    tag_id: i64,
+    alias: String,
+) -> AppResult<i64> {
+    let conn = state.db.lock().await;
+    db::create_tag_alias(&conn, tag_id, &alias)
+}
+
+#[tauri::command]
+pub async fn rename_tag_alias(
+    state: State<'_, AppState>,
+    id: i64,
+    alias: String,
+) -> AppResult<()> {
+    let conn = state.db.lock().await;
+    db::rename_tag_alias(&conn, id, &alias)
+}
+
+#[tauri::command]
+pub async fn delete_tag_alias(state: State<'_, AppState>, id: i64) -> AppResult<()> {
+    let conn = state.db.lock().await;
+    db::delete_tag_alias(&conn, id)
 }
 
 /// Attach or detach a tag from one article.

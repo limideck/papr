@@ -4,6 +4,7 @@ use axum::extract::{Path, Query, State};
 use axum::Json;
 use papr_core::db;
 use papr_core::models::TAG_KIND_INTEREST;
+use papr_core::user_db;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -15,13 +16,13 @@ pub struct ListQuery {
 
 pub async fn list(
     State(state): State<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<Value>> {
     let conn = state.db.lock().await;
     let kind = q.kind.as_deref();
     Ok(Json(json!(
-        db::list_tags(&conn, kind).map_err(ApiError::from)?
+        user_db::list_tags_for_user(&conn, user.id(), kind).map_err(ApiError::from)?
     )))
 }
 
@@ -137,5 +138,69 @@ pub async fn set_article_tag(
     }
     let conn = state.db.lock().await;
     db::set_article_tag(&conn, article_id, tag_id, body.on).map_err(ApiError::from)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+pub struct ListAliasesQuery {
+    pub tag_id: Option<i64>,
+    /// Optional `interest` | `ai` filter.
+    pub kind: Option<String>,
+}
+
+pub async fn list_aliases(
+    State(state): State<AppState>,
+    _user: AuthUser,
+    Query(q): Query<ListAliasesQuery>,
+) -> ApiResult<Json<Value>> {
+    let conn = state.db.lock().await;
+    Ok(Json(json!(
+        db::list_tag_aliases(&conn, q.tag_id, q.kind.as_deref()).map_err(ApiError::from)?
+    )))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateAliasBody {
+    pub tag_id: i64,
+    pub alias: String,
+}
+
+pub async fn create_alias(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Json(body): Json<CreateAliasBody>,
+) -> ApiResult<Json<Value>> {
+    user.require_admin()?;
+    let conn = state.db.lock().await;
+    let id = db::create_tag_alias(&conn, body.tag_id, &body.alias).map_err(ApiError::from)?;
+    Ok(Json(json!({ "id": id })))
+}
+
+#[derive(Deserialize)]
+pub struct UpdateAliasBody {
+    pub alias: String,
+}
+
+pub async fn update_alias(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+    Json(body): Json<UpdateAliasBody>,
+) -> ApiResult<Json<Value>> {
+    user.require_admin()?;
+    let conn = state.db.lock().await;
+    db::rename_tag_alias(&conn, id, &body.alias).map_err(ApiError::from)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+pub async fn delete_alias(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<Value>> {
+    user.require_admin()?;
+    let conn = state.db.lock().await;
+    db::delete_tag_alias(&conn, id).map_err(ApiError::from)?;
     Ok(Json(json!({ "ok": true })))
 }

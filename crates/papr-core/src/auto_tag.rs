@@ -591,8 +591,8 @@ fn log_empty_ai_tags(article_id: i64, title: &str, tags: &[String]) {
     }
 }
 
-/// Attach only suggested tags that case-insensitively match an existing name
-/// of the given kind. Unknown names are dropped; nothing is created.
+/// Attach only suggested tags that resolve to an existing name (or alias) of
+/// the given kind. Unknown names are dropped; nothing is created.
 pub fn apply_suggested_tags(
     conn: &Connection,
     article_id: i64,
@@ -612,18 +612,22 @@ pub fn apply_suggested_tags(
         let Some(name) = normalize_tag_name(name) else {
             continue;
         };
-        let Some(canonical) = existing_names
+
+        // Prefer an in-memory closed-vocab hit (canonical spelling), then fall
+        // back to DB name / alias resolution so LLM synonyms map to the
+        // maintained interest tag.
+        let tag_id = if let Some(canonical) = existing_names
             .iter()
             .find(|e| e.eq_ignore_ascii_case(&name))
             .cloned()
-        else {
+        {
+            db::create_tag(conn, &canonical, kind)?
+        } else if let Some(id) = db::resolve_tag_by_name_or_alias(conn, kind, &name)? {
+            id
+        } else {
             continue;
         };
 
-        // Known name only — create_tag is find-or-create within the kind and
-        // will resolve to the existing row, never invent a new vocabulary entry
-        // when callers only pass matched names.
-        let tag_id = db::create_tag(conn, &canonical, kind)?;
         db::set_article_tag(conn, article_id, tag_id, true)?;
         slots -= 1;
     }
@@ -1207,6 +1211,59 @@ Final: {"tags":["Rust","Go"]}"#;
         assert!(db::list_tags(&conn, Some(TAG_KIND_AI))
             .unwrap()
             .is_empty());
+
+        remove_temp_db(conn, path);
+    }
+
+    #[test]
+    fn apply_suggested_tags_resolves_interest_alias() {
+        let (conn, path) = temp_db();
+        let feed_id = db::insert_feed(
+            &conn,
+            "https://example.com/feed-alias.xml",
+            None,
+            "Example",
+            None,
+            SourceType::Rss,
+            None,
+        )
+        .unwrap();
+        let article = NewArticle {
+            guid: "galias".into(),
+            url: Some("https://example.com/alias".into()),
+            title: "Hello".into(),
+            author: None,
+            summary: Some("World".into()),
+            content_html: None,
+            body_text: "World".into(),
+            image_url: None,
+            published_at: None,
+            enclosures: vec![],
+        };
+        assert!(db::upsert_article(&conn, feed_id, &article, false, &[]).unwrap());
+        let article_id: i64 = conn
+            .query_row("SELECT id FROM articles WHERE guid = 'galias'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+
+        let rust = db::create_tag(&conn, "Rust", TAG_KIND_INTEREST).unwrap();
+        db::create_tag_alias(&conn, rust, "rustlang").unwrap();
+        let existing = vec!["Rust".into()];
+        // Synonym not in the closed list — still attaches via alias.
+        apply_suggested_tags(
+            &conn,
+            article_id,
+            &["RustLang".into(), "Unknown".into()],
+            &existing,
+            5,
+            TAG_KIND_INTEREST,
+        )
+        .unwrap();
+        let attached = db::tags_for_article(&conn, article_id).unwrap();
+        assert_eq!(attached.len(), 1);
+        assert_eq!(attached[0].name, "Rust");
+        assert_eq!(attached[0].id, rust);
 
         remove_temp_db(conn, path);
     }

@@ -56,24 +56,16 @@ fn article_filter_for_user(
     (where_clauses, binds)
 }
 
-fn article_order(oldest_first: bool) -> &'static str {
-    if oldest_first {
+fn article_order(oldest_first: bool, rank_first: bool) -> String {
+    let date = if oldest_first {
         "datetime(COALESCE(a.published_at, a.fetched_at)) ASC, a.id ASC"
     } else {
         "datetime(COALESCE(a.published_at, a.fetched_at)) DESC, a.id DESC"
-    }
-}
-
-fn fts_query(input: &str) -> String {
-    let terms: Vec<String> = input
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|t| !t.is_empty())
-        .map(|t| format!("\"{t}\"*"))
-        .collect();
-    if terms.is_empty() {
-        "\"\"".into()
+    };
+    if rank_first {
+        format!("fts.rank ASC, {date}")
     } else {
-        terms.join(" ")
+        date.to_string()
     }
 }
 
@@ -111,6 +103,67 @@ pub fn list_feeds_for_user(conn: &Connection, user_id: i64) -> AppResult<Vec<Fee
     Ok(rows)
 }
 
+/// Tags with per-user unread ("update") counts for the web multi-user path.
+pub fn list_tags_for_user(
+    conn: &Connection,
+    user_id: i64,
+    kind: Option<&str>,
+) -> AppResult<Vec<Tag>> {
+    let kind = match kind {
+        Some(k) => Some(crate::db::normalize_tag_kind(k)?),
+        None => None,
+    };
+    let sql = if kind.is_some() {
+        "SELECT t.id, t.name, t.color, t.position, t.kind,
+                (SELECT COUNT(*) FROM article_tags at WHERE at.tag_id = t.id),
+                (SELECT COUNT(*) FROM article_tags at
+                   JOIN articles a ON a.id = at.article_id
+                   LEFT JOIN user_article_states uas
+                     ON uas.article_id = a.id AND uas.user_id = ?1
+                  WHERE at.tag_id = t.id AND COALESCE(uas.is_read, 0) = 0)
+         FROM tags t WHERE t.kind = ?2
+         ORDER BY t.position, t.name COLLATE NOCASE"
+    } else {
+        "SELECT t.id, t.name, t.color, t.position, t.kind,
+                (SELECT COUNT(*) FROM article_tags at WHERE at.tag_id = t.id),
+                (SELECT COUNT(*) FROM article_tags at
+                   JOIN articles a ON a.id = at.article_id
+                   LEFT JOIN user_article_states uas
+                     ON uas.article_id = a.id AND uas.user_id = ?1
+                  WHERE at.tag_id = t.id AND COALESCE(uas.is_read, 0) = 0)
+         FROM tags t ORDER BY t.position, t.name COLLATE NOCASE"
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let rows = if let Some(k) = kind {
+        stmt.query_map(params![user_id, k], |r| {
+            Ok(Tag {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                color: r.get(2)?,
+                position: r.get(3)?,
+                kind: r.get(4)?,
+                article_count: r.get(5)?,
+                unread_count: r.get(6)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+    } else {
+        stmt.query_map(params![user_id], |r| {
+            Ok(Tag {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                color: r.get(2)?,
+                position: r.get(3)?,
+                kind: r.get(4)?,
+                article_count: r.get(5)?,
+                unread_count: r.get(6)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+    };
+    Ok(rows)
+}
+
 pub fn list_articles_for_user(
     conn: &Connection,
     user_id: i64,
@@ -121,10 +174,53 @@ pub fn list_articles_for_user(
     limit: i64,
     offset: i64,
 ) -> AppResult<Vec<ArticleSummary>> {
+    list_articles_for_user_sorted(
+        conn,
+        user_id,
+        query,
+        unread_only,
+        search,
+        oldest_first,
+        /* sort_by_relevance */ true,
+        limit,
+        offset,
+    )
+}
+
+pub fn list_articles_for_user_sorted(
+    conn: &Connection,
+    user_id: i64,
+    query: &ArticleQuery,
+    unread_only: bool,
+    search: Option<&str>,
+    oldest_first: bool,
+    sort_by_relevance: bool,
+    limit: i64,
+    offset: i64,
+) -> AppResult<Vec<ArticleSummary>> {
     let (join_sql, join_bind) = state_join(user_id);
     let (mut where_clauses, mut binds) = article_filter_for_user(query, unread_only);
 
-    let searching = search.map(|s| !s.trim().is_empty()).unwrap_or(false);
+    let raw_search = search.map(|s| s.trim()).filter(|s| !s.is_empty());
+    let compiled = raw_search.map(|s| {
+        crate::wordcloud_dict::process_dict().with_dict(|dict| {
+            crate::search::compile_search_with_dict(
+                s,
+                crate::search::SearchMode::Strict,
+                Some(dict),
+            )
+        })
+    });
+    let match_nothing = raw_search.is_some()
+        && compiled.as_ref().is_some_and(|c| c.is_empty());
+    let has_fts = compiled
+        .as_ref()
+        .and_then(|c| c.match_expr.as_ref())
+        .is_some();
+    let has_feed = compiled
+        .as_ref()
+        .is_some_and(|c| !c.feed_prefixes.is_empty());
+
     let mut sql = format!(
         "SELECT a.id, a.feed_id, f.title, f.source_type, a.title, a.author,
                 substr(a.body_text,1,{snippet_len}), a.image_url, a.url, a.published_at,
@@ -135,18 +231,28 @@ pub fn list_articles_for_user(
     );
     // join bind must come first (user_id in JOIN).
     let mut all_binds = vec![join_bind];
-    if searching {
+    let rank_first = has_fts && sort_by_relevance;
+    if has_fts {
+        let expr = compiled.as_ref().unwrap().match_expr.clone().unwrap();
         sql.push_str("JOIN articles_fts fts ON fts.rowid = a.id ");
         where_clauses.push("articles_fts MATCH ?".into());
-        binds.push(Value::Text(fts_query(search.unwrap())));
+        binds.push(Value::Text(expr));
+    }
+    if has_feed {
+        for name in &compiled.as_ref().unwrap().feed_prefixes {
+            where_clauses.push("unicode_lower(f.title) LIKE ?".into());
+            binds.push(Value::Text(format!("{}%", name.to_lowercase())));
+        }
+    }
+    if match_nothing {
+        where_clauses.push("1=0".into());
     }
     sql.push_str("WHERE ");
     sql.push_str(&where_clauses.join(" AND "));
-    // Search filters via FTS MATCH; ORDER BY still follows the browse sort
-    // toggle (same as `db::list_articles`). Do not rank by `fts.rank` here —
-    // that ignored `oldest_first` and broke newest-first under search.
+    // Active search defaults to FTS relevance; browse stays chronological
+    // (same as `db::list_articles_sorted`).
     sql.push_str(" ORDER BY ");
-    sql.push_str(article_order(oldest_first));
+    sql.push_str(&article_order(oldest_first, rank_first));
     sql.push(' ');
     sql.push_str("LIMIT ? OFFSET ?");
     binds.push(Value::Integer(limit));
@@ -195,7 +301,7 @@ pub fn article_index_for_user(
              FROM articles a JOIN feeds f ON f.id = a.feed_id {join_sql}
              WHERE {where_sql}
          ) WHERE aid = ?",
-        order = article_order(oldest_first),
+        order = article_order(oldest_first, false),
         join_sql = join_sql,
         where_sql = where_clauses.join(" AND "),
     );

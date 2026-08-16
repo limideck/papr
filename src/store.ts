@@ -139,6 +139,8 @@ interface UiState {
   unreadOnly: boolean;
   /** Sort the list oldest-first instead of newest-first. */
   sortOldest: boolean;
+  /** When a list search is active, prefer FTS relevance over date. */
+  sortByRelevance: boolean;
   /** Offset of the first page the middle-pane list loads — its paging anchor.
    *  Normally 0 (newest first). Opening an article from search that lives far
    *  down the list jumps the anchor to that article's page so the list loads
@@ -288,6 +290,7 @@ export const useUi = create<UiState>((set, get) => ({
   selectedArticleId: null,
   unreadOnly: false,
   sortOldest: false,
+  sortByRelevance: true,
   listAnchor: 0,
   listSearch: null,
 
@@ -312,9 +315,9 @@ export const useUi = create<UiState>((set, get) => ({
   ),
   readerWidth: ls.num("readerWidth", 680, READER_BOUNDS.width.min, READER_BOUNDS.width.max),
 
-  sidebarWidth: ls.num("sidebarWidth", 248, PANEL_BOUNDS.sidebar.min, PANEL_BOUNDS.sidebar.max),
-  listWidth: ls.num("listWidth", 388, PANEL_BOUNDS.list.min, PANEL_BOUNDS.list.max),
-  aiWidth: ls.num("aiWidth", 360, PANEL_BOUNDS.ai.min, PANEL_BOUNDS.ai.max),
+  sidebarWidth: ls.num("sidebarWidth", 220, PANEL_BOUNDS.sidebar.min, PANEL_BOUNDS.sidebar.max),
+  listWidth: ls.num("listWidth", 320, PANEL_BOUNDS.list.min, PANEL_BOUNDS.list.max),
+  aiWidth: ls.num("aiWidth", 300, PANEL_BOUNDS.ai.min, PANEL_BOUNDS.ai.max),
 
   prefs: loadPrefs(),
 
@@ -340,9 +343,28 @@ export const useUi = create<UiState>((set, get) => ({
   openArticle: (id) => set({ selectedArticleId: id }),
   // Toggling a filter/sort rebuilds the list, so re-anchor to the newest page.
   toggleUnreadOnly: () => set((s) => ({ unreadOnly: !s.unreadOnly, listAnchor: 0 })),
-  toggleSort: () => set((s) => ({ sortOldest: !s.sortOldest, listAnchor: 0 })),
+  toggleSort: () =>
+    set((s) => {
+      // Browse: newest ↔ oldest. Search: relevance → newest → oldest → relevance.
+      if (s.listSearch) {
+        if (s.sortByRelevance) {
+          return { sortByRelevance: false, sortOldest: false, listAnchor: 0 };
+        }
+        if (!s.sortOldest) {
+          return { sortOldest: true, listAnchor: 0 };
+        }
+        return { sortByRelevance: true, sortOldest: false, listAnchor: 0 };
+      }
+      return { sortOldest: !s.sortOldest, listAnchor: 0 };
+    }),
   setListAnchor: (listAnchor) => set({ listAnchor }),
-  setListSearch: (listSearch) => set({ listSearch, listAnchor: 0 }),
+  setListSearch: (listSearch) =>
+    set({
+      listSearch,
+      listAnchor: 0,
+      // New search defaults to relevance ranking.
+      sortByRelevance: true,
+    }),
 
   setPalette: (palette) => { ls.set("palette", palette); mirrorAppearance(palette, get().mode); set({ palette }); },
   setMode: (mode) => { ls.set("mode", mode); mirrorAppearance(get().palette, mode); set({ mode }); },

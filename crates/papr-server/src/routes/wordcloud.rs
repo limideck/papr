@@ -79,7 +79,7 @@ pub async fn get_stopwords(
     })))
 }
 
-/// Read-only entity gazetteer from the shared dashboard config.
+/// Entity gazetteer (admin). Source may be shared seed, local COW, or explicit dir.
 pub async fn get_entities(
     State(state): State<AppState>,
     user: AuthUser,
@@ -93,9 +93,120 @@ pub async fn get_entities(
             .with_dict(|dict| wordcloud::sync_dict_file_version(&conn, dict));
     }
     let doc = state.wordcloud.snapshot_entities();
+    let meta = state.wordcloud.entities_meta();
     Ok(Json(json!({
         "version": doc.version,
         "entities": doc.entities,
+        "source": meta.source,
+        "path": meta.path,
+        "writable": meta.writable,
+        "seedDir": meta.seed_dir,
+        "cowDir": meta.cow_dir,
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PatchEntityBody {
+    pub canonical: Option<String>,
+    pub aliases: Option<Vec<String>>,
+}
+
+/// `PATCH /api/wordcloud/entities/{id}` — update canonical (and optional aliases).
+///
+/// First edit against the shared seed copies entities into the papr COW dir.
+/// Bumps the entities file version so term-index backfill picks up new display names.
+pub async fn patch_entity(
+    State(state): State<AppState>,
+    user: AuthUser,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(body): Json<PatchEntityBody>,
+) -> ApiResult<Json<Value>> {
+    user.require_admin()?;
+    if body.canonical.is_none() && body.aliases.is_none() {
+        return Err(ApiError::bad_request("emptyPatch"));
+    }
+    let (ent, meta) = state
+        .wordcloud
+        .update_entity(
+            &id,
+            body.canonical.as_deref(),
+            body.aliases,
+        )
+        .map_err(ApiError::from)?;
+    let doc = state.wordcloud.snapshot_entities();
+    let bumped = {
+        let conn = state.db.lock().await;
+        state
+            .wordcloud
+            .with_dict(|dict| wordcloud::sync_dict_file_version(&conn, dict))
+            .map_err(ApiError::from)?
+    };
+    Ok(Json(json!({
+        "ok": true,
+        "entity": ent,
+        "version": doc.version,
+        "source": meta.source,
+        "path": meta.path,
+        "writable": meta.writable,
+        "seedDir": meta.seed_dir,
+        "cowDir": meta.cow_dir,
+        "dictVersion": bumped.0,
+        "dictBumped": bumped.1,
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateEntityBody {
+    /// Optional stable id (`group.slug`). Auto-generated when omitted.
+    pub id: Option<String>,
+    pub canonical: String,
+    pub group: Option<String>,
+    pub aliases: Option<Vec<String>>,
+}
+
+/// `POST /api/wordcloud/entities` — create / promote a residual cloud term to an entity.
+///
+/// Use when a lowercase token like `ai` appears in the cloud but is not in the
+/// gazetteer: create canonical `AI` (aliases optional; lowercase form is kept
+/// automatically when casing differs). Cloud aggregation remaps stored
+/// surfaces through the live gazetteer immediately; run term-index backfill
+/// to rewrite `article_terms` for durable storage.
+pub async fn create_entity(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Json(body): Json<CreateEntityBody>,
+) -> ApiResult<Json<Value>> {
+    user.require_admin()?;
+    let (ent, meta) = state
+        .wordcloud
+        .create_entity(
+            body.id.as_deref(),
+            &body.canonical,
+            body.group.as_deref(),
+            body.aliases,
+        )
+        .map_err(ApiError::from)?;
+    let doc = state.wordcloud.snapshot_entities();
+    let bumped = {
+        let conn = state.db.lock().await;
+        state
+            .wordcloud
+            .with_dict(|dict| wordcloud::sync_dict_file_version(&conn, dict))
+            .map_err(ApiError::from)?
+    };
+    Ok(Json(json!({
+        "ok": true,
+        "entity": ent,
+        "version": doc.version,
+        "source": meta.source,
+        "path": meta.path,
+        "writable": meta.writable,
+        "seedDir": meta.seed_dir,
+        "cowDir": meta.cow_dir,
+        "dictVersion": bumped.0,
+        "dictBumped": bumped.1,
     })))
 }
 

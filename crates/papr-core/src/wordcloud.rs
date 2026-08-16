@@ -5,8 +5,11 @@
 //! rewritten in Rust, not linked to Go.
 //!
 //! Hot path: terms are tokenized once at ingest into `article_terms`, then the
-//! API aggregates with SQL over a calendar-day window. Mid-migration / empty
-//! windows fall back to the legacy scan+tokenize path.
+//! API aggregates with SQL over a calendar-day window. When a gazetteer is
+//! present, stored surfaces are remapped to the current canonical at query
+//! time (so promoting `ai` → `AI` updates the cloud without waiting for
+//! backfill). Mid-migration / empty windows fall back to the legacy
+//! scan+tokenize path.
 
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, TimeZone};
 use regex::Regex;
@@ -767,7 +770,8 @@ pub fn build_for_range(
 
 /// Like [`build_for_range`], applying a shared stopwords/entities dictionary.
 ///
-/// Prefers SQL aggregation over `article_terms`. Falls back to the legacy
+/// Prefers SQL aggregation over `article_terms`, remapping residual surfaces
+/// through the gazetteer when `dict` is set. Falls back to the legacy
 /// scan+tokenize path when the window has articles but no indexed terms yet
 /// (mid-migration / empty backfill).
 pub fn build_for_range_with(
@@ -777,7 +781,7 @@ pub fn build_for_range_with(
     dict: Option<&WordCloudDict>,
 ) -> AppResult<CloudResult> {
     let top_n = clamp_top_n(top_n);
-    if let Some(cloud) = try_build_from_terms(conn, range, top_n)? {
+    if let Some(cloud) = try_build_from_terms(conn, range, top_n, dict)? {
         return Ok(cloud);
     }
     build_for_range_scan(conn, range, top_n, dict)
@@ -812,6 +816,7 @@ fn try_build_from_terms(
     conn: &Connection,
     range: &Range,
     top_n: usize,
+    dict: Option<&WordCloudDict>,
 ) -> AppResult<Option<CloudResult>> {
     // Table may be empty mid-migration — detect coverage for this window.
     let terms_articles: i64 = conn.query_row(
@@ -832,29 +837,59 @@ fn try_build_from_terms(
         }));
     }
 
+    // No LIMIT here: remapping aliases → canonical can merge rows that would
+    // otherwise fall outside a pre-limit top-N (e.g. residual `ai` + entity `AI`).
     let mut stmt = conn.prepare(
         "SELECT term, group_key, CAST(ROUND(SUM(weight)) AS INTEGER) AS cnt
          FROM article_terms
          WHERE day >= ?1 AND day <= ?2
-         GROUP BY term, group_key
-         ORDER BY cnt DESC, term ASC
-         LIMIT ?3",
+         GROUP BY term, group_key",
     )?;
-    let rows = stmt.query_map(params![range.from, range.to, top_n as i64], |r| {
-        Ok(Term {
-            term: r.get(0)?,
-            group: r.get(1)?,
-            count: r.get(2)?,
-        })
+    let rows = stmt.query_map(params![range.from, range.to], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
     })?;
-    let mut terms = Vec::new();
+
+    let mut freq: HashMap<String, Freq> = HashMap::new();
     for row in rows {
-        terms.push(row?);
+        let (raw_term, raw_group, cnt) = row?;
+        if cnt <= 0 || raw_term.is_empty() {
+            continue;
+        }
+        let (term, group) = resolve_stored_term(&raw_term, &raw_group, dict);
+        let key = format!("{group}|{term}");
+        let entry = freq.entry(key).or_default();
+        entry.count = entry.count.saturating_add(cnt);
+        entry.group = EntityGroup::parse_loose(&group);
+        entry.text = term;
     }
+
     Ok(Some(CloudResult {
-        terms,
+        terms: finish_freq(freq, top_n),
         scanned: terms_articles.min(MAX_SCAN_ROWS),
     }))
+}
+
+/// Map a stored `article_terms` surface through the live gazetteer.
+///
+/// Residual tokens (`ai`) and stale canonicals (`Ai`) resolve to the entity's
+/// current display spelling (`AI`) and group so the cloud updates on entity
+/// create/edit without waiting for term-index backfill.
+fn resolve_stored_term(
+    term: &str,
+    group: &str,
+    dict: Option<&WordCloudDict>,
+) -> (String, String) {
+    let Some(dict) = dict else {
+        return (term.to_string(), group.to_string());
+    };
+    let Some(syn) = dict.lookup_synonym_group(term) else {
+        return (term.to_string(), group.to_string());
+    };
+    let group = dict
+        .entity(&syn.id)
+        .map(|e| e.group.as_str().to_string())
+        .unwrap_or_else(|| group.to_string());
+    (syn.canonical, group)
 }
 
 fn count_articles_in_range(conn: &Connection, range: &Range) -> AppResult<i64> {
@@ -1121,6 +1156,59 @@ mod tests {
         assert!(
             cloud.terms.iter().any(|t| t.term == "bitcoin"),
             "terms={:?}",
+            cloud.terms
+        );
+    }
+
+    #[test]
+    fn query_time_remaps_residual_alias_to_canonical() {
+        use crate::wordcloud_dict::{EntitiesFile, WordCloudEntity};
+
+        let conn = migrate_memory();
+        conn.execute(
+            "INSERT INTO articles (id, title, summary, published_at, fetched_at)
+             VALUES (1, 'ai boom', 'more ai news', '2026-08-04T12:00:00Z', '2026-08-04T12:00:00Z')",
+            [],
+        )
+        .unwrap();
+        // Simulate pre-entity index: residual lowercase stored as-is.
+        replace_article_terms(
+            &conn,
+            1,
+            "2026-08-04",
+            &[ExtractedTerm {
+                term: "ai".into(),
+                group: "general".into(),
+                weight: 3.0,
+            }],
+            1,
+        )
+        .unwrap();
+
+        let mut dict = WordCloudDict::empty(std::env::temp_dir());
+        dict.apply_entities(EntitiesFile {
+            version: 1,
+            entities: vec![WordCloudEntity {
+                id: "general.ai".into(),
+                canonical: "AI".into(),
+                group: "general".into(),
+                aliases: vec!["ai".into(), "Ai".into()],
+            }],
+        });
+
+        let loc = FixedOffset::east_opt(0).unwrap();
+        let now = loc.with_ymd_and_hms(2026, 8, 4, 15, 0, 0).unwrap();
+        let range = resolve_range(1, "", "", now).unwrap();
+        let cloud = build_for_range_with(&conn, &range, DEFAULT_TOP_N, Some(&dict)).unwrap();
+        let ai = cloud
+            .terms
+            .iter()
+            .find(|t| t.term == "AI")
+            .expect("canonical AI after remap");
+        assert_eq!(ai.count, 3);
+        assert!(
+            !cloud.terms.iter().any(|t| t.term == "ai"),
+            "residual must not remain: {:?}",
             cloud.terms
         );
     }

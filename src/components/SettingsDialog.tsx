@@ -12,7 +12,7 @@ import { modKey, modCombo } from "../lib/platform";
 import { reportError } from "../toast";
 import { downloadFile } from "../lib/download";
 import { NO_AUTOCORRECT } from "../lib/inputProps";
-import type { Feed, Rule, RuleAction, RuleField, RulePreview, Tag } from "../types";
+import type { Feed, Rule, RuleAction, RuleField, RulePreview, Tag, TagAlias } from "../types";
 import { tagColor, TAG_PALETTE } from "../lib/tagColors";
 import Icon, { type IconName } from "./Icon";
 import ConfirmDialog from "./ConfirmDialog";
@@ -2403,11 +2403,15 @@ function UsersSection({ onToast }: { onToast: (m: string) => void }) {
 /* ── tag management: AI tags | interest tags (admin) ─────── */
 const TAG_LIST_PAGE_SIZE = 20;
 
-type TagSortMode = "alpha" | "count";
+type TagSortMode = "alpha" | "count" | "unread";
 type TagSortDir = "asc" | "desc";
 
 function defaultTagSortDir(mode: TagSortMode): TagSortDir {
-  return mode === "count" ? "desc" : "asc";
+  return mode === "alpha" ? "asc" : "desc";
+}
+
+function tagUnreadCount(tag: Tag): number {
+  return tag.unreadCount ?? 0;
 }
 
 function sortTagsList(
@@ -2423,9 +2427,19 @@ function sortTagsList(
         mul *
         a.name.localeCompare(b.name, undefined, { sensitivity: "base" }),
     );
-  } else {
+  } else if (mode === "count") {
     sorted.sort((a, b) => {
       const byCount = (a.articleCount - b.articleCount) * mul;
+      if (byCount !== 0) return byCount;
+      return a.name.localeCompare(b.name, undefined, {
+        sensitivity: "base",
+      });
+    });
+  } else {
+    sorted.sort((a, b) => {
+      const byUnread = (tagUnreadCount(a) - tagUnreadCount(b)) * mul;
+      if (byUnread !== 0) return byUnread;
+      const byCount = b.articleCount - a.articleCount;
       if (byCount !== 0) return byCount;
       return a.name.localeCompare(b.name, undefined, {
         sensitivity: "base",
@@ -2545,7 +2559,7 @@ function StatsSection() {
 function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
   const { t } = useTranslation();
   const qc = useQueryClient();
-  const [tab, setTab] = useState<"ai" | "interest">("ai");
+  const [tab, setTab] = useState<"ai" | "interest" | "aliases">("ai");
   const [interestEnabled, setInterestEnabled] = useState(false);
   const [aiEnabled, setAiEnabled] = useState(false);
   const [interestMax, setInterestMax] = useState(5);
@@ -2567,10 +2581,20 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
   const [tagSort, setTagSort] = useState<{
     mode: TagSortMode;
     dir: TagSortDir;
-  }>({ mode: "count", dir: "desc" });
+  }>({ mode: "unread", dir: "desc" });
   const [page, setPage] = useState(0);
+  const [aliasTagId, setAliasTagId] = useState<number | "">("");
+  const [aliasDraft, setAliasDraft] = useState("");
+  const [aliasFilter, setAliasFilter] = useState("");
+  const [confirmDeleteAlias, setConfirmDeleteAlias] = useState<TagAlias | null>(
+    null,
+  );
 
   const tags = useQuery({ queryKey: ["tags"], queryFn: () => api.listTags() });
+  const aliases = useQuery({
+    queryKey: ["tag-aliases", "interest"],
+    queryFn: () => api.listTagAliases({ kind: "interest" }),
+  });
   const status = useQuery({
     queryKey: ["auto-tag-status", backfillDays],
     queryFn: () => api.getAutoTagStatus(backfillDays),
@@ -2601,6 +2625,10 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
 
   const refreshTags = () => {
     void qc.invalidateQueries({ queryKey: ["tags"] });
+  };
+
+  const refreshAliases = () => {
+    void qc.invalidateQueries({ queryKey: ["tag-aliases"] });
   };
 
   const saveSetting = (key: string, value: string) => {
@@ -2637,6 +2665,7 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
           .renameTag(tag.id, v)
           .then(() => {
             refreshTags();
+            refreshAliases();
             onToast(
               tag.kind === "ai"
                 ? t("settings.autoTag.aiTagRenamed")
@@ -2658,6 +2687,7 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
     try {
       await api.deleteTag(tag.id);
       refreshTags();
+      refreshAliases();
       onToast(
         tag.kind === "ai"
           ? t("settings.autoTag.aiTagDeleted")
@@ -2667,6 +2697,31 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
       reportError(e);
     } finally {
       setConfirmDelete(null);
+    }
+  };
+
+  const addAlias = async () => {
+    const alias = aliasDraft.trim();
+    if (aliasTagId === "" || !alias) return;
+    try {
+      await api.createTagAlias(aliasTagId, alias);
+      setAliasDraft("");
+      refreshAliases();
+      onToast(t("settings.autoTag.aliasCreated"));
+    } catch (e) {
+      reportError(e);
+    }
+  };
+
+  const removeAlias = async (row: TagAlias) => {
+    try {
+      await api.deleteTagAlias(row.id);
+      refreshAliases();
+      onToast(t("settings.autoTag.aliasDeleted"));
+    } catch (e) {
+      reportError(e);
+    } finally {
+      setConfirmDeleteAlias(null);
     }
   };
 
@@ -2728,7 +2783,7 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
     setPage(0);
   };
 
-  const switchTab = (next: "ai" | "interest") => {
+  const switchTab = (next: "ai" | "interest" | "aliases") => {
     setTab(next);
     setPage(0);
   };
@@ -2753,11 +2808,28 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
     (safePage + 1) * TAG_LIST_PAGE_SIZE,
   );
 
+  const aliasRows = aliases.data ?? [];
+  const aliasFilterNorm = aliasFilter.trim().toLowerCase();
+  const filteredAliases = aliasFilterNorm
+    ? aliasRows.filter(
+        (a) =>
+          a.alias.toLowerCase().includes(aliasFilterNorm) ||
+          a.tagName.toLowerCase().includes(aliasFilterNorm),
+      )
+    : aliasRows;
+
   // After delete (or other list shrinks), pull back if the current page
   // would be empty past the last page.
   useEffect(() => {
     if (page !== safePage) setPage(safePage);
   }, [page, safePage]);
+
+  // Prefer a valid interest tag once the vocabulary loads.
+  useEffect(() => {
+    if (aliasTagId !== "") return;
+    const first = interestList[0];
+    if (first) setAliasTagId(first.id);
+  }, [aliasTagId, interestList]);
 
   const renderTagRows = (emptyKey: string, allowCreate: boolean) => (
     <div className="settings-group">
@@ -2813,6 +2885,19 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
                 {t("settings.autoTag.sortCount")}{" "}
                 {tagSort.mode === "count" && tagSort.dir === "asc" ? "↑" : "↓"}
               </button>
+              <span className="s-tag-sort-sep" aria-hidden="true">
+                ·
+              </span>
+              <button
+                type="button"
+                className={tagSort.mode === "unread" ? "active" : ""}
+                onClick={() => setTagSortMode("unread")}
+                aria-pressed={tagSort.mode === "unread"}
+                title={t("settings.autoTag.sortUpdatesHint")}
+              >
+                {t("settings.autoTag.sortUpdates")}{" "}
+                {tagSort.mode === "unread" && tagSort.dir === "asc" ? "↑" : "↓"}
+              </button>
             </span>
           )}
           {/* Always visible on AI tab — never gate on client empty count. */}
@@ -2852,8 +2937,9 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
                 />
                 <span className="s-interest-tag-name">{tag.name}</span>
                 <span className="s-interest-tag-count">
-                  {t("settings.autoTag.articleCount", {
-                    count: tag.articleCount,
+                  {t("settings.autoTag.articleCountWithUnread", {
+                    total: tag.articleCount,
+                    unread: tagUnreadCount(tag),
                   })}
                 </span>
                 <div className="s-interest-tag-swatches" role="group">
@@ -2930,6 +3016,103 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
     </div>
   );
 
+  const renderAliases = () => (
+    <div className="settings-group">
+      <h3 className="settings-group-title" style={{ margin: 0 }}>
+        {t("settings.autoTag.aliases")}
+      </h3>
+      <p className="settings-group-desc" style={{ margin: "4px 0 12px" }}>
+        {t("settings.autoTag.aliasesDesc")}
+      </p>
+      {interestList.length === 0 ? (
+        <p className="settings-group-desc">
+          {t("settings.autoTag.aliasesNeedTags")}
+        </p>
+      ) : (
+        <>
+          <div className="s-alias-form">
+            <label className="s-alias-field">
+              <span>{t("settings.autoTag.aliasCanonical")}</span>
+              <select
+                className="s-text-input"
+                value={aliasTagId === "" ? "" : String(aliasTagId)}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  setAliasTagId(v ? Number(v) : "");
+                }}
+              >
+                {interestList.map((tg) => (
+                  <option key={tg.id} value={tg.id}>
+                    {tg.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="s-alias-field s-alias-field-grow">
+              <span>{t("settings.autoTag.aliasName")}</span>
+              <input
+                className="s-text-input"
+                value={aliasDraft}
+                placeholder={t("settings.autoTag.aliasPlaceholder")}
+                onChange={(e) => setAliasDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    void addAlias();
+                  }
+                }}
+                {...NO_AUTOCORRECT}
+              />
+            </label>
+            <button
+              className="s-btn primary"
+              type="button"
+              disabled={aliasTagId === "" || !aliasDraft.trim()}
+              onClick={() => void addAlias()}
+            >
+              <Icon name="plus" size={12} /> {t("common.add")}
+            </button>
+          </div>
+          {aliasRows.length > 0 && (
+            <input
+              className="s-text-input s-alias-filter"
+              value={aliasFilter}
+              placeholder={t("settings.autoTag.aliasFilter")}
+              onChange={(e) => setAliasFilter(e.target.value)}
+              {...NO_AUTOCORRECT}
+            />
+          )}
+          {filteredAliases.length === 0 ? (
+            <p className="settings-group-desc">
+              {aliasRows.length === 0
+                ? t("settings.autoTag.aliasesEmpty")
+                : t("settings.autoTag.aliasesFilterEmpty")}
+            </p>
+          ) : (
+            <div className="s-interest-tags">
+              {filteredAliases.map((row) => (
+                <div key={row.id} className="s-interest-tag-row">
+                  <span className="s-interest-tag-name">{row.alias}</span>
+                  <span className="s-interest-tag-count">
+                    → {row.tagName}
+                  </span>
+                  <button
+                    className="icon-btn"
+                    type="button"
+                    title={t("common.delete")}
+                    onClick={() => setConfirmDeleteAlias(row)}
+                  >
+                    <Icon name="trash" size={13} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+
   return (
     <>
       <div className="s-tag-mgmt-tabs" role="tablist">
@@ -2950,6 +3133,15 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
           onClick={() => switchTab("interest")}
         >
           {t("settings.autoTag.tabInterest")}
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === "aliases"}
+          className={tab === "aliases" ? "on" : ""}
+          onClick={() => switchTab("aliases")}
+        >
+          {t("settings.autoTag.tabAliases")}
         </button>
       </div>
 
@@ -2989,7 +3181,7 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
             </Row>
           </div>
         </>
-      ) : (
+      ) : tab === "interest" ? (
         <>
           {renderTagRows("settings.autoTag.vocabularyEmpty", true)}
           <div className="settings-group">
@@ -3025,6 +3217,8 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
             </Row>
           </div>
         </>
+      ) : (
+        renderAliases()
       )}
 
       <div className="settings-group">
@@ -3178,6 +3372,19 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
           danger
           onConfirm={() => void removeTag(confirmDelete)}
           onClose={() => setConfirmDelete(null)}
+        />
+      )}
+      {confirmDeleteAlias && (
+        <ConfirmDialog
+          title={t("settings.autoTag.deleteAlias")}
+          message={t("settings.autoTag.deleteAliasConfirm", {
+            alias: confirmDeleteAlias.alias,
+            tag: confirmDeleteAlias.tagName,
+          })}
+          confirmLabel={t("common.delete")}
+          danger
+          onConfirm={() => void removeAlias(confirmDeleteAlias)}
+          onClose={() => setConfirmDeleteAlias(null)}
         />
       )}
       {confirmCleanupEmpty && (

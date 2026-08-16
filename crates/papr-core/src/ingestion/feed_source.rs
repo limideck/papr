@@ -255,6 +255,18 @@ pub fn insert_feed_source(conn: &Connection, base_url: &str) -> AppResult<i64> {
         return Err(AppError::code("invalidIndexUrl"));
     }
     let base = normalize_index_url(base_url);
+    // Catch duplicates before create_folder so we never leave a stray folder
+    // when the UNIQUE(base_url) insert would fail.
+    let existing: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM feed_sources WHERE base_url = ?1",
+            params![base],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if existing.is_some() {
+        return Err(AppError::code("indexUrlExists"));
+    }
     let folder_name = folder_name_from_index_url(&base);
     let folder_id = db::create_folder(conn, &folder_name)?;
     conn.execute(
@@ -685,5 +697,35 @@ mod tests {
             folder_name_from_index_url("https://ex.com/"),
             "Ex.com"
         );
+    }
+
+    #[test]
+    fn insert_feed_source_rejects_duplicate_base_url() {
+        let path = std::env::temp_dir().join(format!(
+            "papr-feed-source-dup-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let conn = crate::db::open(&path).unwrap();
+        let url = "https://bryan.yzcw.dpdns.org/theinformation/";
+        let id = insert_feed_source(&conn, url).unwrap();
+        assert!(id > 0);
+        // Trailing-slash variants normalize to the same key.
+        let err = insert_feed_source(&conn, "https://bryan.yzcw.dpdns.org/theinformation")
+            .unwrap_err();
+        assert!(
+            matches!(err, AppError::Coded("indexUrlExists")),
+            "got {err:?}"
+        );
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM feed_sources", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
     }
 }

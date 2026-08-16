@@ -1,0 +1,2562 @@
+{
+  "version": 4,
+  "entities": [
+    {
+      "id": "country.us",
+      "canonical": "United States",
+      "group": "country",
+      "aliases": [
+        "us",
+        "usa",
+        "u.s.",
+        "u.s.a.",
+        "america",
+        "american",
+        "united states",
+        "united states of america",
+        "美国",
+        "美方"
+      ]
+    },
+    {
+      "id": "country.iran",
+      "canonical": "Iran",
+      "group": "country",
+      "aliases": [
+        "iran",
+        "iranian",
+        "islamic republic of iran",
+        "伊朗",
+        "伊朗伊斯兰共和国"
+      ]
+    },
+    {
+      "id": "country.cuba",
+      "canonical": "Cuba",
+      "group": "country",
+      "aliases": [
+        "cuba",
+        "cuban",
+        "古巴"
+      ]
+    },
+    {
+      "id": "country.israel",
+      "canonical": "Israel",
+      "group": "country",
+      "aliases": [
+        "israel",
+        "israeli",
+        "以色列"
+      ]
+    },
+    {
+      "id": "country.palestine",
+      "canonical": "Palestine",
+      "group": "country",
+      "aliases": [
+        "palestine",
+        "palestinian",
+        "巴勒斯坦"
+      ]
+    },
+    {
+      "id": "country.ukraine",
+      "canonical": "Ukraine",
+      "group": "country",
+      "aliases": [
+        "ukraine",
+        "ukrainian",
+        "乌克兰"
+      ]
+    },
+    {
+      "id": "country.russia",
+      "canonical": "Russia",
+      "group": "country",
+      "aliases": [
+        "russia",
+        "russian",
+        "russian federation",
+        "俄罗斯",
+        "俄方"
+      ]
+    },
+    {
+      "id": "country.china",
+      "canonical": "China",
+      "group": "country",
+      "aliases": [
+        "china",
+        "chinese",
+        "prc",
+        "people's republic of china",
+        "中国",
+        "中方"
+      ]
+    },
+    {
+      "id": "country.north_korea",
+      "canonical": "North Korea",
+      "group": "country",
+      "aliases": [
+        "north korea",
+        "dprk",
+        "north korean",
+        "朝鲜",
+        "北朝鲜"
+      ]
+    },
+    {
+      "id": "country.south_korea",
+      "canonical": "South Korea",
+      "group": "country",
+      "aliases": [
+        "south korea",
+        "rok",
+        "south korean",
+        "韩国",
+        "南韩"
+      ]
+    },
+    {
+      "id": "country.japan",
+      "canonical": "Japan",
+      "group": "country",
+      "aliases": [
+        "japan",
+        "japanese",
+        "日本"
+      ]
+    },
+    {
+      "id": "country.syria",
+      "canonical": "Syria",
+      "group": "country",
+      "aliases": [
+        "syria",
+        "syrian",
+        "叙利亚"
+      ]
+    },
+    {
+      "id": "country.lebanon",
+      "canonical": "Lebanon",
+      "group": "country",
+      "aliases": [
+        "lebanon",
+        "lebanese",
+        "黎巴嫩"
+      ]
+    },
+    {
+      "id": "country.yemen",
+      "canonical": "Yemen",
+      "group": "country",
+      "aliases": [
+        "yemen",
+        "yemeni",
+        "也门"
+      ]
+    },
+    {
+      "id": "country.iraq",
+      "canonical": "Iraq",
+      "group": "country",
+      "aliases": [
+        "iraq",
+        "iraqi",
+        "伊拉克"
+      ]
+    },
+    {
+      "id": "country.saudi",
+      "canonical": "Saudi Arabia",
+      "group": "country",
+      "aliases": [
+        "saudi",
+        "saudi arabia",
+        "ksa",
+        "沙特",
+        "沙特阿拉伯"
+      ]
+    },
+    {
+      "id": "country.egypt",
+      "canonical": "Egypt",
+      "group": "country",
+      "aliases": [
+        "egypt",
+        "egyptian",
+        "埃及"
+      ]
+    },
+    {
+      "id": "country.turkey",
+      "canonical": "Turkey",
+      "group": "country",
+      "aliases": [
+        "turkey",
+        "turkish",
+        "turkiye",
+        "türkiye",
+        "土耳其"
+      ]
+    },
+    {
+      "id": "country.india",
+      "canonical": "India",
+      "group": "country",
+      "aliases": [
+        "india",
+        "indian",
+        "印度"
+      ]
+    },
+    {
+      "id": "country.pakistan",
+      "canonical": "Pakistan",
+      "group": "country",
+      "aliases": [
+        "pakistan",
+        "pakistani",
+        "巴基斯坦"
+      ]
+    },
+    {
+      "id": "country.taiwan",
+      "canonical": "Taiwan",
+      "group": "country",
+      "aliases": [
+        "taiwan",
+        "taiwanese",
+        "roc",
+        "台湾",
+        "台灣"
+      ]
+    },
+    {
+      "id": "country.afghanistan",
+      "canonical": "Afghanistan",
+      "group": "country",
+      "aliases": [
+        "afghanistan",
+        "afghan",
+        "阿富汗"
+      ]
+    },
+    {
+      "id": "country.vietnam",
+      "canonical": "Vietnam",
+      "group": "country",
+      "aliases": [
+        "vietnam",
+        "vietnamese",
+        "越南"
+      ]
+    },
+    {
+      "id": "country.germany",
+      "canonical": "Germany",
+      "group": "country",
+      "aliases": [
+        "germany",
+        "german",
+        "德国",
+        "德國"
+      ]
+    },
+    {
+      "id": "country.france",
+      "canonical": "France",
+      "group": "country",
+      "aliases": [
+        "france",
+        "french",
+        "法国",
+        "法國"
+      ]
+    },
+    {
+      "id": "country.uk",
+      "canonical": "United Kingdom",
+      "group": "country",
+      "aliases": [
+        "uk",
+        "u.k.",
+        "britain",
+        "british",
+        "united kingdom",
+        "england",
+        "英国",
+        "英國"
+      ]
+    },
+    {
+      "id": "country.uae",
+      "canonical": "United Arab Emirates",
+      "group": "country",
+      "aliases": [
+        "uae",
+        "u.a.e.",
+        "emirates",
+        "united arab emirates",
+        "阿联酋",
+        "阿聯酋"
+      ]
+    },
+    {
+      "id": "country.qatar",
+      "canonical": "Qatar",
+      "group": "country",
+      "aliases": [
+        "qatar",
+        "qatari",
+        "卡塔尔",
+        "卡達"
+      ]
+    },
+    {
+      "id": "country.jordan",
+      "canonical": "Jordan",
+      "group": "country",
+      "aliases": [
+        "jordan",
+        "jordanian",
+        "约旦",
+        "約旦"
+      ]
+    },
+    {
+      "id": "country.sudan",
+      "canonical": "Sudan",
+      "group": "country",
+      "aliases": [
+        "sudan",
+        "sudanese",
+        "苏丹",
+        "蘇丹"
+      ]
+    },
+    {
+      "id": "country.libya",
+      "canonical": "Libya",
+      "group": "country",
+      "aliases": [
+        "libya",
+        "libyan",
+        "利比亚",
+        "利比亞"
+      ]
+    },
+    {
+      "id": "country.somalia",
+      "canonical": "Somalia",
+      "group": "country",
+      "aliases": [
+        "somalia",
+        "somali",
+        "索马里",
+        "索馬里"
+      ]
+    },
+    {
+      "id": "country.ethiopia",
+      "canonical": "Ethiopia",
+      "group": "country",
+      "aliases": [
+        "ethiopia",
+        "ethiopian",
+        "埃塞俄比亚"
+      ]
+    },
+    {
+      "id": "country.myanmar",
+      "canonical": "Myanmar",
+      "group": "country",
+      "aliases": [
+        "myanmar",
+        "burma",
+        "缅甸",
+        "緬甸"
+      ]
+    },
+    {
+      "id": "country.philippines",
+      "canonical": "Philippines",
+      "group": "country",
+      "aliases": [
+        "philippines",
+        "filipino",
+        "菲律宾",
+        "菲律賓"
+      ]
+    },
+    {
+      "id": "country.australia",
+      "canonical": "Australia",
+      "group": "country",
+      "aliases": [
+        "australia",
+        "australian",
+        "澳大利亚",
+        "澳洲"
+      ]
+    },
+    {
+      "id": "country.canada",
+      "canonical": "Canada",
+      "group": "country",
+      "aliases": [
+        "canada",
+        "canadian",
+        "加拿大"
+      ]
+    },
+    {
+      "id": "country.brazil",
+      "canonical": "Brazil",
+      "group": "country",
+      "aliases": [
+        "brazil",
+        "brazilian",
+        "巴西"
+      ]
+    },
+    {
+      "id": "country.mexico",
+      "canonical": "Mexico",
+      "group": "country",
+      "aliases": [
+        "mexico",
+        "mexican",
+        "墨西哥"
+      ]
+    },
+    {
+      "id": "country.poland",
+      "canonical": "Poland",
+      "group": "country",
+      "aliases": [
+        "poland",
+        "polish",
+        "波兰",
+        "波蘭"
+      ]
+    },
+    {
+      "id": "country.belarus",
+      "canonical": "Belarus",
+      "group": "country",
+      "aliases": [
+        "belarus",
+        "belarusian",
+        "白俄罗斯",
+        "白俄羅斯"
+      ]
+    },
+    {
+      "id": "country.georgia",
+      "canonical": "Georgia",
+      "group": "country",
+      "aliases": [
+        "georgia",
+        "georgian",
+        "格鲁吉亚",
+        "格魯吉亞"
+      ]
+    },
+    {
+      "id": "country.armenia",
+      "canonical": "Armenia",
+      "group": "country",
+      "aliases": [
+        "armenia",
+        "armenian",
+        "亚美尼亚",
+        "亞美尼亞"
+      ]
+    },
+    {
+      "id": "country.azerbaijan",
+      "canonical": "Azerbaijan",
+      "group": "country",
+      "aliases": [
+        "azerbaijan",
+        "azerbaijani",
+        "阿塞拜疆"
+      ]
+    },
+    {
+      "id": "country.kazakhstan",
+      "canonical": "Kazakhstan",
+      "group": "country",
+      "aliases": [
+        "kazakhstan",
+        "kazakh",
+        "哈萨克斯坦",
+        "哈薩克斯坦"
+      ]
+    },
+    {
+      "id": "org.nato",
+      "canonical": "NATO",
+      "group": "org",
+      "aliases": [
+        "nato",
+        "north atlantic treaty organization",
+        "北约",
+        "北大西洋公约组织"
+      ]
+    },
+    {
+      "id": "org.eu",
+      "canonical": "European Union",
+      "group": "org",
+      "aliases": [
+        "eu",
+        "european union",
+        "欧盟",
+        "歐洲聯盟"
+      ]
+    },
+    {
+      "id": "org.un",
+      "canonical": "United Nations",
+      "group": "org",
+      "aliases": [
+        "un",
+        "united nations",
+        "联合国",
+        "聯合國"
+      ]
+    },
+    {
+      "id": "org.asean",
+      "canonical": "ASEAN",
+      "group": "org",
+      "aliases": [
+        "asean",
+        "association of southeast asian nations",
+        "东盟",
+        "東盟"
+      ]
+    },
+    {
+      "id": "region.middle_east",
+      "canonical": "Middle East",
+      "group": "location",
+      "aliases": [
+        "middle east",
+        "mideast",
+        "中东",
+        "中東"
+      ]
+    },
+    {
+      "id": "region.africa",
+      "canonical": "Africa",
+      "group": "location",
+      "aliases": [
+        "africa",
+        "african",
+        "非洲"
+      ]
+    },
+    {
+      "id": "region.europe",
+      "canonical": "Europe",
+      "group": "location",
+      "aliases": [
+        "europe",
+        "european",
+        "欧洲",
+        "歐洲"
+      ]
+    },
+    {
+      "id": "region.asia",
+      "canonical": "Asia",
+      "group": "location",
+      "aliases": [
+        "asia",
+        "asian",
+        "亚洲",
+        "亞洲"
+      ]
+    },
+    {
+      "id": "region.indo_pacific",
+      "canonical": "Indo-Pacific",
+      "group": "location",
+      "aliases": [
+        "indo-pacific",
+        "indo pacific",
+        "indopacific",
+        "印太"
+      ]
+    },
+    {
+      "id": "location.red_sea",
+      "canonical": "Red Sea",
+      "group": "location",
+      "aliases": [
+        "red sea",
+        "红海",
+        "紅海"
+      ]
+    },
+    {
+      "id": "location.hormuz",
+      "canonical": "Strait of Hormuz",
+      "group": "location",
+      "aliases": [
+        "strait of hormuz",
+        "hormuz",
+        "hormuz strait",
+        "霍尔木兹",
+        "霍尔木兹海峡",
+        "霍爾木茲海峽"
+      ]
+    },
+    {
+      "id": "location.bab_el_mandeb",
+      "canonical": "Bab el-Mandeb",
+      "group": "location",
+      "aliases": [
+        "bab el-mandeb",
+        "bab el mandeb",
+        "bab-el-mandeb",
+        "曼德海峡",
+        "曼德海峽"
+      ]
+    },
+    {
+      "id": "location.suez",
+      "canonical": "Suez Canal",
+      "group": "location",
+      "aliases": [
+        "suez",
+        "suez canal",
+        "苏伊士",
+        "苏伊士运河",
+        "蘇伊士運河"
+      ]
+    },
+    {
+      "id": "location.gaza",
+      "canonical": "Gaza",
+      "group": "location",
+      "aliases": [
+        "gaza",
+        "gaza strip",
+        "加沙",
+        "加沙地带",
+        "加沙地帶"
+      ]
+    },
+    {
+      "id": "location.west_bank",
+      "canonical": "West Bank",
+      "group": "location",
+      "aliases": [
+        "west bank",
+        "约旦河西岸",
+        "西岸"
+      ]
+    },
+    {
+      "id": "location.tel_aviv",
+      "canonical": "Tel Aviv",
+      "group": "location",
+      "aliases": [
+        "tel aviv",
+        "tel-aviv",
+        "特拉维夫",
+        "特拉維夫"
+      ]
+    },
+    {
+      "id": "location.jerusalem",
+      "canonical": "Jerusalem",
+      "group": "location",
+      "aliases": [
+        "jerusalem",
+        "耶路撒冷"
+      ]
+    },
+    {
+      "id": "location.tehran",
+      "canonical": "Tehran",
+      "group": "location",
+      "aliases": [
+        "tehran",
+        "德黑兰",
+        "德黑蘭"
+      ]
+    },
+    {
+      "id": "location.havana",
+      "canonical": "Havana",
+      "group": "location",
+      "aliases": [
+        "havana",
+        "哈瓦那"
+      ]
+    },
+    {
+      "id": "location.guantanamo",
+      "canonical": "Guantanamo",
+      "group": "location",
+      "aliases": [
+        "guantanamo",
+        "guantánamo",
+        "gtmo",
+        "关塔那摩",
+        "關塔那摩"
+      ]
+    },
+    {
+      "id": "location.taiwan_strait",
+      "canonical": "Taiwan Strait",
+      "group": "location",
+      "aliases": [
+        "taiwan strait",
+        "台海",
+        "台湾海峡",
+        "台灣海峽"
+      ]
+    },
+    {
+      "id": "location.south_china_sea",
+      "canonical": "South China Sea",
+      "group": "location",
+      "aliases": [
+        "south china sea",
+        "scs",
+        "南海"
+      ]
+    },
+    {
+      "id": "location.east_china_sea",
+      "canonical": "East China Sea",
+      "group": "location",
+      "aliases": [
+        "east china sea",
+        "东海",
+        "東海"
+      ]
+    },
+    {
+      "id": "location.black_sea",
+      "canonical": "Black Sea",
+      "group": "location",
+      "aliases": [
+        "black sea",
+        "黑海"
+      ]
+    },
+    {
+      "id": "location.mediterranean",
+      "canonical": "Mediterranean",
+      "group": "location",
+      "aliases": [
+        "mediterranean",
+        "mediterranean sea",
+        "地中海"
+      ]
+    },
+    {
+      "id": "location.kyiv",
+      "canonical": "Kyiv",
+      "group": "location",
+      "aliases": [
+        "kyiv",
+        "kiev",
+        "基辅",
+        "基輔"
+      ]
+    },
+    {
+      "id": "location.moscow",
+      "canonical": "Moscow",
+      "group": "location",
+      "aliases": [
+        "moscow",
+        "莫斯科"
+      ]
+    },
+    {
+      "id": "location.beijing",
+      "canonical": "Beijing",
+      "group": "location",
+      "aliases": [
+        "beijing",
+        "北京"
+      ]
+    },
+    {
+      "id": "location.washington",
+      "canonical": "Washington",
+      "group": "location",
+      "aliases": [
+        "washington",
+        "washington dc",
+        "washington d.c.",
+        "华盛顿",
+        "華盛頓"
+      ]
+    },
+    {
+      "id": "location.damascus",
+      "canonical": "Damascus",
+      "group": "location",
+      "aliases": [
+        "damascus",
+        "大马士革",
+        "大馬士革"
+      ]
+    },
+    {
+      "id": "location.baghdad",
+      "canonical": "Baghdad",
+      "group": "location",
+      "aliases": [
+        "baghdad",
+        "巴格达",
+        "巴格達"
+      ]
+    },
+    {
+      "id": "location.beirut",
+      "canonical": "Beirut",
+      "group": "location",
+      "aliases": [
+        "beirut",
+        "贝鲁特",
+        "貝魯特"
+      ]
+    },
+    {
+      "id": "location.sanaa",
+      "canonical": "Sanaa",
+      "group": "location",
+      "aliases": [
+        "sanaa",
+        "sana'a",
+        "萨那",
+        "薩那"
+      ]
+    },
+    {
+      "id": "location.cairo",
+      "canonical": "Cairo",
+      "group": "location",
+      "aliases": [
+        "cairo",
+        "开罗",
+        "開羅"
+      ]
+    },
+    {
+      "id": "location.istanbul",
+      "canonical": "Istanbul",
+      "group": "location",
+      "aliases": [
+        "istanbul",
+        "伊斯坦布尔",
+        "伊斯坦布爾"
+      ]
+    },
+    {
+      "id": "location.tokyo",
+      "canonical": "Tokyo",
+      "group": "location",
+      "aliases": [
+        "tokyo",
+        "东京",
+        "東京"
+      ]
+    },
+    {
+      "id": "location.taipei",
+      "canonical": "Taipei",
+      "group": "location",
+      "aliases": [
+        "taipei",
+        "台北"
+      ]
+    },
+    {
+      "id": "location.seoul",
+      "canonical": "Seoul",
+      "group": "location",
+      "aliases": [
+        "seoul",
+        "首尔",
+        "首爾"
+      ]
+    },
+    {
+      "id": "location.pyongyang",
+      "canonical": "Pyongyang",
+      "group": "location",
+      "aliases": [
+        "pyongyang",
+        "平壤"
+      ]
+    },
+    {
+      "id": "location.kabul",
+      "canonical": "Kabul",
+      "group": "location",
+      "aliases": [
+        "kabul",
+        "喀布尔",
+        "喀布爾"
+      ]
+    },
+    {
+      "id": "location.hanoi",
+      "canonical": "Hanoi",
+      "group": "location",
+      "aliases": [
+        "hanoi",
+        "河内",
+        "河內"
+      ]
+    },
+    {
+      "id": "location.crimea",
+      "canonical": "Crimea",
+      "group": "location",
+      "aliases": [
+        "crimea",
+        "crimean",
+        "克里米亚",
+        "克里米亞"
+      ]
+    },
+    {
+      "id": "location.donbas",
+      "canonical": "Donbas",
+      "group": "location",
+      "aliases": [
+        "donbas",
+        "donbass",
+        "顿巴斯",
+        "頓巴斯"
+      ]
+    },
+    {
+      "id": "location.golan",
+      "canonical": "Golan Heights",
+      "group": "location",
+      "aliases": [
+        "golan",
+        "golan heights",
+        "戈兰高地",
+        "戈蘭高地"
+      ]
+    },
+    {
+      "id": "location.persian_gulf",
+      "canonical": "Persian Gulf",
+      "group": "location",
+      "aliases": [
+        "persian gulf",
+        "arabian gulf",
+        "海湾",
+        "波斯湾",
+        "波斯灣",
+        "海灣"
+      ]
+    },
+    {
+      "id": "location.indian_ocean",
+      "canonical": "Indian Ocean",
+      "group": "location",
+      "aliases": [
+        "indian ocean",
+        "印度洋"
+      ]
+    },
+    {
+      "id": "location.arctic",
+      "canonical": "Arctic",
+      "group": "location",
+      "aliases": [
+        "arctic",
+        "北极",
+        "北極"
+      ]
+    },
+    {
+      "id": "location.taiwan_adiz",
+      "canonical": "ADIZ",
+      "group": "location",
+      "aliases": [
+        "adiz",
+        "air defense identification zone",
+        "防空识别区",
+        "防空識別區"
+      ]
+    },
+    {
+      "id": "person.trump",
+      "canonical": "Trump",
+      "group": "person",
+      "aliases": [
+        "trump",
+        "donald trump",
+        "特朗普",
+        "川普"
+      ]
+    },
+    {
+      "id": "person.biden",
+      "canonical": "Biden",
+      "group": "person",
+      "aliases": [
+        "biden",
+        "joe biden",
+        "拜登"
+      ]
+    },
+    {
+      "id": "person.putin",
+      "canonical": "Putin",
+      "group": "person",
+      "aliases": [
+        "putin",
+        "vladimir putin",
+        "普京"
+      ]
+    },
+    {
+      "id": "person.netanyahu",
+      "canonical": "Netanyahu",
+      "group": "person",
+      "aliases": [
+        "netanyahu",
+        "bibi",
+        "benjamin netanyahu",
+        "内塔尼亚胡",
+        "內塔尼亞胡"
+      ]
+    },
+    {
+      "id": "person.xi",
+      "canonical": "Xi Jinping",
+      "group": "person",
+      "aliases": [
+        "xi",
+        "xi jinping",
+        "习近平",
+        "習近平"
+      ]
+    },
+    {
+      "id": "person.zelensky",
+      "canonical": "Zelensky",
+      "group": "person",
+      "aliases": [
+        "zelensky",
+        "zelenskyy",
+        "volodymyr zelensky",
+        "泽连斯基",
+        "澤連斯基"
+      ]
+    },
+    {
+      "id": "person.khamenei",
+      "canonical": "Khamenei",
+      "group": "person",
+      "aliases": [
+        "khamenei",
+        "ayatollah khamenei",
+        "哈梅内伊",
+        "哈梅內伊"
+      ]
+    },
+    {
+      "id": "person.raisi",
+      "canonical": "Raisi",
+      "group": "person",
+      "aliases": [
+        "raisi",
+        "ebrahim raisi",
+        "莱希",
+        "萊希"
+      ]
+    },
+    {
+      "id": "person.kim",
+      "canonical": "Kim Jong Un",
+      "group": "person",
+      "aliases": [
+        "kim",
+        "kim jong un",
+        "kim jong-un",
+        "金正恩"
+      ]
+    },
+    {
+      "id": "person.assad",
+      "canonical": "Assad",
+      "group": "person",
+      "aliases": [
+        "assad",
+        "bashar al-assad",
+        "bashar assad",
+        "阿萨德",
+        "阿薩德"
+      ]
+    },
+    {
+      "id": "person.macron",
+      "canonical": "Macron",
+      "group": "person",
+      "aliases": [
+        "macron",
+        "emmanuel macron",
+        "马克龙",
+        "馬克龍"
+      ]
+    },
+    {
+      "id": "person.scholz",
+      "canonical": "Scholz",
+      "group": "person",
+      "aliases": [
+        "scholz",
+        "olaf scholz",
+        "朔尔茨",
+        "朔爾茨"
+      ]
+    },
+    {
+      "id": "person.starmer",
+      "canonical": "Starmer",
+      "group": "person",
+      "aliases": [
+        "starmer",
+        "keir starmer",
+        "斯塔默"
+      ]
+    },
+    {
+      "id": "person.modi",
+      "canonical": "Modi",
+      "group": "person",
+      "aliases": [
+        "modi",
+        "narendra modi",
+        "莫迪"
+      ]
+    },
+    {
+      "id": "person.erdogan",
+      "canonical": "Erdogan",
+      "group": "person",
+      "aliases": [
+        "erdogan",
+        "erdoğan",
+        "recep tayyip erdogan",
+        "埃尔多安",
+        "埃爾多安"
+      ]
+    },
+    {
+      "id": "person.harris",
+      "canonical": "Harris",
+      "group": "person",
+      "aliases": [
+        "harris",
+        "kamala harris",
+        "哈里斯"
+      ]
+    },
+    {
+      "id": "person.blinken",
+      "canonical": "Blinken",
+      "group": "person",
+      "aliases": [
+        "blinken",
+        "antony blinken",
+        "布林肯"
+      ]
+    },
+    {
+      "id": "person.austin",
+      "canonical": "Austin",
+      "group": "person",
+      "aliases": [
+        "lloyd austin",
+        "奥斯汀",
+        "奧斯汀"
+      ]
+    },
+    {
+      "id": "person.gallant",
+      "canonical": "Gallant",
+      "group": "person",
+      "aliases": [
+        "gallant",
+        "yoav gallant",
+        "加兰特"
+      ]
+    },
+    {
+      "id": "person.sinwar",
+      "canonical": "Sinwar",
+      "group": "person",
+      "aliases": [
+        "sinwar",
+        "yahya sinwar",
+        "辛瓦尔",
+        "辛瓦爾"
+      ]
+    },
+    {
+      "id": "person.nasrallah",
+      "canonical": "Nasrallah",
+      "group": "person",
+      "aliases": [
+        "nasrallah",
+        "hassan nasrallah",
+        "纳斯鲁拉",
+        "納斯魯拉"
+      ]
+    },
+    {
+      "id": "person.maduro",
+      "canonical": "Maduro",
+      "group": "person",
+      "aliases": [
+        "maduro",
+        "nicolas maduro",
+        "马杜罗",
+        "馬杜羅"
+      ]
+    },
+    {
+      "id": "person.lukashenko",
+      "canonical": "Lukashenko",
+      "group": "person",
+      "aliases": [
+        "lukashenko",
+        "alexander lukashenko",
+        "卢卡申科",
+        "盧卡申科"
+      ]
+    },
+    {
+      "id": "org.irgc",
+      "canonical": "IRGC",
+      "group": "org",
+      "aliases": [
+        "irgc",
+        "islamic revolutionary guard corps",
+        "revolutionary guards",
+        "伊斯兰革命卫队",
+        "革命卫队"
+      ]
+    },
+    {
+      "id": "org.houthis",
+      "canonical": "Houthis",
+      "group": "org",
+      "aliases": [
+        "houthis",
+        "houthi",
+        "ansar allah",
+        "胡塞",
+        "胡塞武装",
+        "胡塞武裝"
+      ]
+    },
+    {
+      "id": "org.hamas",
+      "canonical": "Hamas",
+      "group": "org",
+      "aliases": [
+        "hamas",
+        "哈马斯",
+        "哈馬斯"
+      ]
+    },
+    {
+      "id": "org.hezbollah",
+      "canonical": "Hezbollah",
+      "group": "org",
+      "aliases": [
+        "hezbollah",
+        "hizbollah",
+        "hizbullah",
+        "真主党",
+        "真主黨"
+      ]
+    },
+    {
+      "id": "org.idf",
+      "canonical": "IDF",
+      "group": "org",
+      "aliases": [
+        "idf",
+        "israel defense forces",
+        "以色列国防军",
+        "以色列國防軍"
+      ]
+    },
+    {
+      "id": "org.pla",
+      "canonical": "PLA",
+      "group": "org",
+      "aliases": [
+        "pla",
+        "people's liberation army",
+        "人民解放军",
+        "解放军",
+        "解放軍"
+      ]
+    },
+    {
+      "id": "org.cia",
+      "canonical": "CIA",
+      "group": "org",
+      "aliases": [
+        "cia",
+        "central intelligence agency",
+        "中央情报局",
+        "中情局"
+      ]
+    },
+    {
+      "id": "org.fbi",
+      "canonical": "FBI",
+      "group": "org",
+      "aliases": [
+        "fbi",
+        "federal bureau of investigation",
+        "联邦调查局"
+      ]
+    },
+    {
+      "id": "org.nsa",
+      "canonical": "NSA",
+      "group": "org",
+      "aliases": [
+        "nsa",
+        "national security agency",
+        "国家安全局"
+      ]
+    },
+    {
+      "id": "org.pentagon",
+      "canonical": "Pentagon",
+      "group": "org",
+      "aliases": [
+        "pentagon",
+        "department of defense",
+        "dod",
+        "五角大楼",
+        "五角大樓",
+        "美国国防部"
+      ]
+    },
+    {
+      "id": "org.white_house",
+      "canonical": "White House",
+      "group": "org",
+      "aliases": [
+        "white house",
+        "白宫",
+        "白宮"
+      ]
+    },
+    {
+      "id": "org.kremlin",
+      "canonical": "Kremlin",
+      "group": "org",
+      "aliases": [
+        "kremlin",
+        "克里姆林宫",
+        "克里姆林宮"
+      ]
+    },
+    {
+      "id": "org.unsc",
+      "canonical": "UNSC",
+      "group": "org",
+      "aliases": [
+        "unsc",
+        "un security council",
+        "security council",
+        "安理会",
+        "安理會",
+        "联合国安理会"
+      ]
+    },
+    {
+      "id": "org.iaea",
+      "canonical": "IAEA",
+      "group": "org",
+      "aliases": [
+        "iaea",
+        "international atomic energy agency",
+        "国际原子能机构",
+        "國際原子能機構"
+      ]
+    },
+    {
+      "id": "org.wagner",
+      "canonical": "Wagner",
+      "group": "org",
+      "aliases": [
+        "wagner",
+        "wagner group",
+        "瓦格纳",
+        "瓦格納"
+      ]
+    },
+    {
+      "id": "org.isis",
+      "canonical": "ISIS",
+      "group": "org",
+      "aliases": [
+        "isis",
+        "isil",
+        "islamic state",
+        "daesh",
+        "伊斯兰国",
+        "伊斯蘭國"
+      ]
+    },
+    {
+      "id": "org.al_qaeda",
+      "canonical": "Al-Qaeda",
+      "group": "org",
+      "aliases": [
+        "al-qaeda",
+        "al qaeda",
+        "alqaeda",
+        "基地组织",
+        "基地組織"
+      ]
+    },
+    {
+      "id": "org.taliban",
+      "canonical": "Taliban",
+      "group": "org",
+      "aliases": [
+        "taliban",
+        "塔利班"
+      ]
+    },
+    {
+      "id": "org.mossad",
+      "canonical": "Mossad",
+      "group": "org",
+      "aliases": [
+        "mossad",
+        "摩萨德",
+        "摩薩德"
+      ]
+    },
+    {
+      "id": "org.mi6",
+      "canonical": "MI6",
+      "group": "org",
+      "aliases": [
+        "mi6",
+        "sis",
+        "军情六处"
+      ]
+    },
+    {
+      "id": "org.fsb",
+      "canonical": "FSB",
+      "group": "org",
+      "aliases": [
+        "fsb",
+        "联邦安全局"
+      ]
+    },
+    {
+      "id": "org.pla_navy",
+      "canonical": "PLAN",
+      "group": "org",
+      "aliases": [
+        "plan",
+        "pla navy",
+        "中国海军",
+        "解放军海军"
+      ]
+    },
+    {
+      "id": "org.us_navy",
+      "canonical": "US Navy",
+      "group": "org",
+      "aliases": [
+        "us navy",
+        "u.s. navy",
+        "美国海军",
+        "美國海軍"
+      ]
+    },
+    {
+      "id": "org.centcom",
+      "canonical": "CENTCOM",
+      "group": "org",
+      "aliases": [
+        "centcom",
+        "central command",
+        "中央司令部"
+      ]
+    },
+    {
+      "id": "org.indo_pacom",
+      "canonical": "INDOPACOM",
+      "group": "org",
+      "aliases": [
+        "indopacom",
+        "indo-pacom",
+        "indo pacific command",
+        "印太司令部"
+      ]
+    },
+    {
+      "id": "org.red_cross",
+      "canonical": "Red Cross",
+      "group": "org",
+      "aliases": [
+        "red cross",
+        "icrc",
+        "红十字",
+        "红十字会"
+      ]
+    },
+    {
+      "id": "org.who",
+      "canonical": "WHO",
+      "group": "org",
+      "aliases": [
+        "who",
+        "world health organization",
+        "世界卫生组织",
+        "世卫"
+      ]
+    },
+    {
+      "id": "org.imf",
+      "canonical": "IMF",
+      "group": "org",
+      "aliases": [
+        "imf",
+        "international monetary fund",
+        "国际货币基金组织"
+      ]
+    },
+    {
+      "id": "org.world_bank",
+      "canonical": "World Bank",
+      "group": "org",
+      "aliases": [
+        "world bank",
+        "世界银行"
+      ]
+    },
+    {
+      "id": "org.opec",
+      "canonical": "OPEC",
+      "group": "org",
+      "aliases": [
+        "opec",
+        "欧佩克",
+        "石油输出国组织"
+      ]
+    },
+    {
+      "id": "military.missile",
+      "canonical": "Missile",
+      "group": "military",
+      "aliases": [
+        "missile",
+        "missiles",
+        "导弹",
+        "導彈"
+      ]
+    },
+    {
+      "id": "military.drone",
+      "canonical": "Drone",
+      "group": "military",
+      "aliases": [
+        "drone",
+        "drones",
+        "uav",
+        "uavs",
+        "无人机",
+        "無人機"
+      ]
+    },
+    {
+      "id": "military.airstrike",
+      "canonical": "Airstrike",
+      "group": "military",
+      "aliases": [
+        "airstrike",
+        "airstrikes",
+        "air strike",
+        "air strikes",
+        "空袭",
+        "空襲"
+      ]
+    },
+    {
+      "id": "military.blockade",
+      "canonical": "Blockade",
+      "group": "military",
+      "aliases": [
+        "blockade",
+        "封锁",
+        "封鎖"
+      ]
+    },
+    {
+      "id": "military.nuclear",
+      "canonical": "Nuclear",
+      "group": "military",
+      "aliases": [
+        "nuclear",
+        "nuke",
+        "nukes",
+        "核",
+        "核武器",
+        "核武"
+      ]
+    },
+    {
+      "id": "military.carrier",
+      "canonical": "Aircraft Carrier",
+      "group": "military",
+      "aliases": [
+        "carrier",
+        "carriers",
+        "aircraft carrier",
+        "航母",
+        "航空母舰",
+        "航空母艦"
+      ]
+    },
+    {
+      "id": "military.ballistic",
+      "canonical": "Ballistic Missile",
+      "group": "military",
+      "aliases": [
+        "ballistic",
+        "ballistic missile",
+        "ballistic missiles",
+        "弹道导弹",
+        "彈道導彈"
+      ]
+    },
+    {
+      "id": "military.hypersonic",
+      "canonical": "Hypersonic",
+      "group": "military",
+      "aliases": [
+        "hypersonic",
+        "hypersonic missile",
+        "高超音速"
+      ]
+    },
+    {
+      "id": "military.army",
+      "canonical": "Army",
+      "group": "military",
+      "aliases": [
+        "army",
+        "军队",
+        "陸軍",
+        "陆军"
+      ]
+    },
+    {
+      "id": "military.navy",
+      "canonical": "Navy",
+      "group": "military",
+      "aliases": [
+        "navy",
+        "naval",
+        "海军",
+        "海軍"
+      ]
+    },
+    {
+      "id": "military.air_force",
+      "canonical": "Air Force",
+      "group": "military",
+      "aliases": [
+        "air force",
+        "airforce",
+        "空军",
+        "空軍"
+      ]
+    },
+    {
+      "id": "military.strike",
+      "canonical": "Strike",
+      "group": "military",
+      "aliases": [
+        "strike",
+        "strikes",
+        "打击",
+        "打擊"
+      ]
+    },
+    {
+      "id": "military.attack",
+      "canonical": "Attack",
+      "group": "military",
+      "aliases": [
+        "attack",
+        "attacks",
+        "攻击",
+        "攻擊"
+      ]
+    },
+    {
+      "id": "military.war",
+      "canonical": "War",
+      "group": "military",
+      "aliases": [
+        "war",
+        "战争",
+        "戰爭"
+      ]
+    },
+    {
+      "id": "military.conflict",
+      "canonical": "Conflict",
+      "group": "military",
+      "aliases": [
+        "conflict",
+        "conflicts",
+        "冲突",
+        "衝突"
+      ]
+    },
+    {
+      "id": "military.battle",
+      "canonical": "Battle",
+      "group": "military",
+      "aliases": [
+        "battle",
+        "battles",
+        "战斗",
+        "戰鬥"
+      ]
+    },
+    {
+      "id": "military.invasion",
+      "canonical": "Invasion",
+      "group": "military",
+      "aliases": [
+        "invasion",
+        "invasions",
+        "入侵"
+      ]
+    },
+    {
+      "id": "military.defense",
+      "canonical": "Defense",
+      "group": "military",
+      "aliases": [
+        "defense",
+        "defence",
+        "防御",
+        "防禦",
+        "国防",
+        "國防"
+      ]
+    },
+    {
+      "id": "military.weapon",
+      "canonical": "Weapon",
+      "group": "military",
+      "aliases": [
+        "weapon",
+        "weapons",
+        "武器"
+      ]
+    },
+    {
+      "id": "military.military",
+      "canonical": "Military",
+      "group": "military",
+      "aliases": [
+        "military",
+        "军事",
+        "軍事"
+      ]
+    },
+    {
+      "id": "military.troops",
+      "canonical": "Troops",
+      "group": "military",
+      "aliases": [
+        "troop",
+        "troops",
+        "士兵",
+        "部队",
+        "部隊"
+      ]
+    },
+    {
+      "id": "military.bomb",
+      "canonical": "Bomb",
+      "group": "military",
+      "aliases": [
+        "bomb",
+        "bombs",
+        "bombing",
+        "炸弹",
+        "炸彈",
+        "轰炸",
+        "轟炸"
+      ]
+    },
+    {
+      "id": "military.submarine",
+      "canonical": "Submarine",
+      "group": "military",
+      "aliases": [
+        "submarine",
+        "submarines",
+        "sub",
+        "潜艇",
+        "潛艇"
+      ]
+    },
+    {
+      "id": "military.destroyer",
+      "canonical": "Destroyer",
+      "group": "military",
+      "aliases": [
+        "destroyer",
+        "destroyers",
+        "驱逐舰",
+        "驅逐艦"
+      ]
+    },
+    {
+      "id": "military.frigate",
+      "canonical": "Frigate",
+      "group": "military",
+      "aliases": [
+        "frigate",
+        "frigates",
+        "护卫舰",
+        "護衛艦"
+      ]
+    },
+    {
+      "id": "military.artillery",
+      "canonical": "Artillery",
+      "group": "military",
+      "aliases": [
+        "artillery",
+        "火炮",
+        "炮兵"
+      ]
+    },
+    {
+      "id": "military.cyber",
+      "canonical": "Cyber",
+      "group": "military",
+      "aliases": [
+        "cyber",
+        "cyberattack",
+        "cyber attack",
+        "网络攻击",
+        "網絡攻擊",
+        "网攻"
+      ]
+    },
+    {
+      "id": "military.satellite",
+      "canonical": "Satellite",
+      "group": "military",
+      "aliases": [
+        "satellite",
+        "satellites",
+        "卫星",
+        "衛星"
+      ]
+    },
+    {
+      "id": "military.radar",
+      "canonical": "Radar",
+      "group": "military",
+      "aliases": [
+        "radar",
+        "雷达",
+        "雷達"
+      ]
+    },
+    {
+      "id": "military.interceptor",
+      "canonical": "Interceptor",
+      "group": "military",
+      "aliases": [
+        "interceptor",
+        "interceptors",
+        "拦截弹",
+        "攔截彈"
+      ]
+    },
+    {
+      "id": "military.iron_dome",
+      "canonical": "Iron Dome",
+      "group": "military",
+      "aliases": [
+        "iron dome",
+        "铁穹",
+        "鐵穹"
+      ]
+    },
+    {
+      "id": "politics.sanction",
+      "canonical": "Sanctions",
+      "group": "politics",
+      "aliases": [
+        "sanction",
+        "sanctions",
+        "制裁"
+      ]
+    },
+    {
+      "id": "politics.embargo",
+      "canonical": "Embargo",
+      "group": "politics",
+      "aliases": [
+        "embargo",
+        "embargoes",
+        "禁运",
+        "禁運"
+      ]
+    },
+    {
+      "id": "politics.ceasefire",
+      "canonical": "Ceasefire",
+      "group": "politics",
+      "aliases": [
+        "ceasefire",
+        "cease-fire",
+        "cease fire",
+        "停火"
+      ]
+    },
+    {
+      "id": "politics.summit",
+      "canonical": "Summit",
+      "group": "politics",
+      "aliases": [
+        "summit",
+        "summits",
+        "峰会",
+        "峰會"
+      ]
+    },
+    {
+      "id": "politics.election",
+      "canonical": "Election",
+      "group": "politics",
+      "aliases": [
+        "election",
+        "elections",
+        "选举",
+        "選舉"
+      ]
+    },
+    {
+      "id": "politics.diplomacy",
+      "canonical": "Diplomacy",
+      "group": "politics",
+      "aliases": [
+        "diplomacy",
+        "diplomatic",
+        "外交"
+      ]
+    },
+    {
+      "id": "politics.resolution",
+      "canonical": "Resolution",
+      "group": "politics",
+      "aliases": [
+        "resolution",
+        "resolutions",
+        "决议",
+        "決議"
+      ]
+    },
+    {
+      "id": "politics.government",
+      "canonical": "Government",
+      "group": "politics",
+      "aliases": [
+        "government",
+        "政府"
+      ]
+    },
+    {
+      "id": "politics.president",
+      "canonical": "President",
+      "group": "politics",
+      "aliases": [
+        "president",
+        "总统",
+        "總統"
+      ]
+    },
+    {
+      "id": "politics.minister",
+      "canonical": "Minister",
+      "group": "politics",
+      "aliases": [
+        "minister",
+        "部长",
+        "部長"
+      ]
+    },
+    {
+      "id": "politics.parliament",
+      "canonical": "Parliament",
+      "group": "politics",
+      "aliases": [
+        "parliament",
+        "议会",
+        "議會"
+      ]
+    },
+    {
+      "id": "politics.policy",
+      "canonical": "Policy",
+      "group": "politics",
+      "aliases": [
+        "policy",
+        "policies",
+        "政策"
+      ]
+    },
+    {
+      "id": "politics.treaty",
+      "canonical": "Treaty",
+      "group": "politics",
+      "aliases": [
+        "treaty",
+        "treaties",
+        "条约",
+        "條約"
+      ]
+    },
+    {
+      "id": "politics.agreement",
+      "canonical": "Agreement",
+      "group": "politics",
+      "aliases": [
+        "agreement",
+        "agreements",
+        "协议",
+        "協議"
+      ]
+    },
+    {
+      "id": "politics.negotiation",
+      "canonical": "Negotiation",
+      "group": "politics",
+      "aliases": [
+        "negotiation",
+        "negotiations",
+        "谈判",
+        "談判"
+      ]
+    },
+    {
+      "id": "politics.vote",
+      "canonical": "Vote",
+      "group": "politics",
+      "aliases": [
+        "vote",
+        "votes",
+        "投票"
+      ]
+    },
+    {
+      "id": "politics.hostage",
+      "canonical": "Hostage",
+      "group": "politics",
+      "aliases": [
+        "hostage",
+        "hostages",
+        "人质",
+        "人質"
+      ]
+    },
+    {
+      "id": "politics.refugees",
+      "canonical": "Refugees",
+      "group": "politics",
+      "aliases": [
+        "refugee",
+        "refugees",
+        "难民",
+        "難民"
+      ]
+    },
+    {
+      "id": "politics.coup",
+      "canonical": "Coup",
+      "group": "politics",
+      "aliases": [
+        "coup",
+        "coups",
+        "政变",
+        "政變"
+      ]
+    },
+    {
+      "id": "politics.protest",
+      "canonical": "Protest",
+      "group": "politics",
+      "aliases": [
+        "protest",
+        "protests",
+        "抗议",
+        "抗議",
+        "示威"
+      ]
+    },
+    {
+      "id": "economy.oil",
+      "canonical": "Oil",
+      "group": "economy",
+      "aliases": [
+        "oil",
+        "crude",
+        "crude oil",
+        "石油",
+        "原油"
+      ]
+    },
+    {
+      "id": "economy.gas",
+      "canonical": "Gas",
+      "group": "economy",
+      "aliases": [
+        "gas",
+        "natural gas",
+        "天然气",
+        "天然氣"
+      ]
+    },
+    {
+      "id": "economy.lng",
+      "canonical": "LNG",
+      "group": "economy",
+      "aliases": [
+        "lng",
+        "liquefied natural gas",
+        "液化天然气"
+      ]
+    },
+    {
+      "id": "economy.shipping",
+      "canonical": "Shipping",
+      "group": "economy",
+      "aliases": [
+        "shipping",
+        "maritime shipping",
+        "航运",
+        "航運",
+        "海运",
+        "海運"
+      ]
+    },
+    {
+      "id": "economy.insurance",
+      "canonical": "Insurance",
+      "group": "economy",
+      "aliases": [
+        "insurance",
+        "保险",
+        "保險"
+      ]
+    },
+    {
+      "id": "economy.supply_chain",
+      "canonical": "Supply Chain",
+      "group": "economy",
+      "aliases": [
+        "supply chain",
+        "supply-chain",
+        "供应链",
+        "供應鏈"
+      ]
+    },
+    {
+      "id": "economy.energy",
+      "canonical": "Energy",
+      "group": "economy",
+      "aliases": [
+        "energy",
+        "能源"
+      ]
+    },
+    {
+      "id": "economy.trade",
+      "canonical": "Trade",
+      "group": "economy",
+      "aliases": [
+        "trade",
+        "贸易",
+        "貿易"
+      ]
+    },
+    {
+      "id": "economy.economy",
+      "canonical": "Economy",
+      "group": "economy",
+      "aliases": [
+        "economy",
+        "economic",
+        "经济",
+        "經濟"
+      ]
+    },
+    {
+      "id": "economy.market",
+      "canonical": "Market",
+      "group": "economy",
+      "aliases": [
+        "market",
+        "markets",
+        "市场",
+        "市場"
+      ]
+    },
+    {
+      "id": "economy.price",
+      "canonical": "Price",
+      "group": "economy",
+      "aliases": [
+        "price",
+        "prices",
+        "价格",
+        "價格"
+      ]
+    },
+    {
+      "id": "economy.investment",
+      "canonical": "Investment",
+      "group": "economy",
+      "aliases": [
+        "investment",
+        "investments",
+        "投资",
+        "投資"
+      ]
+    },
+    {
+      "id": "economy.finance",
+      "canonical": "Finance",
+      "group": "economy",
+      "aliases": [
+        "finance",
+        "financial",
+        "金融"
+      ]
+    },
+    {
+      "id": "economy.bank",
+      "canonical": "Bank",
+      "group": "economy",
+      "aliases": [
+        "bank",
+        "banks",
+        "银行",
+        "銀行"
+      ]
+    },
+    {
+      "id": "economy.inflation",
+      "canonical": "Inflation",
+      "group": "economy",
+      "aliases": [
+        "inflation",
+        "通胀",
+        "通貨膨脹",
+        "通货膨胀"
+      ]
+    },
+    {
+      "id": "economy.tariff",
+      "canonical": "Tariff",
+      "group": "economy",
+      "aliases": [
+        "tariff",
+        "tariffs",
+        "关税",
+        "關稅"
+      ]
+    },
+    {
+      "id": "economy.bunker",
+      "canonical": "Bunker Fuel",
+      "group": "economy",
+      "aliases": [
+        "bunker",
+        "bunker fuel",
+        "船用燃油"
+      ]
+    },
+    {
+      "id": "economy.tanker",
+      "canonical": "Tanker",
+      "group": "economy",
+      "aliases": [
+        "tanker",
+        "tankers",
+        "油轮",
+        "油輪"
+      ]
+    },
+    {
+      "id": "economy.freight",
+      "canonical": "Freight",
+      "group": "economy",
+      "aliases": [
+        "freight",
+        "货运",
+        "貨運"
+      ]
+    },
+    {
+      "id": "disaster.earthquake",
+      "canonical": "Earthquake",
+      "group": "disaster",
+      "aliases": [
+        "earthquake",
+        "earthquakes",
+        "quake",
+        "地震"
+      ]
+    },
+    {
+      "id": "disaster.flood",
+      "canonical": "Flood",
+      "group": "disaster",
+      "aliases": [
+        "flood",
+        "floods",
+        "flooding",
+        "洪水",
+        "洪灾",
+        "洪災"
+      ]
+    },
+    {
+      "id": "disaster.hurricane",
+      "canonical": "Hurricane",
+      "group": "disaster",
+      "aliases": [
+        "hurricane",
+        "hurricanes",
+        "typhoon",
+        "typhoons",
+        "cyclone",
+        "飓风",
+        "颱風",
+        "台风"
+      ]
+    },
+    {
+      "id": "disaster.wildfire",
+      "canonical": "Wildfire",
+      "group": "disaster",
+      "aliases": [
+        "wildfire",
+        "wildfires",
+        "bushfire",
+        "山火",
+        "野火"
+      ]
+    },
+    {
+      "id": "disaster.tsunami",
+      "canonical": "Tsunami",
+      "group": "disaster",
+      "aliases": [
+        "tsunami",
+        "tsunamis",
+        "海啸",
+        "海嘯"
+      ]
+    },
+    {
+      "id": "disaster.volcano",
+      "canonical": "Volcano",
+      "group": "disaster",
+      "aliases": [
+        "volcano",
+        "volcanic",
+        "eruption",
+        "火山",
+        "火山喷发"
+      ]
+    },
+    {
+      "id": "disaster.drought",
+      "canonical": "Drought",
+      "group": "disaster",
+      "aliases": [
+        "drought",
+        "droughts",
+        "干旱",
+        "乾旱"
+      ]
+    },
+    {
+      "id": "disaster.evacuation",
+      "canonical": "Evacuation",
+      "group": "disaster",
+      "aliases": [
+        "evacuation",
+        "evacuate",
+        "evacuated",
+        "疏散",
+        "撤离",
+        "撤離"
+      ]
+    },
+    {
+      "id": "disaster.casualty",
+      "canonical": "Casualty",
+      "group": "disaster",
+      "aliases": [
+        "casualty",
+        "casualties",
+        "伤亡",
+        "傷亡"
+      ]
+    },
+    {
+      "id": "disaster.explosion",
+      "canonical": "Explosion",
+      "group": "disaster",
+      "aliases": [
+        "explosion",
+        "explosions",
+        "爆炸"
+      ]
+    },
+    {
+      "id": "disaster.fire",
+      "canonical": "Fire",
+      "group": "disaster",
+      "aliases": [
+        "fire",
+        "fires",
+        "火灾",
+        "火災"
+      ]
+    },
+    {
+      "id": "disaster.crash",
+      "canonical": "Crash",
+      "group": "disaster",
+      "aliases": [
+        "crash",
+        "crashes",
+        "坠毁",
+        "墜毀"
+      ]
+    },
+    {
+      "id": "disaster.disaster",
+      "canonical": "Disaster",
+      "group": "disaster",
+      "aliases": [
+        "disaster",
+        "disasters",
+        "灾难",
+        "災難",
+        "灾害",
+        "災害"
+      ]
+    },
+    {
+      "id": "disaster.rescue",
+      "canonical": "Rescue",
+      "group": "disaster",
+      "aliases": [
+        "rescue",
+        "rescued",
+        "救援"
+      ]
+    },
+    {
+      "id": "disaster.landslide",
+      "canonical": "Landslide",
+      "group": "disaster",
+      "aliases": [
+        "landslide",
+        "landslides",
+        "泥石流",
+        "滑坡"
+      ]
+    },
+    {
+      "id": "disaster.heatwave",
+      "canonical": "Heatwave",
+      "group": "disaster",
+      "aliases": [
+        "heatwave",
+        "heat wave",
+        "heatwaves",
+        "热浪",
+        "熱浪"
+      ]
+    },
+    {
+      "id": "disaster.pandemic",
+      "canonical": "Pandemic",
+      "group": "disaster",
+      "aliases": [
+        "pandemic",
+        "epidemic",
+        "疫情",
+        "大流行"
+      ]
+    },
+    {
+      "id": "general.ai",
+      "canonical": "AI",
+      "group": "general",
+      "aliases": [
+        "ai",
+        "Ai"
+      ]
+    },
+    {
+      "id": "general.entity",
+      "canonical": "人工智能",
+      "group": "general",
+      "aliases": [
+        "ai"
+      ]
+    }
+  ]
+}

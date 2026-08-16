@@ -61,8 +61,9 @@
 
   --reader-font: var(--serif);
 
-  --col-sidebar: 248px;
-  --col-list: 388px;
+  --col-sidebar: 220px;
+  --col-list: 320px;
+  --ai-width: 300px;
 }
 
 /* Dark is a mode-level concern (native controls, scrollbars, text selection)
@@ -494,6 +495,7 @@ button { font-family: inherit; }
   transition: border-color .15s;
   white-space: nowrap;
   flex-shrink: 0;
+  position: relative;
 }
 .sidebar-search:hover { border-color: var(--hair-strong); }
 .sidebar-search:focus-within { border-color: var(--hair-strong); }
@@ -509,6 +511,67 @@ button { font-family: inherit; }
 }
 .sidebar-search input::placeholder { color: var(--muted); }
 .sidebar-search input::-webkit-search-cancel-button { display: none; }
+.sidebar-search-help {
+  position: relative;
+  flex: 0 0 auto;
+}
+.sidebar-search-help > summary {
+  list-style: none;
+  cursor: pointer;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  font-size: 10px;
+  color: var(--muted);
+  border: 1px solid var(--hair);
+  user-select: none;
+  line-height: 1;
+}
+.sidebar-search-help > summary::-webkit-details-marker { display: none; }
+.sidebar-search-help[open] > summary {
+  color: var(--ink);
+  border-color: var(--hair-strong);
+}
+.sidebar-search-help-pop {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 6px);
+  z-index: 40;
+  width: 220px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--hair-strong);
+  background: var(--panel, var(--paper));
+  box-shadow: 0 8px 24px color-mix(in srgb, var(--ink) 12%, transparent);
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--ink);
+  white-space: normal;
+}
+.sidebar-search-help-pop p { margin: 0 0 6px; color: var(--muted); }
+.sidebar-search-help-pop ul {
+  margin: 0;
+  padding: 0 0 0 1.1em;
+}
+.sidebar-search-help-pop li { margin: 2px 0; }
+.sidebar-search-help-pop code {
+  font-size: 11px;
+  padding: 0 3px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--ink) 6%, transparent);
+}
+.sidebar-search-help-more {
+  margin-top: 8px !important;
+  font-size: 11px;
+}
+.art-hit {
+  background: color-mix(in srgb, var(--accent) 28%, transparent);
+  color: inherit;
+  border-radius: 2px;
+  padding: 0 1px;
+}
 
 .sidebar-scroll {
   flex: 1;
@@ -662,6 +725,7 @@ button { font-family: inherit; }
   color: inherit;
   cursor: pointer;
   flex-shrink: 0;
+  line-height: 0;
 }
 .sb-folder svg { transition: transform .2s; }
 .sb-folder.collapsed svg { transform: rotate(-90deg); }
@@ -944,6 +1008,21 @@ button { font-family: inherit; }
   display: flex;
   flex-direction: column;
   min-height: 0;
+  min-width: 0;
+  position: relative;
+  /* Named container so a narrow reader column can fall back to overlay
+     drawer behaviour without crushing article text. */
+  container-type: inline-size;
+  container-name: reader;
+}
+
+/* Article column + AI summary share one row. When the drawer opens it
+   takes real flex width (via --ai-width) so body content is not covered. */
+.reader-main {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
   position: relative;
 }
 
@@ -981,56 +1060,8 @@ button { font-family: inherit; }
 
 .reader-scroll {
   flex: 1;
-  overflow-y: auto;
-}
-
-/* In-app original-page view (issue #49): a thin address bar over a host div.
-   A native child webview (page_view.rs) is positioned over `.reader-webview-host`
-   — it is NOT in the DOM, so the host only reserves the space and shows a
-   neutral backdrop until the webview paints. */
-.reader-webview {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-}
-.reader-webview-bar {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 7px 18px;
-  font-size: 12px;
-  color: var(--muted);
-  background: var(--paper);
-  border-bottom: 1px solid var(--line);
-  flex-shrink: 0;
-}
-.reader-webview-url {
-  flex: 1;
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.reader-webview-open {
-  flex-shrink: 0;
-  color: var(--accent);
-  background: none;
-  border: none;
-  cursor: pointer;
-  font-size: 12px;
-  padding: 0;
-}
-.reader-webview-open:hover {
-  text-decoration: underline;
-}
-.reader-webview-host {
-  flex: 1;
-  min-height: 0;
-  /* Themed floor, not hard `#fff`: the native webview paints over this, but
-     until it does, a white tile flashes in the dark theme (the very flash the
-     recent window fixes chased). `--paper` is dark in dark mode, cream in light. */
-  background: var(--paper);
+  overflow-y: auto;
 }
 
 .article {
@@ -1213,20 +1244,52 @@ button { font-family: inherit; }
 }
 .tag:hover { background: var(--accent-soft); color: var(--accent-ink); }
 
-/* AI summary drawer */
+/* AI summary drawer — sits beside the article in `.reader-main` (not an
+   overlay). Closed state collapses to width 0; open uses --ai-width from
+   the store / drag handle. */
 .ai-drawer {
-  position: absolute;
-  top: 38px; right: 0; bottom: 0;
-  width: var(--ai-width, 360px);
+  position: relative;
+  flex: 0 0 0;
+  width: 0;
+  max-width: 100%;
+  align-self: stretch;
   background: var(--panel);
-  border-left: 1px solid var(--hair);
-  transform: translateX(100%);
-  transition: transform .35s cubic-bezier(.22,.61,.36,1);
+  border-left: 1px solid transparent;
+  /* Clip only while collapsed so the open drawer's left-edge resize
+     handle (which straddles the boundary) stays grabbable. */
+  overflow: hidden;
+  transition:
+    flex-basis .35s cubic-bezier(.22,.61,.36,1),
+    width .35s cubic-bezier(.22,.61,.36,1),
+    border-color .2s ease;
   z-index: 5;
   display: flex;
   flex-direction: column;
 }
-.ai-drawer.open { transform: translateX(0); }
+.ai-drawer.open {
+  flex-basis: var(--ai-width, 300px);
+  width: var(--ai-width, 300px);
+  border-left-color: var(--hair);
+  overflow: visible;
+}
+
+/* Narrow reader column (small window / wide sidebar+list): keep the drawer
+   as an overlay so the article isn't squeezed to a sliver. Toolbar close
+   and the drawer close button still dismiss it. */
+@container reader (max-width: 720px) {
+  .reader.ai-open .ai-drawer.open {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    flex-basis: auto;
+    /* Cap overlay width so a resized drawer can't cover the whole pane. */
+    width: min(var(--ai-width, 300px), 92%);
+    max-width: 92%;
+    box-shadow: -8px 0 24px rgba(0, 0, 0, 0.08);
+    overflow: hidden; /* clip shadow/content to the overlay sheet */
+  }
+}
 .ai-head {
   padding: 18px 20px 12px;
   display: flex;
@@ -3518,6 +3581,31 @@ button.tag-picker-chip-name:focus-visible {
   box-shadow: 0 0 0 1px var(--panel);
 }
 
+.s-alias-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.s-alias-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--ink-2);
+  min-width: 140px;
+}
+.s-alias-field-grow {
+  flex: 1;
+  min-width: 160px;
+}
+.s-alias-filter {
+  margin-bottom: 8px;
+  width: 100%;
+  max-width: 320px;
+}
+
 .sb-tags-card {
   border-radius: 10px;
   background: color-mix(in srgb, var(--ink) 4.5%, var(--paper));
@@ -3867,6 +3955,106 @@ button.tag-picker-chip-name:focus-visible {
   color: var(--muted);
   line-height: 1.4;
 }
+.wc-admin-source {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: -4px;
+}
+.wc-admin-source-badge {
+  display: inline-flex;
+  align-items: center;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--hair);
+  color: var(--ink);
+  background: var(--bg-elev, var(--bg));
+}
+.wc-admin-source-badge.source-shared {
+  color: var(--muted);
+}
+.wc-admin-source-badge.source-local,
+.wc-admin-source-badge.source-explicit {
+  border-color: var(--accent, var(--ink));
+  color: var(--accent-ink, var(--accent, var(--ink)));
+}
+.wc-admin-path {
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+.wc-admin-actions {
+  white-space: nowrap;
+  width: 1%;
+}
+.wc-admin-actions .s-btn {
+  margin: 0 4px 4px 0;
+}
+.wc-admin-row-edit td {
+  background: var(--accent-soft, rgba(0, 0, 0, 0.03));
+}
+.wc-admin-edit-input,
+.wc-admin-edit-aliases {
+  width: 100%;
+  box-sizing: border-box;
+  font: inherit;
+  font-size: 12px;
+  padding: 6px 8px;
+  border: 1px solid var(--hair);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--ink);
+}
+.wc-admin-edit-aliases {
+  resize: vertical;
+  min-height: 56px;
+  line-height: 1.4;
+}
+.wc-admin-add {
+  margin: 0.75rem 0 1rem;
+  padding: 0.75rem 0.85rem;
+  border: 1px solid var(--hair);
+  border-radius: 8px;
+  background: var(--accent-soft, rgba(0, 0, 0, 0.02));
+}
+.wc-admin-add-row {
+  display: grid;
+  grid-template-columns: 1.2fr 0.8fr 1fr;
+  gap: 0.65rem;
+  margin-bottom: 0.65rem;
+}
+.wc-admin-add-row label,
+.wc-admin-add-aliases {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  font-size: 12px;
+  color: var(--muted);
+}
+.wc-admin-add-row select {
+  font: inherit;
+  font-size: 12px;
+  padding: 6px 8px;
+  border: 1px solid var(--hair);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--ink);
+}
+.wc-admin-add-aliases {
+  margin-bottom: 0.65rem;
+}
+@media (max-width: 720px) {
+  .wc-admin-add-row {
+    grid-template-columns: 1fr;
+  }
+}
 
 .list-search-chip {
   display: inline-flex;
@@ -3883,18 +4071,6 @@ button.tag-picker-chip-name:focus-visible {
 }
 .list-search-chip:hover {
   background: color-mix(in srgb, var(--accent) 18%, var(--paper));
-}
-
-.reader-webview-fallback {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 14px;
-  padding: 40px 24px;
-  text-align: center;
-  color: var(--muted);
-  font-size: 14px;
 }
 
 /* ====== Feed sources admin ====== */
@@ -3979,6 +4155,33 @@ button.tag-picker-chip-name:focus-visible {
 .feed-sources-meta {
   font-size: 11.5px;
   color: var(--muted);
+}
+.feed-sources-rename {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+.feed-sources-rename-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 160px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.feed-sources-rename-label input {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  font-size: 13px;
+  padding: 6px 8px;
+  border: 1px solid var(--hair);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--ink);
 }
 .feed-sources-item-actions {
   display: flex;

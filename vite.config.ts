@@ -2,7 +2,7 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
 // papr-server default listen port (PORT=8080 in crates/papr-server/.env.example).
-const apiTarget = process.env.PAPR_API_PROXY || "http://localhost:8080";
+const apiTarget = process.env.PAPR_API_PROXY || "http://localhost:8111";
 
 // https://vite.dev/config/
 export default defineConfig({

@@ -501,6 +501,23 @@ static MIGRATIONS: LazyLock<Migrations> = LazyLock::new(|| {
                 VALUES ('dedup_enabled', '1');
             "#,
         ),
+        // v30 — interest-tag aliases: admin-maintained synonym → canonical tag.
+        // Additive only (new table); production DBs open → migrate with an
+        // empty alias table — no backfill. Deleting a tag cascades its aliases.
+        // Do NOT drop/rebuild `tags` or `article_tags`. Owned inside papr
+        // (Settings), not wordcloud entity JSON.
+        M::up(
+            r#"
+            CREATE TABLE tag_aliases (
+                id     INTEGER PRIMARY KEY,
+                alias  TEXT NOT NULL,
+                tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+                kind   TEXT NOT NULL,
+                UNIQUE(kind, alias COLLATE NOCASE)
+            );
+            CREATE INDEX idx_tag_aliases_tag ON tag_aliases(tag_id);
+            "#,
+        ),
     ])
 });
 
@@ -1440,14 +1457,19 @@ fn article_filter(query: &ArticleQuery, unread_only: bool) -> (Vec<String>, Vec<
     (where_clauses, binds)
 }
 
-/// The non-search ORDER BY clause shared by `list_articles` and
-/// `article_index`. See `list_articles` for why the effective date is wrapped
-/// in `datetime(COALESCE(...))`.
-fn article_order(oldest_first: bool) -> &'static str {
-    if oldest_first {
+/// The ORDER BY clause shared by `list_articles` and `article_index`.
+/// When `rank_first` is set (active search + relevance sort), FTS5 `bm25`
+/// rank leads and the browse date order is secondary.
+fn article_order(oldest_first: bool, rank_first: bool) -> String {
+    let date = if oldest_first {
         "datetime(COALESCE(a.published_at, a.fetched_at)) ASC, a.id ASC"
     } else {
         "datetime(COALESCE(a.published_at, a.fetched_at)) DESC, a.id DESC"
+    };
+    if rank_first {
+        format!("fts.rank ASC, {date}")
+    } else {
+        date.to_string()
     }
 }
 
@@ -1471,7 +1493,7 @@ pub fn article_index(
              FROM articles a JOIN feeds f ON f.id = a.feed_id
              WHERE {where_sql}
          ) WHERE aid = ?",
-        order = article_order(oldest_first),
+        order = article_order(oldest_first, false),
         where_sql = where_clauses.join(" AND "),
     );
     binds.push(Value::Integer(article_id));
@@ -1491,9 +1513,53 @@ pub fn list_articles(
     limit: i64,
     offset: i64,
 ) -> AppResult<Vec<ArticleSummary>> {
+    list_articles_sorted(
+        conn,
+        query,
+        unread_only,
+        search,
+        oldest_first,
+        /* sort_by_relevance */ true,
+        limit,
+        offset,
+    )
+}
+
+/// Like `list_articles`, but `sort_by_relevance` controls whether an active
+/// search orders by FTS rank (default) or by date only.
+pub fn list_articles_sorted(
+    conn: &Connection,
+    query: &ArticleQuery,
+    unread_only: bool,
+    search: Option<&str>,
+    oldest_first: bool,
+    sort_by_relevance: bool,
+    limit: i64,
+    offset: i64,
+) -> AppResult<Vec<ArticleSummary>> {
     let (mut where_clauses, mut binds) = article_filter(query, unread_only);
 
-    let searching = search.map(|s| !s.trim().is_empty()).unwrap_or(false);
+    let raw_search = search.map(|s| s.trim()).filter(|s| !s.is_empty());
+    let compiled = raw_search.map(|s| {
+        crate::wordcloud_dict::process_dict().with_dict(|dict| {
+            crate::search::compile_search_with_dict(
+                s,
+                crate::search::SearchMode::Strict,
+                Some(dict),
+            )
+        })
+    });
+    // Non-empty input that compiles to nothing → zero rows (spec).
+    let match_nothing = raw_search.is_some()
+        && compiled.as_ref().is_some_and(|c| c.is_empty());
+    let has_fts = compiled
+        .as_ref()
+        .and_then(|c| c.match_expr.as_ref())
+        .is_some();
+    let has_feed = compiled
+        .as_ref()
+        .is_some_and(|c| !c.feed_prefixes.is_empty());
+
     let mut sql = format!(
         "SELECT a.id, a.feed_id, f.title, f.source_type, a.title, a.author,
                 substr(a.body_text,1,{snippet_len}), a.image_url, a.url, a.published_at,
@@ -1501,12 +1567,21 @@ pub fn list_articles(
          FROM articles a JOIN feeds f ON f.id = a.feed_id ",
         snippet_len = PREVIEW_SNIPPET_CHARS,
     );
-    if searching {
+    let rank_first = has_fts && sort_by_relevance;
+    if has_fts {
+        let expr = compiled.as_ref().unwrap().match_expr.clone().unwrap();
         sql.push_str("JOIN articles_fts fts ON fts.rowid = a.id ");
         where_clauses.push("articles_fts MATCH ?".into());
-        // Explicit search: every typed word must match (AND), so results
-        // narrow as the user adds terms.
-        binds.push(Value::Text(fts_query(search.unwrap(), false)));
+        binds.push(Value::Text(expr));
+    }
+    if has_feed {
+        for name in &compiled.as_ref().unwrap().feed_prefixes {
+            where_clauses.push("unicode_lower(f.title) LIKE ?".into());
+            binds.push(Value::Text(format!("{}%", name.to_lowercase())));
+        }
+    }
+    if match_nothing {
+        where_clauses.push("1=0".into());
     }
     sql.push_str("WHERE ");
     sql.push_str(&where_clauses.join(" AND "));
@@ -1519,11 +1594,11 @@ pub fn list_articles(
     // by `idx_articles_sort`, an expression index over the same wrapped
     // expression (v12) — the planner uses it for both directions, no sort.
     //
-    // Search only filters the set (FTS MATCH); the browse sort toggle still
-    // owns ORDER BY. Ranking by `fts.rank` here ignored `oldest_first`, so a
-    // "最新优先" list filtered by a term could put older hits above newer ones.
+    // Active search defaults to FTS relevance (`fts.rank`), with date as
+    // secondary. Browse (no search) stays chronological. Callers may pass
+    // `sort_by_relevance: false` to force date order while searching.
     sql.push_str(" ORDER BY ");
-    sql.push_str(article_order(oldest_first));
+    sql.push_str(&article_order(oldest_first, rank_first));
     sql.push(' ');
     sql.push_str("LIMIT ? OFFSET ?");
     binds.push(Value::Integer(limit));
@@ -1604,30 +1679,19 @@ pub fn apply_card_images(conn: &Connection, updates: &[(i64, String)]) -> AppRes
     Ok(())
 }
 
-/// Turn raw user text into a safe FTS5 MATCH expression (each term
-/// prefix-matched). `or_join` selects how multiple terms combine: `false`
-/// joins them with an implicit AND (every term must match — explicit search,
-/// where adding words narrows results); `true` joins them with `OR` (any term
-/// may match — recall-oriented retrieval, e.g. RAG over a natural-language
-/// question, where AND-ing every word would match nothing).
-///
-/// Punctuation *splits* a word into separate terms rather than being deleted
-/// inside it: the `unicode61` tokenizer indexes `rust-lang` / `node.js` as the
-/// two tokens `rust`+`lang` and `node`+`js`, so collapsing the query side to
-/// `rustlang` / `nodejs` would match nothing the index actually holds.
+/// Turn raw user text into a safe FTS5 MATCH expression.
+/// Prefer `crate::search::compile_search` for new call sites.
+/// `or_join` maps to recall (OR) vs strict (AND) mode.
+/// Expands bare terms via the process wordcloud dict (CN–EN synonyms).
 fn fts_query(input: &str, or_join: bool) -> String {
-    let terms: Vec<String> = input
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|t| !t.is_empty())
-        .map(|t| format!("\"{t}\"*"))
-        .collect();
-    if terms.is_empty() {
-        "\"\"".into()
-    } else if or_join {
-        terms.join(" OR ")
+    let mode = if or_join {
+        crate::search::SearchMode::Recall
     } else {
-        terms.join(" ")
-    }
+        crate::search::SearchMode::Strict
+    };
+    crate::wordcloud_dict::process_dict().with_dict(|dict| {
+        crate::search::fts_match_expr_with_dict(input, mode, Some(dict))
+    })
 }
 
 /// Retrieve up to `limit` articles relevant to a natural-language `question`,
@@ -1934,11 +1998,13 @@ fn map_tag_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Tag> {
         position: r.get(3)?,
         kind: r.get(4)?,
         article_count: r.get(5)?,
+        // Per-article tag chips pass a literal 0; list endpoints compute live unread.
+        unread_count: r.get(6)?,
     })
 }
 
 /// Every tag (optionally filtered by kind), ordered for the sidebar, with a
-/// live article count.
+/// live article count and unread ("update") count.
 pub fn list_tags(conn: &Connection, kind: Option<&str>) -> AppResult<Vec<Tag>> {
     let kind = match kind {
         Some(k) => Some(normalize_tag_kind(k)?),
@@ -1946,12 +2012,18 @@ pub fn list_tags(conn: &Connection, kind: Option<&str>) -> AppResult<Vec<Tag>> {
     };
     let sql = if kind.is_some() {
         "SELECT t.id, t.name, t.color, t.position, t.kind,
-                (SELECT COUNT(*) FROM article_tags at WHERE at.tag_id = t.id)
+                (SELECT COUNT(*) FROM article_tags at WHERE at.tag_id = t.id),
+                (SELECT COUNT(*) FROM article_tags at
+                   JOIN articles a ON a.id = at.article_id
+                  WHERE at.tag_id = t.id AND a.is_read = 0)
          FROM tags t WHERE t.kind = ?1
          ORDER BY t.position, t.name COLLATE NOCASE"
     } else {
         "SELECT t.id, t.name, t.color, t.position, t.kind,
-                (SELECT COUNT(*) FROM article_tags at WHERE at.tag_id = t.id)
+                (SELECT COUNT(*) FROM article_tags at WHERE at.tag_id = t.id),
+                (SELECT COUNT(*) FROM article_tags at
+                   JOIN articles a ON a.id = at.article_id
+                  WHERE at.tag_id = t.id AND a.is_read = 0)
          FROM tags t ORDER BY t.position, t.name COLLATE NOCASE"
     };
     let mut stmt = conn.prepare(sql)?;
@@ -2066,6 +2138,214 @@ pub fn reorder_tags(conn: &Connection, ids: &[i64]) -> AppResult<()> {
 
 pub fn delete_tag(conn: &Connection, id: i64) -> AppResult<()> {
     conn.execute("DELETE FROM tags WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+// ─────────────────────────── tag aliases ───────────────────────────
+
+fn map_tag_alias_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TagAlias> {
+    Ok(TagAlias {
+        id: r.get(0)?,
+        alias: r.get(1)?,
+        tag_id: r.get(2)?,
+        kind: r.get(3)?,
+        tag_name: r.get(4)?,
+    })
+}
+
+/// List aliases, optionally filtered by target tag and/or kind.
+pub fn list_tag_aliases(
+    conn: &Connection,
+    tag_id: Option<i64>,
+    kind: Option<&str>,
+) -> AppResult<Vec<TagAlias>> {
+    let kind = match kind {
+        Some(k) => Some(normalize_tag_kind(k)?),
+        None => None,
+    };
+    let sql = match (tag_id.is_some(), kind.is_some()) {
+        (true, true) => {
+            "SELECT a.id, a.alias, a.tag_id, a.kind, t.name
+             FROM tag_aliases a JOIN tags t ON t.id = a.tag_id
+             WHERE a.tag_id = ?1 AND a.kind = ?2
+             ORDER BY a.alias COLLATE NOCASE"
+        }
+        (true, false) => {
+            "SELECT a.id, a.alias, a.tag_id, a.kind, t.name
+             FROM tag_aliases a JOIN tags t ON t.id = a.tag_id
+             WHERE a.tag_id = ?1
+             ORDER BY a.alias COLLATE NOCASE"
+        }
+        (false, true) => {
+            "SELECT a.id, a.alias, a.tag_id, a.kind, t.name
+             FROM tag_aliases a JOIN tags t ON t.id = a.tag_id
+             WHERE a.kind = ?1
+             ORDER BY t.name COLLATE NOCASE, a.alias COLLATE NOCASE"
+        }
+        (false, false) => {
+            "SELECT a.id, a.alias, a.tag_id, a.kind, t.name
+             FROM tag_aliases a JOIN tags t ON t.id = a.tag_id
+             ORDER BY a.kind, t.name COLLATE NOCASE, a.alias COLLATE NOCASE"
+        }
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let rows = match (tag_id, kind) {
+        (Some(tid), Some(k)) => stmt
+            .query_map(params![tid, k], map_tag_alias_row)?
+            .collect::<Result<Vec<_>, _>>()?,
+        (Some(tid), None) => stmt
+            .query_map(params![tid], map_tag_alias_row)?
+            .collect::<Result<Vec<_>, _>>()?,
+        (None, Some(k)) => stmt
+            .query_map(params![k], map_tag_alias_row)?
+            .collect::<Result<Vec<_>, _>>()?,
+        (None, None) => stmt
+            .query_map([], map_tag_alias_row)?
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    Ok(rows)
+}
+
+/// Resolve an alias string to its canonical tag id within `kind`.
+pub fn resolve_tag_alias(conn: &Connection, kind: &str, alias: &str) -> AppResult<Option<i64>> {
+    let kind = normalize_tag_kind(kind)?;
+    let alias = alias.trim();
+    if alias.is_empty() {
+        return Ok(None);
+    }
+    Ok(conn
+        .query_row(
+            "SELECT tag_id FROM tag_aliases
+             WHERE kind = ?1 AND alias = ?2 COLLATE NOCASE",
+            params![kind, alias],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+/// Resolve a suggested name to a tag id: exact tag name first, then alias.
+///
+/// Case-insensitive within `kind`. Does not create tags.
+pub fn resolve_tag_by_name_or_alias(
+    conn: &Connection,
+    kind: &str,
+    name: &str,
+) -> AppResult<Option<i64>> {
+    let kind = normalize_tag_kind(kind)?;
+    let name = name.trim();
+    if name.is_empty() {
+        return Ok(None);
+    }
+    if let Some(id) = conn
+        .query_row(
+            "SELECT id FROM tags WHERE kind = ?1 AND name = ?2 COLLATE NOCASE",
+            params![kind, name],
+            |r| r.get(0),
+        )
+        .optional()?
+    {
+        return Ok(Some(id));
+    }
+    resolve_tag_alias(conn, kind, name)
+}
+
+/// Add an alias for `tag_id`. Kind is taken from the target tag.
+///
+/// Guardrails: trim; reject empty; reject if the alias equals any tag name of
+/// the same kind (case-insensitive); UNIQUE(kind, alias) enforces one mapping.
+pub fn create_tag_alias(conn: &Connection, tag_id: i64, alias: &str) -> AppResult<i64> {
+    let alias = alias.trim();
+    if alias.is_empty() {
+        return Err(AppError::code("emptyTagAlias"));
+    }
+    let kind: String = conn
+        .query_row("SELECT kind FROM tags WHERE id = ?1", params![tag_id], |r| {
+            r.get(0)
+        })
+        .optional()?
+        .ok_or_else(|| AppError::code("tagNotFound"))?;
+    let kind = normalize_tag_kind(&kind)?;
+
+    let name_clash: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM tags WHERE kind = ?1 AND name = ?2 COLLATE NOCASE",
+            params![kind, alias],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if name_clash.is_some() {
+        return Err(AppError::code("tagAliasConflictsWithTagName"));
+    }
+
+    let alias_clash: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM tag_aliases WHERE kind = ?1 AND alias = ?2 COLLATE NOCASE",
+            params![kind, alias],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if alias_clash.is_some() {
+        return Err(AppError::code("tagAliasExists"));
+    }
+
+    conn.execute(
+        "INSERT INTO tag_aliases(alias, tag_id, kind) VALUES (?1, ?2, ?3)",
+        params![alias, tag_id, kind],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Rename an alias; same guardrails as [`create_tag_alias`].
+pub fn rename_tag_alias(conn: &Connection, id: i64, alias: &str) -> AppResult<()> {
+    let alias = alias.trim();
+    if alias.is_empty() {
+        return Err(AppError::code("emptyTagAlias"));
+    }
+    let kind: String = conn
+        .query_row(
+            "SELECT kind FROM tag_aliases WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| AppError::code("tagAliasNotFound"))?;
+    let kind = normalize_tag_kind(&kind)?;
+
+    let name_clash: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM tags WHERE kind = ?1 AND name = ?2 COLLATE NOCASE",
+            params![kind, alias],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if name_clash.is_some() {
+        return Err(AppError::code("tagAliasConflictsWithTagName"));
+    }
+
+    let alias_clash: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM tag_aliases
+             WHERE kind = ?1 AND alias = ?2 COLLATE NOCASE AND id != ?3",
+            params![kind, alias, id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if alias_clash.is_some() {
+        return Err(AppError::code("tagAliasExists"));
+    }
+
+    conn.execute(
+        "UPDATE tag_aliases SET alias = ?2 WHERE id = ?1",
+        params![id, alias],
+    )?;
+    Ok(())
+}
+
+pub fn delete_tag_alias(conn: &Connection, id: i64) -> AppResult<()> {
+    let n = conn.execute("DELETE FROM tag_aliases WHERE id = ?1", params![id])?;
+    if n == 0 {
+        return Err(AppError::code("tagAliasNotFound"));
+    }
     Ok(())
 }
 
@@ -2534,10 +2814,10 @@ pub fn clear_auto_tag_queue(conn: &Connection) -> AppResult<usize> {
     Ok(n)
 }
 
-/// Tags attached to one article (article_count left at 0 — unused per-article).
+/// Tags attached to one article (counts left at 0 — unused per-article).
 pub fn tags_for_article(conn: &Connection, article_id: i64) -> AppResult<Vec<Tag>> {
     let mut stmt = conn.prepare(
-        "SELECT t.id, t.name, t.color, t.position, t.kind, 0
+        "SELECT t.id, t.name, t.color, t.position, t.kind, 0, 0
          FROM tags t JOIN article_tags at ON at.tag_id = t.id
          WHERE at.article_id = ?1
          ORDER BY t.kind, t.position, t.name COLLATE NOCASE",
@@ -2565,7 +2845,7 @@ pub fn tags_for_articles(
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!(
-        "SELECT at.article_id, t.id, t.name, t.color, t.position, t.kind, 0
+        "SELECT at.article_id, t.id, t.name, t.color, t.position, t.kind, 0, 0
          FROM tags t JOIN article_tags at ON at.tag_id = t.id
          WHERE at.article_id IN ({placeholders})
          ORDER BY at.article_id, t.kind, t.position, t.name COLLATE NOCASE"
@@ -2581,6 +2861,7 @@ pub fn tags_for_articles(
             position: r.get(4)?,
             kind: r.get(5)?,
             article_count: r.get(6)?,
+            unread_count: r.get(7)?,
         };
         Ok((article_id, tag))
     })?;
@@ -3967,7 +4248,7 @@ mod tests {
     #[test]
     fn fts_query_and_joins_explicit_search_terms() {
         // Explicit search: every word required (implicit FTS5 AND).
-        assert_eq!(fts_query("rust async", false), "\"rust\"* \"async\"*");
+        assert_eq!(fts_query("rust async", false), "\"rust\"* AND \"async\"*");
     }
 
     #[test]
@@ -3975,7 +4256,7 @@ mod tests {
         // RAG retrieval: any word may match.
         assert_eq!(
             fts_query("rust async runtime", true),
-            "\"rust\"* OR \"async\"* OR \"runtime\"*"
+            "(\"rust\"* OR \"async\"* OR \"runtime\"*)"
         );
     }
 
@@ -3990,14 +4271,15 @@ mod tests {
 
     #[test]
     fn fts_query_splits_punctuation_into_separate_terms() {
-        // Punctuation *inside* a word splits it into separate terms, matching
-        // how the unicode61 tokenizer indexes the article text — collapsing
-        // `rust-lang` to `rustlang` would match nothing the index holds.
-        assert_eq!(fts_query("rust-lang", false), "\"rust\"* \"lang\"*");
-        assert_eq!(fts_query("node.js", true), "\"node\"* OR \"js\"*");
+        // Punctuation *inside* a word splits it into separate AND-joined
+        // parts, matching how unicode61 indexes the article text.
+        assert_eq!(fts_query("rust-lang", false), "\"rust\"* AND \"lang\"*");
+        // A single dotted token still AND-joins its parts (not OR), even in
+        // recall mode — recall only ORs *separate* bare terms.
+        assert_eq!(fts_query("node.js", true), "\"node\"* AND \"js\"*");
         assert_eq!(
             fts_query("co-op runtime", false),
-            "\"co\"* \"op\"* \"runtime\"*"
+            "\"co\"* AND \"op\"* AND \"runtime\"*"
         );
     }
 
@@ -5199,10 +5481,9 @@ mod tests {
     }
 
     #[test]
-    fn list_articles_search_respects_chronological_sort() {
-        // FTS filters the result set; the newest/oldest toggle must still
-        // control ORDER BY. Ranking by `fts.rank` alone put older high-scoring
-        // hits above newer ones while the UI still showed 最新优先.
+    fn list_articles_search_defaults_to_relevance_then_date() {
+        // Active search orders by FTS rank first; equal-rank ties break by date.
+        // `sort_by_relevance: false` restores pure chronological order.
         let (conn, fixture) = test_db();
         let feed_id: i64 = conn
             .query_row("SELECT feed_id FROM articles WHERE id = ?1", [fixture], |r| {
@@ -5249,7 +5530,8 @@ mod tests {
             })
             .unwrap();
 
-        let newest = list_articles(
+        // Same FTS score → secondary date DESC (newest first).
+        let by_rank = list_articles(
             &conn,
             &ArticleQuery::All,
             false,
@@ -5260,26 +5542,138 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            newest.iter().map(|a| a.id).collect::<Vec<_>>(),
+            by_rank.iter().map(|a| a.id).collect::<Vec<_>>(),
             [newer_id, older_id],
-            "newest-first search must order by article date, not fts.rank"
+            "relevance sort uses date as secondary (newest)"
         );
 
-        let oldest = list_articles(
+        let by_date_oldest = list_articles_sorted(
             &conn,
             &ArticleQuery::All,
             false,
             Some("China"),
             true,
+            false,
             50,
             0,
         )
         .unwrap();
         assert_eq!(
-            oldest.iter().map(|a| a.id).collect::<Vec<_>>(),
+            by_date_oldest.iter().map(|a| a.id).collect::<Vec<_>>(),
             [older_id, newer_id],
-            "oldest-first search must mirror chronological order"
+            "sort_by_relevance=false must use chronological oldest-first"
         );
+    }
+
+    #[test]
+    fn list_articles_strict_and_or_not_semantics() {
+        let (conn, fixture) = test_db();
+        let feed_id: i64 = conn
+            .query_row("SELECT feed_id FROM articles WHERE id = ?1", [fixture], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute("DELETE FROM articles WHERE id = ?1", [fixture])
+            .unwrap();
+
+        add_article(
+            &conn,
+            feed_id,
+            "t1",
+            "Trump visits China",
+            "trade talks continue",
+        );
+        add_article(
+            &conn,
+            feed_id,
+            "t2",
+            "Biden on China",
+            "diplomacy notes",
+        );
+        add_article(
+            &conn,
+            feed_id,
+            "t3",
+            "Trump tariff plan",
+            "tariff announcement",
+        );
+        add_article(
+            &conn,
+            feed_id,
+            "t4",
+            "Opinion: markets",
+            "Trump China opinion piece",
+        );
+
+        let and_hits = list_articles(
+            &conn,
+            &ArticleQuery::All,
+            false,
+            Some("Trump china"),
+            false,
+            50,
+            0,
+        )
+        .unwrap();
+        let and_titles: Vec<&str> = and_hits.iter().map(|a| a.title.as_str()).collect();
+        assert!(and_titles.iter().any(|t| t.contains("visits China")));
+        assert!(
+            !and_titles.iter().any(|t| t.contains("tariff plan")),
+            "AND must exclude Trump-only without china: {and_titles:?}"
+        );
+
+        let or_hits = list_articles(
+            &conn,
+            &ArticleQuery::All,
+            false,
+            Some("Trump OR Biden"),
+            false,
+            50,
+            0,
+        )
+        .unwrap();
+        assert!(or_hits.len() >= 3);
+
+        let not_hits = list_articles(
+            &conn,
+            &ArticleQuery::All,
+            false,
+            Some("Trump -tariff"),
+            false,
+            50,
+            0,
+        )
+        .unwrap();
+        let not_titles: Vec<&str> = not_hits.iter().map(|a| a.title.as_str()).collect();
+        assert!(
+            !not_titles.iter().any(|t| t.to_lowercase().contains("tariff")),
+            "NOT must exclude tariff: {not_titles:?}"
+        );
+
+        let grouped = list_articles(
+            &conn,
+            &ArticleQuery::All,
+            false,
+            Some("(Trump OR Biden) china"),
+            false,
+            50,
+            0,
+        )
+        .unwrap();
+        assert!(!grouped.is_empty());
+
+        let phrase = list_articles(
+            &conn,
+            &ArticleQuery::All,
+            false,
+            Some("\"visits China\""),
+            false,
+            50,
+            0,
+        )
+        .unwrap();
+        assert_eq!(phrase.len(), 1);
+        assert!(phrase[0].title.contains("visits China"));
     }
 
     // ── feed rename vs. refresh ──────────────────────────────────────
@@ -5850,5 +6244,114 @@ mod tests {
         let windowed = ai_usage_stats(&conn, 30).unwrap();
         assert_eq!(windowed.total.calls, 2);
         assert_eq!(windowed.total.prompt_tokens, 210);
+    }
+
+    #[test]
+    fn tag_aliases_migration_additive_and_crud() {
+        // v30 only adds `tag_aliases` — existing tags / article_tags survive.
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        MIGRATIONS.to_version(&mut conn, 29).unwrap();
+        register_functions(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO feeds(id, feed_url, title, source_type)
+             VALUES (1, 'https://a.example/feed', 'A', 'rss')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO articles(id, feed_id, guid, url, title, body_text)
+             VALUES (1, 1, 'g1', 'https://example.com/a', 'T', '')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tags(id, name, color, position, kind)
+             VALUES (10, 'Rust', 'clay', 0, 'interest')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO article_tags(article_id, tag_id) VALUES (1, 10)",
+            [],
+        )
+        .unwrap();
+
+        MIGRATIONS.to_latest(&mut conn).unwrap();
+
+        let tag_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tags", [], |r| r.get(0))
+            .unwrap();
+        let link_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM article_tags", [], |r| r.get(0))
+            .unwrap();
+        let alias_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tag_aliases", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tag_count, 1);
+        assert_eq!(link_count, 1);
+        assert_eq!(alias_count, 0, "v1 ships with an empty alias table");
+
+        let alias_id = create_tag_alias(&conn, 10, "  rustlang  ").unwrap();
+        let listed = list_tag_aliases(&conn, Some(10), Some(TAG_KIND_INTEREST)).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, alias_id);
+        assert_eq!(listed[0].alias, "rustlang");
+        assert_eq!(listed[0].tag_name, "Rust");
+
+        assert_eq!(
+            resolve_tag_by_name_or_alias(&conn, TAG_KIND_INTEREST, "RustLang")
+                .unwrap(),
+            Some(10)
+        );
+        assert_eq!(
+            resolve_tag_by_name_or_alias(&conn, TAG_KIND_INTEREST, "rust").unwrap(),
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn create_tag_alias_rejects_empty_and_tag_name_clash() {
+        let (conn, _) = test_db();
+        let rust = create_tag(&conn, "Rust", TAG_KIND_INTEREST).unwrap();
+        let _go = create_tag(&conn, "Go", TAG_KIND_INTEREST).unwrap();
+
+        assert!(matches!(
+            create_tag_alias(&conn, rust, "   ").unwrap_err(),
+            AppError::Coded("emptyTagAlias")
+        ));
+        // Alias must not equal any tag name in the same kind (incl. self).
+        assert!(matches!(
+            create_tag_alias(&conn, rust, "Go").unwrap_err(),
+            AppError::Coded("tagAliasConflictsWithTagName")
+        ));
+        assert!(matches!(
+            create_tag_alias(&conn, rust, "rust").unwrap_err(),
+            AppError::Coded("tagAliasConflictsWithTagName")
+        ));
+
+        create_tag_alias(&conn, rust, "rustlang").unwrap();
+        assert!(matches!(
+            create_tag_alias(&conn, rust, "RustLang").unwrap_err(),
+            AppError::Coded("tagAliasExists")
+        ));
+    }
+
+    #[test]
+    fn delete_tag_cascades_aliases() {
+        let (conn, _) = test_db();
+        let rust = create_tag(&conn, "Rust", TAG_KIND_INTEREST).unwrap();
+        create_tag_alias(&conn, rust, "rustlang").unwrap();
+        create_tag_alias(&conn, rust, "rust-rs").unwrap();
+        assert_eq!(list_tag_aliases(&conn, Some(rust), None).unwrap().len(), 2);
+
+        delete_tag(&conn, rust).unwrap();
+        assert!(list_tag_aliases(&conn, None, Some(TAG_KIND_INTEREST))
+            .unwrap()
+            .is_empty());
+        let leftover: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tag_aliases", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(leftover, 0);
     }
 }

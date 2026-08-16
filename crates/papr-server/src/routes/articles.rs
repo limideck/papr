@@ -21,10 +21,17 @@ pub struct ListQuery {
     pub search: Option<String>,
     #[serde(default)]
     pub oldest_first: bool,
+    /// When search is active, order by FTS rank (default true).
+    #[serde(default = "default_true")]
+    pub sort_by_relevance: bool,
     #[serde(default = "default_limit")]
     pub limit: i64,
     #[serde(default)]
     pub offset: i64,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_limit() -> i64 {
@@ -52,6 +59,8 @@ pub struct ListBody {
     pub search: Option<String>,
     #[serde(default)]
     pub oldest_first: bool,
+    #[serde(default = "default_true")]
+    pub sort_by_relevance: bool,
     #[serde(default = "default_limit")]
     pub limit: i64,
     #[serde(default)]
@@ -91,13 +100,14 @@ pub async fn list(
 ) -> ApiResult<Json<Value>> {
     let query = parse_article_query(q.kind.as_deref(), q.value);
     let conn = state.db.lock().await;
-    let rows = user_db::list_articles_for_user(
+    let rows = user_db::list_articles_for_user_sorted(
         &conn,
         user.id(),
         &query,
         q.unread_only,
         q.search.as_deref(),
         q.oldest_first,
+        q.sort_by_relevance,
         q.limit,
         q.offset,
     )
@@ -112,13 +122,14 @@ pub async fn list_post(
 ) -> ApiResult<Json<Value>> {
     let query = ArticleQuery::from(body.query);
     let conn = state.db.lock().await;
-    let rows = user_db::list_articles_for_user(
+    let rows = user_db::list_articles_for_user_sorted(
         &conn,
         user.id(),
         &query,
         body.unread_only,
         body.search.as_deref(),
         body.oldest_first,
+        body.sort_by_relevance,
         body.limit,
         body.offset,
     )

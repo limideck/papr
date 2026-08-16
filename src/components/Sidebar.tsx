@@ -7,6 +7,7 @@ import { useUi } from "../store";
 import { useArticleActions } from "../hooks/articleActions";
 import { withUndo, reportError } from "../toast";
 import { tagColor, TAG_PALETTE } from "../lib/tagColors";
+import { mergeAdditiveSearchTerm } from "../lib/searchChips";
 import type { ArticleQuery, Feed, Folder, Tag } from "../types";
 import Icon, { type IconName } from "./Icon";
 import ContextMenu, { type MenuEntry } from "./ContextMenu";
@@ -113,6 +114,12 @@ export default function Sidebar({
   const folders = useQuery({ queryKey: ["folders"], queryFn: api.listFolders });
   const counts = useQuery({ queryKey: ["counts"], queryFn: api.smartCounts });
   const tags = useQuery({ queryKey: ["tags"], queryFn: () => api.listTags() });
+  const entitiesQ = useQuery({
+    queryKey: ["wordcloud-entities"],
+    queryFn: api.getWordCloudEntities,
+    staleTime: 60_000,
+  });
+  const cloudEntities = entitiesQ.data?.entities ?? [];
 
   const [collapsed, setCollapsed] = useState<Record<number, boolean>>(() => {
     try {
@@ -188,30 +195,32 @@ export default function Sidebar({
     return sorted;
   };
 
-  // Tag list sort: alpha by name, or by article count. Same persistence
-  // pattern as feed sort so the Tags tab keeps the preferred order.
-  type TagSortMode = "alpha" | "count";
+  // Tag list sort: alpha by name, article count, or unread ("update") count.
+  // Same persistence pattern as feed sort so the Tags tab keeps the preferred order.
+  type TagSortMode = "alpha" | "count" | "unread";
   type TagSortDir = "asc" | "desc";
   const TAG_SORT_KEY = "papr.tagSort";
   const defaultTagDir = (mode: TagSortMode): TagSortDir =>
-    mode === "count" ? "desc" : "asc";
+    mode === "alpha" ? "asc" : "desc";
   const [tagSort, setTagSort] = useState<{
     mode: TagSortMode;
     dir: TagSortDir;
   }>(() => {
     try {
       const raw = localStorage.getItem(TAG_SORT_KEY);
-      if (!raw) return { mode: "count", dir: "desc" };
+      if (!raw) return { mode: "unread", dir: "desc" };
       const [modePart, dirPart] = raw.split(":");
       const mode: TagSortMode =
-        modePart === "alpha" || modePart === "count" ? modePart : "count";
+        modePart === "alpha" || modePart === "count" || modePart === "unread"
+          ? modePart
+          : "unread";
       const dir: TagSortDir =
         dirPart === "asc" || dirPart === "desc"
           ? dirPart
           : defaultTagDir(mode);
       return { mode, dir };
     } catch {
-      return { mode: "count", dir: "desc" };
+      return { mode: "unread", dir: "desc" };
     }
   });
   useEffect(() => {
@@ -226,6 +235,8 @@ export default function Sidebar({
     );
   };
 
+  const tagUnread = (tag: Tag) => tag.unreadCount ?? 0;
+
   const sortTags = (list: Tag[]): Tag[] => {
     const sorted = [...list];
     const mul = tagSort.dir === "asc" ? 1 : -1;
@@ -235,10 +246,80 @@ export default function Sidebar({
           mul *
           a.name.localeCompare(b.name, undefined, { sensitivity: "base" }),
       );
-    } else {
+    } else if (tagSort.mode === "count") {
       sorted.sort((a, b) => {
         const byCount = (a.articleCount - b.articleCount) * mul;
         if (byCount !== 0) return byCount;
+        return a.name.localeCompare(b.name, undefined, {
+          sensitivity: "base",
+        });
+      });
+    } else {
+      sorted.sort((a, b) => {
+        const byUnread = (tagUnread(a) - tagUnread(b)) * mul;
+        if (byUnread !== 0) return byUnread;
+        const byCount = b.articleCount - a.articleCount;
+        if (byCount !== 0) return byCount;
+        return a.name.localeCompare(b.name, undefined, {
+          sensitivity: "base",
+        });
+      });
+    }
+    return sorted;
+  };
+
+  // Interest tags on the Feeds tab: default / persist sort by updates (unread).
+  type InterestSortMode = "alpha" | "unread";
+  const INTEREST_SORT_KEY = "papr.interestTagSort";
+  const [interestSort, setInterestSort] = useState<{
+    mode: InterestSortMode;
+    dir: TagSortDir;
+  }>(() => {
+    try {
+      const raw = localStorage.getItem(INTEREST_SORT_KEY);
+      if (!raw) return { mode: "unread", dir: "desc" };
+      const [modePart, dirPart] = raw.split(":");
+      const mode: InterestSortMode =
+        modePart === "alpha" || modePart === "unread" ? modePart : "unread";
+      const dir: TagSortDir =
+        dirPart === "asc" || dirPart === "desc"
+          ? dirPart
+          : mode === "unread"
+            ? "desc"
+            : "asc";
+      return { mode, dir };
+    } catch {
+      return { mode: "unread", dir: "desc" };
+    }
+  });
+  useEffect(() => {
+    localStorage.setItem(
+      INTEREST_SORT_KEY,
+      `${interestSort.mode}:${interestSort.dir}`,
+    );
+  }, [interestSort]);
+
+  const setInterestSortMode = (mode: InterestSortMode) => {
+    setInterestSort((prev) =>
+      prev.mode === mode
+        ? { mode, dir: prev.dir === "asc" ? "desc" : "asc" }
+        : { mode, dir: mode === "unread" ? "desc" : "asc" },
+    );
+  };
+
+  const sortInterestTags = (list: Tag[]): Tag[] => {
+    const sorted = [...list];
+    const mul = interestSort.dir === "asc" ? 1 : -1;
+    if (interestSort.mode === "alpha") {
+      sorted.sort(
+        (a, b) =>
+          mul *
+          a.name.localeCompare(b.name, undefined, { sensitivity: "base" }),
+      );
+    } else {
+      sorted.sort((a, b) => {
+        const byUnread = (tagUnread(a) - tagUnread(b)) * mul;
+        if (byUnread !== 0) return byUnread;
         return a.name.localeCompare(b.name, undefined, {
           sensitivity: "base",
         });
@@ -339,14 +420,8 @@ export default function Sidebar({
     (tg) => (tg.kind ?? "interest") === "interest",
   );
   const aiTags = allTags.filter((tg) => tg.kind === "ai");
-  // Preview on the Feeds tab: top 10 interest tags by article count.
-  const topTags = [...interestTags]
-    .sort(
-      (a, b) =>
-        b.articleCount - a.articleCount ||
-        a.name.localeCompare(b.name, undefined, { sensitivity: "base" }),
-    )
-    .slice(0, 10);
+  // Feeds tab: all interest tags by current update/name sort.
+  const topTags = sortInterestTags(interestTags);
   const isActive = (q: ArticleQuery) => sameQuery(q, query);
 
   // Keep the selected feed in view. Opening an article from search jumps the
@@ -387,6 +462,34 @@ export default function Sidebar({
     isActive({ kind: "feed", value: f.id });
   const visibleFeeds = allFeeds.filter(feedVisible);
   const ungrouped = sortFeeds(visibleFeeds.filter((f) => f.folderId == null));
+
+  const folderUnreadTotal = (folderId: number) =>
+    visibleFeeds
+      .filter((f) => f.folderId === folderId)
+      .reduce((n, f) => n + f.unreadCount, 0);
+
+  // Apply the same A–Z / Updates sort to folders (not only feeds inside them).
+  const sortedFolders = (() => {
+    const list = [...allFolders];
+    const mul = feedSort.dir === "asc" ? 1 : -1;
+    if (feedSort.mode === "alpha") {
+      list.sort(
+        (a, b) =>
+          mul *
+          a.name.localeCompare(b.name, undefined, { sensitivity: "base" }),
+      );
+    } else {
+      list.sort((a, b) => {
+        const byUnread =
+          (folderUnreadTotal(a.id) - folderUnreadTotal(b.id)) * mul;
+        if (byUnread !== 0) return byUnread;
+        return a.name.localeCompare(b.name, undefined, {
+          sensitivity: "base",
+        });
+      });
+    }
+    return list;
+  })();
 
   // ── drag to move a feed between folders ──
   const handleDrop = (target: number | null) => {
@@ -665,18 +768,11 @@ export default function Sidebar({
     // Snapshot search before `select`, which clears listSearch on every browse
     // change — otherwise Shift+click would always see an empty set.
     const cur = useUi.getState().listSearch?.trim() ?? "";
-    const parts = cur.split(/\s+/).filter(Boolean);
     let next: string | null;
     if (additive) {
-      if (!cur) {
-        next = term;
-      } else if (parts.includes(term)) {
-        next = parts.filter((p) => p !== term).join(" ") || null;
-      } else {
-        next = `${cur} ${term}`;
-      }
+      next = mergeAdditiveSearchTerm(cur, term, cloudEntities);
     } else {
-      next = term;
+      next = term.trim() || null;
     }
     // Apply as the article-list filter, but stay on the word-cloud tab.
     select({ kind: "all" }, t("smart.all"));
@@ -695,7 +791,10 @@ export default function Sidebar({
   };
 
   /** Tag row used on Feeds (preview) and Tags (full list, reorderable). */
-  const tagRow = (tag: Tag, opts: { reorderable: boolean; alwaysCount: boolean }) => (
+  const tagRow = (
+    tag: Tag,
+    opts: { reorderable: boolean; alwaysCount: boolean; showUnread?: boolean },
+  ) => (
     <div
       key={tag.id}
       className={`sb-item ${
@@ -746,8 +845,16 @@ export default function Sidebar({
         />
       </span>
       <span className="sb-label">{tag.name}</span>
-      {(opts.alwaysCount || showCounts) && tag.articleCount > 0 && (
-        <span className="sb-count">{tag.articleCount}</span>
+      {(opts.alwaysCount || showCounts) &&
+        (tag.articleCount > 0 || tagUnread(tag) > 0) && (
+        <span className="sb-count">
+          {opts.showUnread
+            ? t("sidebar.tagCountWithUnread", {
+                total: tag.articleCount,
+                unread: tagUnread(tag),
+              })
+            : tag.articleCount}
+        </span>
       )}
     </div>
   );
@@ -831,6 +938,21 @@ export default function Sidebar({
                       ? "↑"
                       : "↓"}
                   </button>
+                  <span className="sb-feed-sort-sep" aria-hidden="true">
+                    ·
+                  </span>
+                  <button
+                    type="button"
+                    className={tagSort.mode === "unread" ? "active" : ""}
+                    onClick={() => setTagSortMode("unread")}
+                    aria-pressed={tagSort.mode === "unread"}
+                    title={t("sidebar.sortUpdatesHint")}
+                  >
+                    {t("sidebar.sortUpdates")}{" "}
+                    {tagSort.mode === "unread" && tagSort.dir === "asc"
+                      ? "↑"
+                      : "↓"}
+                  </button>
                 </span>
               </span>
             </div>
@@ -843,6 +965,7 @@ export default function Sidebar({
                   // fight the selected mode (same idea as the Feeds list).
                   reorderable: false,
                   alwaysCount: true,
+                  showUnread: true,
                 }),
               )
             )}
@@ -858,6 +981,7 @@ export default function Sidebar({
           value={searchDraft}
           placeholder={t("sidebar.searchArticles")}
           aria-label={t("sidebar.searchArticles")}
+          title={t("sidebar.searchHint")}
           onChange={(e) => setSearchDraft(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === "Enter") {
@@ -866,6 +990,30 @@ export default function Sidebar({
             }
           }}
         />
+        <details className="sidebar-search-help">
+          <summary title={t("sidebar.searchSyntaxTitle")}>?</summary>
+          <div className="sidebar-search-help-pop" role="note">
+            <p>{t("sidebar.searchHint")}</p>
+            <ul>
+              <li>
+                <code>a b</code> — {t("sidebar.searchHelpAnd")}
+              </li>
+              <li>
+                <code>"a b"</code> — {t("sidebar.searchHelpPhrase")}
+              </li>
+              <li>
+                <code>a OR b</code> — {t("sidebar.searchHelpOr")}
+              </li>
+              <li>
+                <code>a -b</code> — {t("sidebar.searchHelpNot")}
+              </li>
+              <li>
+                <code>title:a</code> / <code>feed:Name</code>
+              </li>
+            </ul>
+            <p className="sidebar-search-help-more">{t("sidebar.searchHelpMore")}</p>
+          </div>
+        </details>
       </label>
 
       <div className="sidebar-scroll">
@@ -927,9 +1075,9 @@ export default function Sidebar({
                 className={feedSort.mode === "unread" ? "active" : ""}
                 onClick={() => setSortMode("unread")}
                 aria-pressed={feedSort.mode === "unread"}
-                title={t("sidebar.sortUnreadHint")}
+                title={t("sidebar.sortUpdatesHint")}
               >
-                {t("sidebar.sortUnread")}{" "}
+                {t("sidebar.sortUpdates")}{" "}
                 {feedSort.mode === "unread" && feedSort.dir === "asc"
                   ? "↑"
                   : "↓"}
@@ -1020,7 +1168,7 @@ export default function Sidebar({
           </div>
         )}
 
-        {allFolders.map((folder) => {
+        {sortedFolders.map((folder) => {
           const inFolder = sortFeeds(
             visibleFeeds.filter((f) => f.folderId === folder.id),
           );
@@ -1059,53 +1207,50 @@ export default function Sidebar({
                 tabIndex={0}
                 aria-expanded={!isCollapsed}
                 aria-current={folderActive || undefined}
-                aria-label={`${folder.name}, ${t(
-                  isCollapsed ? "sidebar.expandFolder" : "sidebar.collapseFolder",
-                )}`}
-                onClick={() =>
-                  setCollapsed((s) => ({ ...s, [folder.id]: !isCollapsed }))
-                }
-                onKeyDown={onActivate(() =>
-                  setCollapsed((s) => ({ ...s, [folder.id]: !isCollapsed })),
-                )}
+                aria-label={folder.name}
+                onClick={() => {
+                  select({ kind: "folder", value: folder.id }, folder.name);
+                  if (isCollapsed) {
+                    setCollapsed((s) => ({ ...s, [folder.id]: false }));
+                  }
+                }}
+                onKeyDown={onActivate(() => {
+                  select({ kind: "folder", value: folder.id }, folder.name);
+                  if (isCollapsed) {
+                    setCollapsed((s) => ({ ...s, [folder.id]: false }));
+                  }
+                })}
                 onContextMenu={(e) => {
                   e.preventDefault();
                   setMenu({ x: e.clientX, y: e.clientY, kind: "folder", folder });
                 }}
               >
-                {/* Chevron, name, and the row body toggle expand/collapse.
-                    The unread count (below) selects the folder's article view. */}
-                <span className="sb-folder-toggle" aria-hidden>
+                {/* Chevron toggles expand/collapse; the rest selects the folder view. */}
+                <button
+                  type="button"
+                  className="sb-folder-toggle"
+                  aria-label={t(
+                    isCollapsed
+                      ? "sidebar.expandFolder"
+                      : "sidebar.collapseFolder",
+                  )}
+                  aria-expanded={!isCollapsed}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setCollapsed((s) => ({
+                      ...s,
+                      [folder.id]: !isCollapsed,
+                    }));
+                  }}
+                >
                   <Icon name="chevron-down" size={11} />
-                </span>
+                </button>
                 <span className="sb-folder-name">{folder.name}</span>
-                {showCounts && (isCollapsed || folderActive) && folderUnread > 0 && (
-                  <span
-                    className="sb-count"
-                    role="button"
-                    tabIndex={0}
-                    aria-label={folder.name}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      select(
-                        { kind: "folder", value: folder.id },
-                        folder.name,
-                      );
-                    }}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter" || e.key === " ") {
-                        e.preventDefault();
-                        e.stopPropagation();
-                        select(
-                          { kind: "folder", value: folder.id },
-                          folder.name,
-                        );
-                      }
-                    }}
-                  >
-                    {folderUnread}
-                  </span>
-                )}
+                {showCounts &&
+                  (isCollapsed || folderActive) &&
+                  folderUnread > 0 && (
+                    <span className="sb-count">{folderUnread}</span>
+                  )}
               </div>
               {!isCollapsed && inFolder.map(feedRow)}
             </div>
@@ -1116,9 +1261,49 @@ export default function Sidebar({
           <>
             <div className="sb-section-title">
               <span>{t("sidebar.interestTags")}</span>
+              <span className="sb-section-actions">
+                <span
+                  className="sb-feed-sort"
+                  role="group"
+                  aria-label={t("sidebar.sortInterestBy")}
+                >
+                  <button
+                    type="button"
+                    className={interestSort.mode === "alpha" ? "active" : ""}
+                    onClick={() => setInterestSortMode("alpha")}
+                    aria-pressed={interestSort.mode === "alpha"}
+                    title={t("sidebar.sortAlphaHint")}
+                  >
+                    {interestSort.mode === "alpha" &&
+                    interestSort.dir === "desc"
+                      ? "Z-A ↓"
+                      : "A-Z ↑"}
+                  </button>
+                  <span className="sb-feed-sort-sep" aria-hidden="true">
+                    ·
+                  </span>
+                  <button
+                    type="button"
+                    className={interestSort.mode === "unread" ? "active" : ""}
+                    onClick={() => setInterestSortMode("unread")}
+                    aria-pressed={interestSort.mode === "unread"}
+                    title={t("sidebar.sortUpdatesHint")}
+                  >
+                    {t("sidebar.sortUpdates")}{" "}
+                    {interestSort.mode === "unread" &&
+                    interestSort.dir === "asc"
+                      ? "↑"
+                      : "↓"}
+                  </button>
+                </span>
+              </span>
             </div>
             {topTags.map((tag) =>
-              tagRow(tag, { reorderable: false, alwaysCount: false }),
+              tagRow(tag, {
+                reorderable: false,
+                alwaysCount: false,
+                showUnread: true,
+              }),
             )}
           </>
         )}

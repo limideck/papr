@@ -29,3 +29,27 @@ export async function copyText(text: string): Promise<boolean> {
     return false;
   }
 }
+
+/** Copy both plain text and HTML when the ClipboardItem API is available, so
+ *  pasting into rich editors (Word, Notes, mail) keeps basic formatting.
+ *  Falls back to plain text on older webviews or when the write is denied. */
+export async function copyRichText(plain: string, html: string): Promise<boolean> {
+  if (
+    typeof navigator !== "undefined" &&
+    typeof ClipboardItem !== "undefined" &&
+    navigator.clipboard?.write
+  ) {
+    try {
+      await navigator.clipboard.write([
+        new ClipboardItem({
+          "text/plain": new Blob([plain], { type: "text/plain" }),
+          "text/html": new Blob([html], { type: "text/html" }),
+        }),
+      ]);
+      return true;
+    } catch {
+      /* fall through to plain text */
+    }
+  }
+  return copyText(plain);
+}

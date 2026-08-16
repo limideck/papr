@@ -100,9 +100,17 @@ export interface WordCloudEntity {
   aliases: string[];
 }
 
+export type WordCloudEntitiesSource = "shared" | "local" | "explicit";
+
 export interface WordCloudEntities {
   version: number;
   entities: WordCloudEntity[];
+  /** Where the active entities JSON was loaded from. */
+  source?: WordCloudEntitiesSource;
+  path?: string;
+  writable?: boolean;
+  seedDir?: string;
+  cowDir?: string;
 }
 
 export type SourceType =
@@ -192,6 +200,18 @@ export interface Tag {
   /** Defaults to interest when omitted by older payloads. */
   kind?: TagKind;
   articleCount: number;
+  /** Unread articles with this tag — used as the sidebar "update" count. */
+  unreadCount?: number;
+}
+
+/** Synonym → canonical tag mapping (Settings → Auto-tag → Aliases). */
+export interface TagAlias {
+  id: number;
+  alias: string;
+  tagId: number;
+  kind: TagKind | string;
+  /** Canonical tag display name. */
+  tagName: string;
 }
 
 export type RuleField = "title" | "author" | "content" | "any";

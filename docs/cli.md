@@ -94,6 +94,16 @@ repair the binary path on re-run.)
 | Area | Commands |
 | --- | --- |
 | Read | `papr`, `feeds`, `list`, `read`, `search` |
+
+### Search
+
+`papr search "<query>"` runs SQLite FTS5 over every article. By default it uses
+**recall** mode (bare terms join with OR) so multi-word questions still hit —
+same behaviour as RAG retrieval. Pass `--and` for **strict** mode (implicit AND),
+matching the desktop/web sidebar search.
+
+Full syntax (phrases, `OR` / `NOT` / `-`, grouping, `title:` / `body:` / `feed:`):
+see **[search.md](search.md)**.
 | Triage | `mark`, `mark-all`, `extract`, `refresh` |
 | Subscriptions | `subscribe`, `unsubscribe`, `feed`, `folder`, `folders`, `opml` |
 | Organise | `tags`, `tag`, `rules`, `rule`, `highlights`, `highlight` |

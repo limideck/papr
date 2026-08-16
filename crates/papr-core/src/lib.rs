@@ -19,6 +19,7 @@ pub mod ingestion;
 pub mod models;
 pub mod opml;
 pub mod sanitize;
+pub mod search;
 pub mod sync;
 pub mod translate;
 pub mod user_db;

@@ -94,6 +94,14 @@ pub fn api_router() -> Router<AppState> {
         .route("/api/tags/reorder", post(tags::reorder))
         .route("/api/tags/cleanup-empty", post(tags::cleanup_empty))
         .route(
+            "/api/tags/aliases",
+            get(tags::list_aliases).post(tags::create_alias),
+        )
+        .route(
+            "/api/tags/aliases/{id}",
+            patch(tags::update_alias).delete(tags::delete_alias),
+        )
+        .route(
             "/api/articles/{article_id}/tags/{tag_id}",
             put(tags::set_article_tag),
         )
@@ -119,7 +127,14 @@ pub fn api_router() -> Router<AppState> {
         // wordcloud
         .route("/api/wordcloud", get(wordcloud::get))
         .route("/api/wordcloud/stopwords", get(wordcloud::get_stopwords))
-        .route("/api/wordcloud/entities", get(wordcloud::get_entities))
+        .route(
+            "/api/wordcloud/entities",
+            get(wordcloud::get_entities).post(wordcloud::create_entity),
+        )
+        .route(
+            "/api/wordcloud/entities/{id}",
+            patch(wordcloud::patch_entity),
+        )
         .route("/api/wordcloud/status", get(wordcloud::status))
         .route("/api/wordcloud/backfill", post(wordcloud::backfill))
         // highlights

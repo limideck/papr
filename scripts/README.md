@@ -234,6 +234,8 @@ Unregister: `scripts/uninstall-service.sh`.
 | `PAPR_STATIC_DIR` | Frontend dir |
 | `PAPR_ADMIN_USER` / `PAPR_ADMIN_PASSWORD` | Admin seed |
 | `PAPR_ADMIN_RESET` | `1` to reset admin password on startup |
+| `PAPR_WORDCLOUD_DIR` | Optional override for wordcloud JSON dir (non-seed = read/write) |
+| `PAPR_WORDCLOUD_COW_DIR` | Optional COW overlay dir (default: `{dirname(PAPR_DB)}/wordcloud`) |
 | `RUST_LOG` | Tracing filter |
 
 Never commit a real `.env` or `scripts/deploy.env`.

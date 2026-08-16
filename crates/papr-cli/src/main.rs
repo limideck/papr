@@ -82,6 +82,10 @@ enum Cmd {
         /// Maximum matches to return.
         #[arg(long, default_value_t = SEARCH_LIMIT)]
         limit: i64,
+        /// Use strict AND for bare terms (same as the app sidebar). Default is
+        /// recall/OR, matching RAG retrieval.
+        #[arg(long)]
+        and: bool,
     },
     /// Change article state: read | unread | star | unstar | later | unlater.
     Mark {
@@ -490,7 +494,7 @@ async fn run(cli: Cli) -> Result<String, AxiError> {
         Some(Cmd::Feeds) => cmd_feeds(&path),
         Some(Cmd::List(args)) => cmd_list(&path, args),
         Some(Cmd::Read(args)) => cmd_read(&path, args),
-        Some(Cmd::Search { query, limit }) => cmd_search(&path, &query, limit),
+        Some(Cmd::Search { query, limit, and }) => cmd_search(&path, &query, limit, and),
         Some(Cmd::Mark { state, ids }) => cmd_mark(&path, &state, &ids),
         Some(Cmd::Tags) => cmd_tags(&path),
         Some(Cmd::Subscribe { url, folder }) => cmd_subscribe(&path, &url, folder).await,
@@ -828,11 +832,29 @@ fn cmd_read(path: &Path, args: ReadArgs) -> Result<String, AxiError> {
     Ok(d.into_toon())
 }
 
-fn cmd_search(path: &Path, query: &str, limit: i64) -> Result<String, AxiError> {
+fn cmd_search(path: &Path, query: &str, limit: i64, strict_and: bool) -> Result<String, AxiError> {
     let conn = open_ro(path)?;
-    let hits = db::search_articles_for_rag(&conn, query, clamp_limit(limit)).map_err(db_err)?;
+    let mode = if strict_and { "strict" } else { "recall" };
+    let hits = if strict_and {
+        db::list_articles(
+            &conn,
+            &ArticleQuery::All,
+            false,
+            Some(query),
+            false,
+            clamp_limit(limit),
+            0,
+        )
+        .map_err(db_err)?
+        .into_iter()
+        .map(|a| (a.id, a.title, a.feed_title))
+        .collect::<Vec<_>>()
+    } else {
+        db::search_articles_for_rag(&conn, query, clamp_limit(limit)).map_err(db_err)?
+    };
     let mut d = Doc::new();
     d.set("query", query);
+    d.set("mode", mode);
     d.set("count", hits.len());
     let rows: Vec<Value> = hits
         .iter()

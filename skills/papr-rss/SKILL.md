@@ -31,8 +31,13 @@ papr list --fields author,url   # add columns: author,url,snippet,type,feed_id,p
 papr read <id> [<id>...]    # plain-text body, truncated; pass several ids to batch
 papr read --feed <id> --unread --limit 5   # read a feed's latest unread in one call
 papr read <id> --full       # the complete body when truncation hid something
-papr search "<query>"       # FTS5 full-text search across every article
+papr search "<query>"       # FTS5 full-text search (recall/OR by default)
+papr search "<query>" --and # strict AND — same as the app sidebar search
 ```
+
+Search syntax (phrases, `OR` / `NOT` / `-`, grouping, field filters) is defined in
+[`docs/search.md`](../../docs/search.md). Default CLI mode is **recall** (OR);
+the UI list search is **strict** (AND).
 
 ## Triage & subscriptions
 

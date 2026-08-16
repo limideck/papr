@@ -9,6 +9,11 @@ import { copyText } from "../lib/clipboard";
 import { relTime } from "../lib/feedMeta";
 import { openUrl } from "../lib/openUrl";
 import { modCombo } from "../lib/platform";
+import {
+  highlightSegments,
+  searchHighlightTerms,
+} from "../lib/searchHighlight";
+import { removeSearchChip, searchChips } from "../lib/searchChips";
 import { reportError, toast } from "../toast";
 import { clampToViewport } from "../lib/viewport";
 import { tagColor } from "../lib/tagColors";
@@ -37,6 +42,7 @@ export default function ArticleList({ onToast }: Props) {
   const unreadOnly = useUi((s) => s.unreadOnly);
   const toggleUnreadOnly = useUi((s) => s.toggleUnreadOnly);
   const sortOldest = useUi((s) => s.sortOldest);
+  const sortByRelevance = useUi((s) => s.sortByRelevance);
   const toggleSort = useUi((s) => s.toggleSort);
   const listAnchor = useUi((s) => s.listAnchor);
   const listSearch = useUi((s) => s.listSearch);
@@ -48,6 +54,12 @@ export default function ArticleList({ onToast }: Props) {
   const openArticle = useUi((s) => s.openArticle);
 
   const feeds = useQuery({ queryKey: ["feeds"], queryFn: api.listFeeds });
+  const entitiesQ = useQuery({
+    queryKey: ["wordcloud-entities"],
+    queryFn: api.getWordCloudEntities,
+    staleTime: 60_000,
+  });
+  const entities = entitiesQ.data?.entities ?? [];
   const feedById = useMemo(() => {
     const m: Record<number, Feed> = {};
     for (const f of feeds.data ?? []) m[f.id] = f;
@@ -67,7 +79,15 @@ export default function ArticleList({ onToast }: Props) {
   // Opening a deep article from search anchors here so the list loads only that
   // article's page; the user can then page newer (up) or older (down) from it.
   const browse = useInfiniteQuery({
-    queryKey: ["articles", query, unreadOnly, sortOldest, listAnchor, listSearch],
+    queryKey: [
+      "articles",
+      query,
+      unreadOnly,
+      sortOldest,
+      sortByRelevance,
+      listAnchor,
+      listSearch,
+    ],
     initialPageParam: listAnchor,
     queryFn: ({ pageParam }) =>
       api.listArticles(
@@ -77,12 +97,23 @@ export default function ArticleList({ onToast }: Props) {
         sortOldest,
         PAGE,
         pageParam as number,
+        listSearch ? sortByRelevance : false,
       ),
     getNextPageParam: (last, _all, lastParam) =>
       last.length < PAGE ? undefined : (lastParam as number) + PAGE,
     getPreviousPageParam: (_first, _all, firstParam) =>
       (firstParam as number) > 0 ? Math.max(0, (firstParam as number) - PAGE) : undefined,
   });
+
+  const hitTerms = useMemo(
+    () => (listSearch ? searchHighlightTerms(listSearch, entities) : []),
+    [listSearch, entities],
+  );
+
+  const searchChipList = useMemo(
+    () => (listSearch ? searchChips(listSearch, entities) : []),
+    [listSearch, entities],
+  );
 
   const items: ArticleSummary[] = useMemo(
     () => browse.data?.pages.flat() ?? [],
@@ -151,7 +182,7 @@ export default function ArticleList({ onToast }: Props) {
   const prevBaseRef = useRef(baseOffset);
   const listSigRef = useRef("");
   useLayoutEffect(() => {
-    const sig = `${JSON.stringify(query)}|${unreadOnly}|${sortOldest}|${listAnchor}`;
+    const sig = `${JSON.stringify(query)}|${unreadOnly}|${sortOldest}|${sortByRelevance}|${listAnchor}`;
     const prev = prevBaseRef.current;
     prevBaseRef.current = baseOffset;
     if (sig !== listSigRef.current) {
@@ -162,7 +193,7 @@ export default function ArticleList({ onToast }: Props) {
       const el = scrollRef.current;
       if (el) el.scrollTop += (prev - baseOffset) * rowEstimate;
     }
-  }, [baseOffset, query, unreadOnly, sortOldest, listAnchor, rowEstimate]);
+  }, [baseOffset, query, unreadOnly, sortOldest, sortByRelevance, listAnchor, rowEstimate]);
 
   // The article we're keeping in view. A one-shot scroll lands on *estimated*
   // row heights when the list hasn't measured yet — fatal for long rows (an
@@ -270,7 +301,7 @@ export default function ArticleList({ onToast }: Props) {
   useEffect(() => {
     lookupRef.current = null;
     setLocate(null);
-  }, [query, unreadOnly, sortOldest]);
+  }, [query, unreadOnly, sortOldest, sortByRelevance]);
 
   useEffect(() => () => window.clearTimeout(hoverTimer.current), []);
 
@@ -282,7 +313,7 @@ export default function ArticleList({ onToast }: Props) {
   useEffect(() => {
     window.clearTimeout(hoverTimer.current);
     setHover(null);
-  }, [query, unreadOnly, sortOldest]);
+  }, [query, unreadOnly, sortOldest, sortByRelevance]);
 
   // Jump back to the top of the list whenever the sidebar selection changes.
   // The scroll container stays mounted across the query swap, so without this
@@ -427,28 +458,18 @@ export default function ArticleList({ onToast }: Props) {
             <span className="count">
               {browse.isLoading ? t("common.loading") : showCount}
             </span>
-            {listSearch &&
-              listSearch
-                .trim()
-                .split(/\s+/)
-                .filter(Boolean)
-                .map((term) => (
+            {searchChipList.map((chip) => (
                   <button
-                    key={term}
+                    key={chip.entityId ?? chip.tokens.join("\0")}
                     type="button"
                     className="list-search-chip"
                     onClick={() => {
-                      const parts = listSearch
-                        .trim()
-                        .split(/\s+/)
-                        .filter(Boolean);
-                      setListSearch(
-                        parts.filter((p) => p !== term).join(" ") || null,
-                      );
+                      if (!listSearch) return;
+                      setListSearch(removeSearchChip(listSearch, chip));
                     }}
                     title={t("articleList.clearSearch")}
                   >
-                    “{term}”
+                    “{chip.label}”
                     <Icon name="x" size={11} />
                   </button>
                 ))}
@@ -456,12 +477,33 @@ export default function ArticleList({ onToast }: Props) {
         </h1>
         <div className="list-meta">
           <button
-            className={`list-meta-btn ${!sortOldest ? "on" : ""}`}
+            className={`list-meta-btn ${
+              listSearch
+                ? sortByRelevance || !sortOldest
+                  ? "on"
+                  : ""
+                : !sortOldest
+                  ? "on"
+                  : ""
+            }`}
             onClick={toggleSort}
             title={t("articleList.sort")}
           >
-            <Icon name={sortOldest ? "arrow-up" : "arrow-down"} size={12} />
-            {sortOldest ? t("articleList.oldestFirst") : t("articleList.newestFirst")}
+            <Icon
+              name={
+                listSearch && sortByRelevance
+                  ? "search"
+                  : sortOldest
+                    ? "arrow-up"
+                    : "arrow-down"
+              }
+              size={12}
+            />
+            {listSearch && sortByRelevance
+              ? t("articleList.relevance")
+              : sortOldest
+                ? t("articleList.oldestFirst")
+                : t("articleList.newestFirst")}
           </button>
           <button
             className={`list-meta-btn ${unreadOnly ? "on" : ""}`}
@@ -601,8 +643,14 @@ export default function ArticleList({ onToast }: Props) {
                         </span>
                       )}
                     </div>
-                    <h3 className="art-title">{a.title}</h3>
-                    {a.snippet && <p className="art-snippet">{a.snippet}</p>}
+                    <h3 className="art-title">
+                      <HighlightText text={a.title} terms={hitTerms} />
+                    </h3>
+                    {a.snippet && (
+                      <p className="art-snippet">
+                        <HighlightText text={a.snippet} terms={hitTerms} />
+                      </p>
+                    )}
                     <ListTags tags={a.tags} />
                   </div>
                 </div>
@@ -625,6 +673,23 @@ export default function ArticleList({ onToast }: Props) {
       )}
 
     </div>
+  );
+}
+
+function HighlightText({ text, terms }: { text: string; terms: string[] }) {
+  if (!terms.length) return <>{text}</>;
+  return (
+    <>
+      {highlightSegments(text, terms).map((seg, i) =>
+        seg.hit ? (
+          <mark key={i} className="art-hit">
+            {seg.text}
+          </mark>
+        ) : (
+          <span key={i}>{seg.text}</span>
+        ),
+      )}
+    </>
   );
 }
 
