@@ -616,7 +616,16 @@ impl WordCloudDict {
                 let end = start + alias.len();
                 if span_occupied(&occupied, start, end) || !alias_boundary_ok(&norm, alias, start, end)
                 {
+                    // Advance to the next *char* boundary: `start` is a valid
+                    // boundary (find returns one), but `start + 1` can land
+                    // inside a multibyte UTF-8 char, and the next
+                    // `&norm[search_from..]` slice would then panic. Skipping
+                    // to the next boundary is also strictly correct — any
+                    // later match must begin at a char boundary anyway.
                     search_from = start + 1;
+                    while !norm.is_char_boundary(search_from) {
+                        search_from += 1;
+                    }
                     continue;
                 }
                 for slot in occupied.iter_mut().take(end).skip(start) {
@@ -1078,6 +1087,39 @@ mod tests {
         let (hits, occupied, _) = dict.match_entities("the united states and us met");
         assert_eq!(hits.get("country.us").copied().unwrap_or(0), 2);
         assert!(occupied.iter().any(|b| *b));
+    }
+
+    #[test]
+    fn cjk_overlapping_aliases_do_not_panic_on_rejected_span() {
+        // Regression: a shorter CJK alias whose match is rejected because a
+        // longer alias already occupied the span used to advance `search_from`
+        // by one *byte* (`start + 1`), landing inside a multibyte UTF-8 char.
+        // The next `&norm[search_from..]` slice then panicked, killing the
+        // background refresh task mid-ingestion (wordcloud_dict.rs:611).
+        let mut dict = WordCloudDict::empty(PathBuf::from("/tmp"));
+        dict.apply_entities(EntitiesFile {
+            version: 1,
+            entities: vec![
+                WordCloudEntity {
+                    id: "org.pentagon".into(),
+                    canonical: "Pentagon".into(),
+                    group: "org".into(),
+                    aliases: vec!["美国国防部".into()],
+                },
+                WordCloudEntity {
+                    id: "country.china".into(),
+                    canonical: "China".into(),
+                    group: "country".into(),
+                    aliases: vec!["美国".into()],
+                },
+            ],
+        });
+        // 美国国防部 (6 CJK chars, 18 bytes) matches first and occupies the
+        // span; 美国 then starts at the same byte 0, is rejected as occupied,
+        // and must resume at the next char boundary instead of byte 1.
+        let (hits, _, _) = dict.match_entities("美国国防部 invests");
+        assert_eq!(hits.get("org.pentagon").copied().unwrap_or(0), 1);
+        assert!(hits.get("country.china").is_none());
     }
 
     #[test]
