@@ -63,3 +63,6 @@ feedoverflow/
 
 # Accidental curl/cookie scratch files at repo root
 /-X
+
+# Local server DB backups (large, never commit)
+backups/

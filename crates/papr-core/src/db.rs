@@ -4264,7 +4264,9 @@ mod tests {
     fn fts_query_strips_punctuation_and_handles_empty() {
         // Non-alphanumerics are dropped from each term; an all-punctuation
         // input collapses to a match-nothing expression in both modes.
-        assert_eq!(fts_query("c++!", false), "\"c\"*");
+        // Short Latin tokens (≤3 chars) are whole-token matches — no `*`
+        // prefix — so `c++` does not over-match `c`+anything.
+        assert_eq!(fts_query("c++!", false), "\"c\"");
         assert_eq!(fts_query("!!! ???", true), "\"\"");
         assert_eq!(fts_query("   ", false), "\"\"");
     }
@@ -4275,11 +4277,13 @@ mod tests {
         // parts, matching how unicode61 indexes the article text.
         assert_eq!(fts_query("rust-lang", false), "\"rust\"* AND \"lang\"*");
         // A single dotted token still AND-joins its parts (not OR), even in
-        // recall mode — recall only ORs *separate* bare terms.
-        assert_eq!(fts_query("node.js", true), "\"node\"* AND \"js\"*");
+        // recall mode — recall only ORs *separate* bare terms. Short parts
+        // (`js`, `co`, `op`) stay whole-token (no `*`); longer parts keep the
+        // automatic prefix.
+        assert_eq!(fts_query("node.js", true), "\"node\"* AND \"js\"");
         assert_eq!(
             fts_query("co-op runtime", false),
-            "\"co\"* AND \"op\"* AND \"runtime\"*"
+            "\"co\" AND \"op\" AND \"runtime\"*"
         );
     }
 
@@ -4548,6 +4552,74 @@ mod tests {
             .unwrap()
             .unread_count;
         assert_eq!(from_list, 2);
+    }
+
+    #[test]
+    fn ingest_indexing_survives_overlapping_cjk_aliases() {
+        // Regression for the production outage: `index_article_by_id` (the
+        // backfill indexing path, and the same `terms_for_snippet` chain the
+        // ingest path runs) used to panic inside wordcloud `match_entities`
+        // when a shorter CJK alias (美国) is rejected because a longer alias
+        // (美国国防部) already occupied the span — the byte-offset advance
+        // landed mid-UTF-8-char. Deterministic here because the dict is
+        // constructed inline rather than loaded from the process default.
+        use crate::wordcloud_dict::{EntitiesFile, WordCloudDict};
+        use std::path::PathBuf;
+
+        let mut dict = WordCloudDict::empty(PathBuf::from("/tmp"));
+        dict.apply_entities(EntitiesFile {
+            version: 1,
+            entities: vec![
+                crate::wordcloud_dict::WordCloudEntity {
+                    id: "org.pentagon".into(),
+                    canonical: "Pentagon".into(),
+                    group: "org".into(),
+                    aliases: vec!["美国国防部".into()],
+                },
+                crate::wordcloud_dict::WordCloudEntity {
+                    id: "country.china".into(),
+                    canonical: "China".into(),
+                    group: "country".into(),
+                    aliases: vec!["美国".into()],
+                },
+            ],
+        });
+
+        let (conn, feed_id) = test_db();
+        let cjk = NewArticle {
+            guid: "cjk-overlap".into(),
+            url: Some("https://example.com/cjk-overlap".into()),
+            title: "美国国防部 invests heavily".into(),
+            author: None,
+            summary: None,
+            content_html: Some("<p>body</p>".into()),
+            body_text: "Pentagon spending news".into(),
+            image_url: None,
+            published_at: None,
+            enclosures: Vec::new(),
+        };
+        upsert_article(&conn, feed_id, &cjk, false, &[]).unwrap();
+        let article_id: i64 = conn
+            .query_row(
+                "SELECT id FROM articles WHERE guid = 'cjk-overlap'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        // Must not panic; must index the longer-alias entity.
+        crate::wordcloud::index_article_by_id(&conn, article_id, &dict).unwrap();
+        let terms: Vec<String> = conn
+            .prepare("SELECT term FROM article_terms WHERE article_id = ?1")
+            .unwrap()
+            .query_map([article_id], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            terms.iter().any(|t| t == "Pentagon"),
+            "expected the longer-alias canonical in terms, got {terms:?}"
+        );
     }
 
     #[test]

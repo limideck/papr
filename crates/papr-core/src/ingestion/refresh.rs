@@ -375,3 +375,164 @@ async fn poll_newsletters(
     }
     total_new
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::SourceType;
+    use std::path::PathBuf;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Minimal RSS 2.0 document with two items.
+    const FEED_BODY: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Test Feed</title>
+    <link>http://example.com/</link>
+    <description>test</description>
+    <item><title>First Story</title><guid>1</guid><link>http://example.com/1</link><description>one</description></item>
+    <item><title>Second Story</title><guid>2</guid><link>http://example.com/2</link><description>two</description></item>
+  </channel>
+</rss>"#;
+
+    /// An item whose title contains *overlapping* CJK aliases (美国国防部 is a
+    /// longer alias that occupies the span 美国 also starts at). Regression for
+    /// the wordcloud `match_entities` UTF-8 byte-offset panic that killed the
+    /// background refresh loop mid-ingestion.
+    const CJK_FEED_BODY: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Test Feed</title>
+    <link>http://example.com/</link>
+    <description>test</description>
+    <item><title>美国国防部 invests heavily</title><guid>cjk1</guid><link>http://example.com/cjk1</link><description>Pentagon spending news</description></item>
+  </channel>
+</rss>"#;
+
+    /// Serve `body` for the next `requests` HTTP requests on an ephemeral
+    /// loopback port and return the base URL. Each response is a plain 200
+    /// with the body; used to exercise the real fetch → parse → ingest path
+    /// without external network access.
+    async fn serve_feed(body: &'static str, requests: u32) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..requests {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 8192];
+                let _ = sock.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/rss+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        format!("http://{addr}/feed.xml")
+    }
+
+    /// A migrated writer connection on a unique temp file, wrapped in the same
+    /// async mutex shape `refresh_core` expects.
+    fn test_state() -> (PathBuf, Arc<Mutex<Connection>>) {
+        let path = std::env::temp_dir().join(format!(
+            "papr-refresh-test-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let conn = db::open(&path).unwrap();
+        (path, Arc::new(Mutex::new(conn)))
+    }
+
+    #[tokio::test]
+    async fn due_scope_with_nothing_due_returns_ran_false() {
+        let (_path, db) = test_state();
+        // No feeds at all → the Due pipeline bows out without fetching.
+        let client = fetch::build_client(10, "none");
+        let summary = refresh_core(&db, &client, RefreshScope::Due, |_| {})
+            .await
+            .unwrap();
+        assert!(!summary.ran);
+        assert_eq!(summary.new_articles, 0);
+    }
+
+    #[tokio::test]
+    async fn refresh_core_ingests_feed_over_http() {
+        let url = serve_feed(FEED_BODY, 1).await;
+        let (_path, db) = test_state();
+        {
+            let conn = db.lock().await;
+            db::insert_feed(
+                &conn,
+                &url,
+                None,
+                "Test Feed",
+                None,
+                SourceType::Rss,
+                None,
+            )
+            .unwrap();
+        }
+        let client = fetch::build_client(10, "none");
+        let summary = refresh_core(&db, &client, RefreshScope::All, |_| {})
+            .await
+            .unwrap();
+        assert!(summary.ran);
+        assert_eq!(summary.new_articles, 2, "both items must be ingested");
+
+        let conn = db.lock().await;
+        let articles: i64 = conn
+            .query_row("SELECT COUNT(*) FROM articles", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(articles, 2);
+        let (fetched, err): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT last_fetched_at, fetch_error FROM feeds WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(fetched.is_some(), "feed must be touched after a fetch");
+        assert!(err.is_none(), "no fetch error expected, got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn refresh_ingests_cjk_overlapping_alias_article_without_panic() {
+        // Regression for the production outage: ingesting an article whose
+        // title contains overlapping CJK aliases used to panic inside
+        // wordcloud `match_entities` (byte-offset advance mid-char), which
+        // unwound and killed the whole refresh task. With the process dict
+        // loaded (present on dev/prod machines), this panicked before the fix.
+        let url = serve_feed(CJK_FEED_BODY, 1).await;
+        let (_path, db) = test_state();
+        {
+            let conn = db.lock().await;
+            db::insert_feed(
+                &conn,
+                &url,
+                None,
+                "Test Feed",
+                None,
+                SourceType::Rss,
+                None,
+            )
+            .unwrap();
+        }
+        let client = fetch::build_client(10, "none");
+        let summary = refresh_core(&db, &client, RefreshScope::All, |_| {})
+            .await
+            .unwrap();
+        assert!(summary.ran);
+        assert_eq!(summary.new_articles, 1, "CJK item must be ingested");
+
+        let conn = db.lock().await;
+        let title: String = conn
+            .query_row("SELECT title FROM articles LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(title, "美国国防部 invests heavily");
+    }
+}

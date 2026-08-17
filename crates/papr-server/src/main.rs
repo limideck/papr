@@ -141,3 +141,54 @@ async fn seed_admin_and_sources(state: &AppState) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    fn test_app() -> Router {
+        let path = std::env::temp_dir().join(format!(
+            "papr-server-test-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let state = AppState::new(&path).expect("test state");
+        routes::api_router().with_state(state)
+    }
+
+    #[tokio::test]
+    async fn health_endpoint_returns_ok() {
+        let app = test_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn article_routes_reject_anonymous_requests() {
+        let app = test_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/articles")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+}
