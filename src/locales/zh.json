@@ -785,7 +785,18 @@
         "translate": "翻译",
         "translate-preview": "列表预览",
         "auto-tag": "自动打标"
-      }
+      },
+      "aiOfficial": "官方余额",
+      "aiOfficialWindow": "时间范围",
+      "aiOfficialWindowDesc": "展示多少天的官方余额记录。",
+      "aiOfficialBalance": "当前余额",
+      "aiOfficialBalanceDesc": "实时来自 DeepSeek /user/balance 官方接口。",
+      "aiOfficialToppedUp": "充值 / 赠送",
+      "aiOfficialDailySpend": "每日花费",
+      "aiOfficialDailySpendDesc": "每日真实花费（余额差值；余额上升表示充值）。",
+      "aiOfficialRefresh": "立即刷新",
+      "aiOfficialPlatform": "官网用量（需配置平台 token）",
+      "aiOfficialEmpty": "暂无官方余额记录 — "
     },
     "about": {
       "tabAbout": "关于",

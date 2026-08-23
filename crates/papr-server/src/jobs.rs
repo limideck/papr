@@ -7,6 +7,7 @@ use papr_core::error::AppError;
 use papr_core::ingestion::feed_source;
 use papr_core::ingestion::refresh::{self, RefreshScope};
 use papr_core::wordcloud;
+use chrono::Datelike;
 use std::time::Duration;
 
 /// Default interval between due-feed refresh ticks (seconds).
@@ -38,7 +39,8 @@ pub fn spawn_background_jobs(state: AppState) {
     for worker_id in 0..n {
         tokio::spawn(auto_tag_worker(state.clone(), worker_id));
     }
-    tokio::spawn(wordcloud_backfill_loop(state));
+    tokio::spawn(wordcloud_backfill_loop(state.clone()));
+    tokio::spawn(balance_snapshot_loop(state));
 }
 
 async fn refresh_loop(state: AppState) {
@@ -248,6 +250,64 @@ async fn wordcloud_backfill_loop(state: AppState) {
                 );
             }
             Err(e) => tracing::warn!("wordcloud backfill write failed: {e}"),
+        }
+    }
+}
+
+/// Daily official-balance snapshot (once per UTC day) plus, when a
+/// `deepseek_platform_token` is configured, a best-effort sync of the
+/// dashboard's token/cost usage for the current month. The admin AI-usage view
+/// lazily refreshes as well, so this job just guarantees the ledger fills even
+/// when nobody opens the page.
+async fn balance_snapshot_loop(state: AppState) {
+    // Run shortly after boot, then probe every 6h (cheap when not due).
+    tokio::time::sleep(Duration::from_secs(90)).await;
+    let mut ticker = tokio::time::interval(Duration::from_secs(6 * 60 * 60));
+    loop {
+        ticker.tick().await;
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let due = {
+            let conn = state.db.lock().await;
+            db::last_balance_day(&conn).unwrap_or(None) != Some(today)
+        };
+        if !due {
+            continue;
+        }
+        let (key, token) = {
+            let conn = state.db.lock().await;
+            (
+                db::get_setting(&conn, "ai_api_key").ok().flatten(),
+                db::get_setting(&conn, "deepseek_platform_token").ok().flatten(),
+            )
+        };
+        let Some(key) = key.filter(|k| !k.is_empty()) else {
+            continue;
+        };
+        match crate::balance::fetch_balance(&state.http, &key).await {
+            Ok(snap) => {
+                let conn = state.db.lock().await;
+                match db::record_balance_snapshot(&conn, snap.total, snap.granted, snap.topped_up) {
+                    Ok(()) => tracing::info!(total = snap.total, "official balance snapshot recorded"),
+                    Err(e) => tracing::warn!("balance snapshot persist failed: {e}"),
+                }
+            }
+            Err(e) => tracing::warn!("official balance fetch failed: {e}"),
+        }
+        if let Some(token) = token.filter(|t| !t.is_empty()) {
+            let now = chrono::Utc::now();
+            let usage = crate::balance::fetch_monthly_usage(
+                &state.http,
+                &token,
+                now.year(),
+                now.month() as u32,
+            )
+            .await;
+            if !usage.is_empty() {
+                let conn = state.db.lock().await;
+                for u in &usage {
+                    let _ = db::upsert_official_usage(&conn, &u.day, u.tokens, u.cost);
+                }
+            }
         }
     }
 }

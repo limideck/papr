@@ -1,6 +1,7 @@
 //! papr-server — Web-first HTTP API + static frontend + background jobs.
 
 mod auth;
+mod balance;
 mod error;
 mod jobs;
 mod routes;

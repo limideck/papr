@@ -746,7 +746,18 @@
         "translate": "Translations",
         "translate-preview": "List previews",
         "auto-tag": "Auto-tagging"
-      }
+      },
+      "aiOfficial": "Official balance",
+      "aiOfficialWindow": "Period",
+      "aiOfficialWindowDesc": "Days of official balance history to show.",
+      "aiOfficialBalance": "Current balance",
+      "aiOfficialBalanceDesc": "Live from the DeepSeek /user/balance endpoint.",
+      "aiOfficialToppedUp": "Top-up / granted",
+      "aiOfficialDailySpend": "Daily spend",
+      "aiOfficialDailySpendDesc": "Real money spent per day (balance deltas). Negative deltas are top-ups.",
+      "aiOfficialRefresh": "Refresh now",
+      "aiOfficialPlatform": "Official dashboard usage (platform token)",
+      "aiOfficialEmpty": "No official balance recorded yet — "
     },
     "about": {
       "tabAbout": "About",

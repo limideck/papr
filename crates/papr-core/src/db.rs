@@ -518,6 +518,30 @@ static MIGRATIONS: LazyLock<Migrations> = LazyLock::new(|| {
             CREATE INDEX idx_tag_aliases_tag ON tag_aliases(tag_id);
             "#,
         ),
+        // v31 — official DeepSeek balance snapshots + dashboard usage, so the
+        // admin UI can show the *real* money spent (balance deltas from the
+        // official /user/balance endpoint) next to the locally-estimated cost.
+        // Additive only; populated by a background job and on-demand refresh.
+        // `ai_official_usage` is filled from the (undocumented, best-effort)
+        // platform dashboard endpoints when a platform session token is
+        // configured — it is optional and degrades gracefully when absent.
+        M::up(
+            r#"
+            CREATE TABLE ai_balance_history (
+                id              INTEGER PRIMARY KEY,
+                recorded_at     TEXT NOT NULL UNIQUE,
+                total_balance   REAL NOT NULL,
+                granted_balance REAL NOT NULL DEFAULT 0,
+                topped_up_balance REAL NOT NULL DEFAULT 0
+            );
+            CREATE TABLE ai_official_usage (
+                id      INTEGER PRIMARY KEY,
+                day     TEXT NOT NULL UNIQUE,
+                tokens  INTEGER NOT NULL DEFAULT 0,
+                cost    REAL NOT NULL DEFAULT 0
+            );
+            "#,
+        ),
     ])
 });
 
@@ -3455,6 +3479,156 @@ pub fn set_digest_cache(conn: &Connection, text: &str) -> AppResult<()> {
     )
 }
 
+// ─────────────────────────── official balance / usage ───────────────────────────
+
+/// One day of the official DeepSeek balance ledger, with the spend derived
+/// from consecutive snapshots.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct BalanceDay {
+    pub day: String,
+    pub total_balance: f64,
+    pub granted_balance: f64,
+    pub topped_up_balance: f64,
+    /// Money spent that day (previous total − this total). `None` on the
+    /// first recorded day (no baseline).
+    pub spend: Option<f64>,
+    /// Top-up detected that day (total rose vs the previous snapshot).
+    pub topup: Option<f64>,
+}
+
+/// Upsert today's balance snapshot (one row per UTC day).
+pub fn record_balance_snapshot(
+    conn: &Connection,
+    total: f64,
+    granted: f64,
+    topped_up: f64,
+) -> AppResult<()> {
+    let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    conn.execute(
+        "INSERT INTO ai_balance_history(recorded_at, total_balance, granted_balance, topped_up_balance)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(recorded_at) DO UPDATE SET
+             total_balance = excluded.total_balance,
+             granted_balance = excluded.granted_balance,
+             topped_up_balance = excluded.topped_up_balance",
+        params![day, total, granted, topped_up],
+    )?;
+    Ok(())
+}
+
+/// The most recent balance snapshot, if any.
+pub fn latest_balance(conn: &Connection) -> AppResult<Option<BalanceDay>> {
+    Ok(conn
+        .query_row(
+            "SELECT recorded_at, total_balance, granted_balance, topped_up_balance
+             FROM ai_balance_history ORDER BY recorded_at DESC LIMIT 1",
+            [],
+            |r| {
+                Ok(BalanceDay {
+                    day: r.get(0)?,
+                    total_balance: r.get(1)?,
+                    granted_balance: r.get(2)?,
+                    topped_up_balance: r.get(3)?,
+                    spend: None,
+                    topup: None,
+                })
+            },
+        )
+        .optional()?)
+}
+
+/// The most recent snapshot day (`YYYY-MM-DD`), for the daily job's
+/// once-per-day gate. `None` when nothing has ever been recorded.
+pub fn last_balance_day(conn: &Connection) -> AppResult<Option<String>> {
+    Ok(conn.query_row(
+        "SELECT MAX(recorded_at) FROM ai_balance_history",
+        [],
+        |r| r.get::<_, Option<String>>(0),
+    )?)
+}
+
+/// The trailing `days` of balance history (oldest first), with per-day spend
+/// derived from consecutive totals — the *real* money the account consumed,
+/// straight from the official `/user/balance` endpoint.
+pub fn balance_history(conn: &Connection, days: i64) -> AppResult<Vec<BalanceDay>> {
+    let days = days.clamp(1, 366);
+    let mut stmt = conn.prepare(
+        "SELECT recorded_at, total_balance, granted_balance, topped_up_balance
+         FROM ai_balance_history
+         ORDER BY recorded_at DESC
+         LIMIT ?1",
+    )?;
+    let mut rows: Vec<BalanceDay> = stmt
+        .query_map(params![days], |r| {
+            Ok(BalanceDay {
+                day: r.get(0)?,
+                total_balance: r.get(1)?,
+                granted_balance: r.get(2)?,
+                topped_up_balance: r.get(3)?,
+                spend: None,
+                topup: None,
+            })
+        })?
+        .collect::<Result<_, _>>()?;
+    // Newest first → walk backward to attach the previous day's total.
+    for i in 0..rows.len() {
+        if let Some(prev) = rows.get(i + 1) {
+            let delta = rows[i].total_balance - prev.total_balance;
+            if delta < -0.0005 {
+                rows[i].spend = Some(-delta);
+                rows[i].topup = None;
+            } else if delta > 0.0005 {
+                rows[i].spend = None;
+                rows[i].topup = Some(delta);
+            } else {
+                rows[i].spend = Some(0.0);
+                rows[i].topup = None;
+            }
+        }
+    }
+    rows.reverse();
+    Ok(rows)
+}
+
+/// One day of official dashboard usage (tokens + cost), from the platform
+/// endpoints — best-effort and only present when a platform token is set.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct OfficialUsageDay {
+    pub day: String,
+    pub tokens: i64,
+    pub cost: f64,
+}
+
+pub fn upsert_official_usage(conn: &Connection, day: &str, tokens: i64, cost: f64) -> AppResult<()> {
+    conn.execute(
+        "INSERT INTO ai_official_usage(day, tokens, cost) VALUES (?1, ?2, ?3)
+         ON CONFLICT(day) DO UPDATE SET tokens = excluded.tokens, cost = excluded.cost",
+        params![day, tokens, cost],
+    )?;
+    Ok(())
+}
+
+pub fn official_usage(conn: &Connection, days: i64) -> AppResult<Vec<OfficialUsageDay>> {
+    let days = days.clamp(1, 366);
+    let mut stmt = conn.prepare(
+        "SELECT day, tokens, cost FROM ai_official_usage
+         ORDER BY day DESC LIMIT ?1",
+    )?;
+    let mut rows = stmt
+        .query_map(params![days], |r| {
+            Ok(OfficialUsageDay {
+                day: r.get(0)?,
+                tokens: r.get(1)?,
+                cost: r.get(2)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.reverse();
+    Ok(rows)
+}
+
 /// Aggregate AI usage over the trailing `days` (clamped to 1–366), bucketed by
 /// feature, with grand totals in `total`.
 pub fn ai_usage_stats(conn: &Connection, days: i64) -> AppResult<AiUsageStats> {
@@ -4856,6 +5030,62 @@ mod tests {
         // Empty text is never served as a hit.
         set_digest_cache(&conn, "   ").unwrap();
         assert!(get_digest_cache(&conn).unwrap().is_none());
+    }
+
+    #[test]
+    fn balance_history_derives_spend_and_topups() {
+        let (conn, _) = test_db();
+        assert!(latest_balance(&conn).unwrap().is_none());
+        assert!(last_balance_day(&conn).unwrap().is_none());
+        assert!(balance_history(&conn, 30).unwrap().is_empty());
+
+        // Three snapshots: day1 = 100, day2 = 80 (spent 20), day3 = 110 (topup 30).
+        conn.execute(
+            "INSERT INTO ai_balance_history(recorded_at, total_balance, granted_balance, topped_up_balance)
+             VALUES ('2026-08-01', 100, 0, 100)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ai_balance_history(recorded_at, total_balance, granted_balance, topped_up_balance)
+             VALUES ('2026-08-02', 80, 0, 100)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ai_balance_history(recorded_at, total_balance, granted_balance, topped_up_balance)
+             VALUES ('2026-08-03', 110, 0, 130)",
+            [],
+        )
+        .unwrap();
+
+        let latest = latest_balance(&conn).unwrap().unwrap();
+        assert_eq!(latest.day, "2026-08-03");
+        assert_eq!(latest.total_balance, 110.0);
+        assert_eq!(last_balance_day(&conn).unwrap().as_deref(), Some("2026-08-03"));
+
+        let hist = balance_history(&conn, 30).unwrap();
+        assert_eq!(hist.len(), 3);
+        // Oldest first; first day has no baseline.
+        assert_eq!(hist[0].day, "2026-08-01");
+        assert!(hist[0].spend.is_none());
+        // day2: spend 20.
+        assert_eq!(hist[1].day, "2026-08-02");
+        assert_eq!(hist[1].spend, Some(20.0));
+        assert!(hist[1].topup.is_none());
+        // day3: topup 30, no spend.
+        assert_eq!(hist[2].day, "2026-08-03");
+        assert_eq!(hist[2].topup, Some(30.0));
+        assert!(hist[2].spend.is_none());
+
+        // Official usage round-trips.
+        upsert_official_usage(&conn, "2026-08-02", 100_000, 1.5).unwrap();
+        upsert_official_usage(&conn, "2026-08-02", 120_000, 1.8).unwrap(); // upsert
+        let usage = official_usage(&conn, 30).unwrap();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].day, "2026-08-02");
+        assert_eq!(usage[0].tokens, 120_000);
+        assert_eq!(usage[0].cost, 1.8);
     }
 
     #[test]

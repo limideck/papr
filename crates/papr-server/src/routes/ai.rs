@@ -6,12 +6,14 @@
 //! Each stream is delivered as SSE (`text/event-stream`), one JSON event per
 //! frame, matching the shapes the frontend's `apiStream` consumer expects.
 
+use crate::balance;
 use crate::error::{ApiError, ApiResult};
 use crate::state::{AppState, AuthUser};
 use axum::extract::{Path, Query, State};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use chrono::Datelike;
 use papr_core::ai::{self, AiConfig, AiEvent};
 use papr_core::db;
 use papr_core::error::AppError;
@@ -19,7 +21,7 @@ use papr_core::sanitize;
 use papr_core::translate::{self, TranslateEvent};
 use rusqlite::Connection;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::convert::Infallible;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -703,4 +705,94 @@ mod tests {
             }
         }
     }
+}
+
+// ─────────────────────────── official balance / usage ───────────────────────────
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BalanceQuery {
+    pub days: Option<i64>,
+}
+
+/// Snapshot the official balance now (and platform usage when a
+/// `deepseek_platform_token` is configured). Records a row per UTC day;
+/// returns false when no API key is configured (nothing to do).
+pub async fn refresh_official_data(state: &AppState) -> ApiResult<bool> {
+    let (key, token) = {
+        let conn = state.db.lock().await;
+        (
+            db::get_setting(&conn, "ai_api_key").map_err(ApiError::from)?,
+            db::get_setting(&conn, "deepseek_platform_token").map_err(ApiError::from)?,
+        )
+    };
+    let Some(key) = key.filter(|k| !k.is_empty()) else {
+        return Ok(false);
+    };
+    match balance::fetch_balance(&state.http, &key).await {
+        Ok(snap) => {
+            let conn = state.db.lock().await;
+            db::record_balance_snapshot(&conn, snap.total, snap.granted, snap.topped_up)
+                .map_err(ApiError::from)?;
+        }
+        Err(e) => log::warn!("official balance refresh failed: {e}"),
+    }
+    if let Some(token) = token.filter(|t| !t.is_empty()) {
+        let now = chrono::Utc::now();
+        let usage = balance::fetch_monthly_usage(
+            &state.http,
+            &token,
+            now.year(),
+            now.month() as u32,
+        )
+        .await;
+        if !usage.is_empty() {
+            let conn = state.db.lock().await;
+            for u in &usage {
+                let _ = db::upsert_official_usage(&conn, &u.day, u.tokens, u.cost);
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// `GET /api/ai/balance` — official balance ledger + spend + (optional)
+/// dashboard usage. Lazily snapshots once per day so the view is always fresh
+/// without a scheduler dependency.
+pub async fn balance_report(
+    State(state): State<AppState>,
+    _user: AuthUser,
+    Query(q): Query<BalanceQuery>,
+) -> ApiResult<Json<Value>> {
+    let days = q.days.unwrap_or(30).clamp(1, 366);
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let stale = {
+        let conn = state.db.lock().await;
+        db::last_balance_day(&conn).map_err(ApiError::from)? != Some(today.clone())
+    };
+    if stale {
+        let _ = refresh_official_data(&state).await;
+    }
+    let (latest, history, official) = {
+        let conn = state.db.lock().await;
+        (
+            db::latest_balance(&conn).map_err(ApiError::from)?,
+            db::balance_history(&conn, days).map_err(ApiError::from)?,
+            db::official_usage(&conn, days).map_err(ApiError::from)?,
+        )
+    };
+    Ok(Json(json!({
+        "latest": latest,
+        "history": history,
+        "officialUsage": official,
+    })))
+}
+
+/// `POST /api/ai/balance/refresh` — force an official snapshot now.
+pub async fn balance_refresh(
+    State(state): State<AppState>,
+    _user: AuthUser,
+) -> ApiResult<Json<Value>> {
+    let ok = refresh_official_data(&state).await?;
+    Ok(Json(json!({ "ok": ok })))
 }

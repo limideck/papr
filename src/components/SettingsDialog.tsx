@@ -1477,6 +1477,7 @@ function AdvancedSection({
   return (
     <>
       <AiSettingsGroup onToast={onToast} />
+      <OfficialBalanceGroup />
       <AiUsageGroup />
       <StorageGroup onToast={onToast} />
       <NetworkGroup onToast={onToast} />
@@ -2012,6 +2013,132 @@ function AiSettingsGroup({ onToast }: { onToast: (m: string) => void }) {
           }}
         />
       </Row>
+    </div>
+  );
+}
+
+/** Official DeepSeek balance — real money spent per day (balance deltas from
+ * the official /user/balance endpoint), plus dashboard usage when a platform
+ * token is configured. Refreshes daily server-side; a manual refresh button
+ * forces a snapshot now. */
+function OfficialBalanceGroup() {
+  const { t } = useTranslation();
+  const [days, setDays] = useState(14);
+  const report = useQuery({
+    queryKey: ["ai-balance", days],
+    queryFn: () => api.aiBalance(days),
+  });
+  const qc = useQueryClient();
+  const [refreshing, setRefreshing] = useState(false);
+
+  const refresh = async () => {
+    setRefreshing(true);
+    try {
+      await api.aiBalanceRefresh();
+      qc.invalidateQueries({ queryKey: ["ai-balance"] });
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
+  const fmt = (n?: number | null) =>
+    n == null ? "—" : `¥${n.toFixed(2)}`;
+
+  return (
+    <div className="settings-group">
+      <h3 className="settings-group-title">{t("settings.advanced.aiOfficial")}</h3>
+      <Row
+        label={t("settings.advanced.aiOfficialWindow")}
+        desc={t("settings.advanced.aiOfficialWindowDesc")}
+      >
+        <Select
+          value={String(days)}
+          options={[
+            { value: "7", label: "7" },
+            { value: "14", label: "14" },
+            { value: "30", label: "30" },
+          ]}
+          aria-label={t("settings.advanced.aiOfficialWindow")}
+          onChange={(v) => setDays(Number(v))}
+        />
+      </Row>
+
+      {report.isLoading ? (
+        <p className="settings-group-desc">{t("common.loading")}</p>
+      ) : report.data?.latest ? (
+        <>
+          <Row
+            label={t("settings.advanced.aiOfficialBalance")}
+            desc={t("settings.advanced.aiOfficialBalanceDesc")}
+          >
+            <span className="s-value">{fmt(report.data.latest.totalBalance)}</span>
+          </Row>
+          <Row label={t("settings.advanced.aiOfficialToppedUp")}>
+            <span className="s-value">
+              {fmt(report.data.latest.toppedUpBalance)}{" "}
+              <span className="settings-group-desc" style={{ display: "inline" }}>
+                + {fmt(report.data.latest.grantedBalance)} granted
+              </span>
+            </span>
+          </Row>
+          <Row
+            label={t("settings.advanced.aiOfficialDailySpend")}
+            desc={t("settings.advanced.aiOfficialDailySpendDesc")}
+          >
+            <button
+              type="button"
+              className="s-btn"
+              onClick={refresh}
+              disabled={refreshing}
+            >
+              {refreshing ? t("common.loading") : t("settings.advanced.aiOfficialRefresh")}
+            </button>
+          </Row>
+          <div className="settings-group-desc" style={{ paddingTop: 6 }}>
+            {[...report.data.history].reverse().map((d) => (
+              <div
+                key={d.day}
+                style={{ display: "flex", justifyContent: "space-between", gap: 12 }}
+              >
+                <span>{d.day}</span>
+                <span style={{ fontVariantNumeric: "tabular-nums" }}>
+                  {d.topup != null
+                    ? `+${fmt(d.topup)}`
+                    : d.spend != null
+                      ? `-${fmt(d.spend)}`
+                      : "—"}
+                </span>
+              </div>
+            ))}
+          </div>
+          {report.data.officialUsage.length > 0 && (
+            <div className="settings-group-desc" style={{ paddingTop: 6 }}>
+              <div style={{ display: "flex", justifyContent: "space-between" }}>
+                <span>{t("settings.advanced.aiOfficialPlatform")}</span>
+                <span />
+              </div>
+              {[...report.data.officialUsage].reverse().map((u) => (
+                <div
+                  key={u.day}
+                  style={{ display: "flex", justifyContent: "space-between", gap: 12 }}
+                >
+                  <span>{u.day}</span>
+                  <span style={{ fontVariantNumeric: "tabular-nums" }}>
+                    {u.tokens.toLocaleString()} tok · {fmt(u.cost)}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </>
+      ) : (
+        <p className="settings-group-desc">
+          {t("settings.advanced.aiOfficialEmpty")}
+          <button type="button" className="s-btn" onClick={refresh}>
+            {t("settings.advanced.aiOfficialRefresh")}
+          </button>
+        </p>
+      )}
     </div>
   );
 }

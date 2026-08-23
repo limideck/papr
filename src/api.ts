@@ -485,6 +485,29 @@ export interface AiUsageReport {
 }
 export const aiUsage = (days: number = 30) =>
   apiJson<AiUsageReport>(`${API}/ai/usage${qs({ days })}`);
+
+export interface BalanceDay {
+  day: string;
+  totalBalance: number;
+  grantedBalance: number;
+  toppedUpBalance: number;
+  spend: number | null;
+  topup: number | null;
+}
+export interface OfficialUsageDay {
+  day: string;
+  tokens: number;
+  cost: number;
+}
+export interface BalanceReport {
+  latest: BalanceDay | null;
+  history: BalanceDay[];
+  officialUsage: OfficialUsageDay[];
+}
+export const aiBalance = (days: number = 30) =>
+  apiJson<BalanceReport>(`${API}/ai/balance${qs({ days })}`);
+export const aiBalanceRefresh = () =>
+  apiJson<{ ok: boolean }>(`${API}/ai/balance/refresh`, { method: "POST" });
 export const cleanupArticles = (days: number) =>
   apiJson<number | { count: number }>(`${API}/storage/cleanup`, {
     method: "POST",

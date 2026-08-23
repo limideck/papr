@@ -746,7 +746,18 @@
         "translate": "翻訳",
         "translate-preview": "リストプレビュー",
         "auto-tag": "自動タグ付け"
-      }
+      },
+      "aiOfficial": "公式残高",
+      "aiOfficialWindow": "期間",
+      "aiOfficialWindowDesc": "表示する公式残高履歴の日数。",
+      "aiOfficialBalance": "現在の残高",
+      "aiOfficialBalanceDesc": "DeepSeek /user/balance 公式APIから取得。",
+      "aiOfficialToppedUp": "チャージ / 付与",
+      "aiOfficialDailySpend": "日次支出",
+      "aiOfficialDailySpendDesc": "1日あたりの実支出（残高差）。残高増加はチャージ。",
+      "aiOfficialRefresh": "今すぐ更新",
+      "aiOfficialPlatform": "公式ダッシュボード使用量（プラットフォームトークン）",
+      "aiOfficialEmpty": "公式残高の記録がまだありません — "
     },
     "about": {
       "tabAbout": "情報",

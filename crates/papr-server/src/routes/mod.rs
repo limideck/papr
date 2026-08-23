@@ -73,6 +73,8 @@ pub fn api_router() -> Router<AppState> {
         .route("/api/ai/digest", post(ai::digest))
         .route("/api/ai/translate", post(ai::translate))
         .route("/api/ai/usage", get(ai::usage))
+        .route("/api/ai/balance", get(ai::balance_report))
+        .route("/api/ai/balance/refresh", post(ai::balance_refresh))
         .route("/api/smart-counts", get(articles::smart_counts))
         // OPML
         .route("/api/opml/import", post(opml::import))
