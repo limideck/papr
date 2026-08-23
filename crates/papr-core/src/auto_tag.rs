@@ -491,7 +491,7 @@ not merely because the story is general news.";
     (system.to_string(), user)
 }
 
-pub fn prompt_ai(title: &str, summary: &str, existing_ai: &[String]) -> (String, String) {
+pub fn prompt_ai(title: &str, summary: &str) -> (String, String) {
     let title = sanitize_prompt_text(title);
     let summary = sanitize_prompt_text(summary);
     let system = "You tag news articles for an RSS reader. \
@@ -499,22 +499,16 @@ Reply with ONLY a JSON object, no markdown, no commentary. \
 Format: {\"tags\":[\"name1\",\"name2\"]}. \
 Suggest short topical tags (1-3 words each) grounded in the title and summary — \
 places, topics, people, events (e.g. Spain, Migration, Ceuta). \
-Prefer reusing names from the existing-tags list when they fit (exact spelling). \
-You may invent new tag names when nothing suitable exists. \
+Use the natural, established name for each topic and stay consistent: \
+the same topic must always get the same tag. \
+Do not repeat the article title or quote long phrases as tags. \
 Clear news (geopolitics, migration, disasters, politics, business, science, sports) \
 MUST receive 2-5 tags. \
 Use at most 5 tags. \
 Return {\"tags\":[]} only for empty or placeholder fluff with no identifiable topic — \
 never for a real news headline.";
-    let existing_list = if existing_ai.is_empty() {
-        "(none yet)".to_string()
-    } else {
-        existing_ai.join(", ")
-    };
     let summary = truncate_summary(&summary);
-    let user = format!(
-        "Existing tags: {existing_list}\n\nTitle: {title}\n\nSummary: {summary}"
-    );
+    let user = format!("Title: {title}\n\nSummary: {summary}");
     (system.to_string(), user)
 }
 
@@ -522,7 +516,6 @@ pub fn prompt_combined(
     title: &str,
     summary: &str,
     interest: &[String],
-    existing_ai: &[String],
 ) -> (String, String) {
     let title = sanitize_prompt_text(title);
     let summary = sanitize_prompt_text(summary);
@@ -532,7 +525,8 @@ Format: {\"interest\":[\"name1\"],\"tags\":[\"name2\"]}. \
 For \"interest\": choose ONLY from the interest-tags list (exact spelling); never invent; \
 match places/topics/events from the article when they appear in that list. \
 For \"tags\": short topical free-form labels (1-3 words) grounded in the title/summary; \
-prefer existing AI tags when they fit; new names are allowed. \
+use the natural, established name for each topic and stay consistent — \
+the same topic must always get the same tag; do not quote long phrases as tags. \
 Clear news stories MUST get useful free-form tags (2-5) even when no interest tags match. \
 Use at most 5 names in each array. \
 Empty arrays only when that taxonomy truly has nothing applicable — \
@@ -542,14 +536,9 @@ not for ordinary news coverage.";
     } else {
         interest.join(", ")
     };
-    let ai_list = if existing_ai.is_empty() {
-        "(none yet)".to_string()
-    } else {
-        existing_ai.join(", ")
-    };
     let summary = truncate_summary(&summary);
     let user = format!(
-        "Interest tags: {interest_list}\nExisting AI tags: {ai_list}\n\nTitle: {title}\n\nSummary: {summary}"
+        "Interest tags: {interest_list}\n\nTitle: {title}\n\nSummary: {summary}"
     );
     (system.to_string(), user)
 }
@@ -662,7 +651,6 @@ struct JobContext {
     title: String,
     summary: String,
     interest_names: Vec<String>,
-    ai_names: Vec<String>,
     interest_on: bool,
     ai_on: bool,
     interest_max: i64,
@@ -692,10 +680,6 @@ fn load_job_context(conn: &Connection, article_id: i64) -> AppResult<JobContext>
         .into_iter()
         .map(|t| t.name)
         .collect();
-    let ai_names: Vec<String> = db::list_tags(conn, Some(TAG_KIND_AI))?
-        .into_iter()
-        .map(|t| t.name)
-        .collect();
     let cfg = AiConfig::new(
         db::get_setting(conn, "ai_provider")?,
         db::get_setting(conn, "ai_api_key")?,
@@ -706,7 +690,6 @@ fn load_job_context(conn: &Connection, article_id: i64) -> AppResult<JobContext>
         title,
         summary,
         interest_names,
-        ai_names,
         interest_on,
         ai_on,
         interest_max,
@@ -851,12 +834,8 @@ pub async fn process_article(
     let has_content = article_has_content(&ctx.title, &ctx.summary);
 
     if run_interest && run_ai {
-        let (system, user) = prompt_combined(
-            &ctx.title,
-            &ctx.summary,
-            &ctx.interest_names,
-            &ctx.ai_names,
-        );
+        let (system, user) =
+            prompt_combined(&ctx.title, &ctx.summary, &ctx.interest_names);
         let ((interest, ai_tags), outcome) = tags_from_model(
             client,
             &ctx.cfg,
@@ -908,7 +887,7 @@ pub async fn process_article(
     }
 
     // AI-only path.
-    let (system, user) = prompt_ai(&ctx.title, &ctx.summary, &ctx.ai_names);
+    let (system, user) = prompt_ai(&ctx.title, &ctx.summary);
     let (suggested, outcome) = tags_from_model(
         client,
         &ctx.cfg,
@@ -1091,7 +1070,7 @@ Final: {"tags":["Rust","Go"]}"#;
     fn prompt_ai_contains_cleaned_title_and_summary() {
         let title = "Spain plans burials\u{200B}";
         let summary = "<p>Police identify the \u{200C}bodies of 80 migrants in Ceuta.</p>";
-        let (system, user) = prompt_ai(title, summary, &[]);
+        let (system, user) = prompt_ai(title, summary);
         assert!(system.contains("MUST receive 2-5 tags"));
         assert!(system.contains("never for a real news headline"));
         assert!(!user.contains('\u{200B}'));

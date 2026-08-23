@@ -121,6 +121,24 @@ async fn auto_tag_worker(state: AppState, worker_id: usize) {
             continue;
         }
 
+        // Daily call budget (`ai_tag_daily_budget`, 0 = unlimited): a content
+        // spike (e.g. a batch of added feeds) must never surprise-bill the LLM
+        // account. Once today's budget is spent the workers back off and the
+        // queue waits until tomorrow.
+        let budget_left = {
+            let conn = state.db.lock().await;
+            let budget = db::setting_parsed::<i64>(&conn, "ai_tag_daily_budget", 0);
+            if budget > 0 {
+                budget - db::count_ai_usage_today(&conn, "auto-tag").unwrap_or(0)
+            } else {
+                1 // unlimited
+            }
+        };
+        if budget_left <= 0 {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            continue;
+        }
+
         // Manual sync auto-tag (reader click) holds the LLM / writer mutex —
         // skip claiming so backlog workers do not pile on in parallel.
         if state.manual_auto_tag_busy() {

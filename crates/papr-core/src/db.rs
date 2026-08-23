@@ -947,6 +947,18 @@ pub fn feed_last_fetched(conn: &Connection, id: i64) -> AppResult<Option<String>
     )?)
 }
 
+/// How many articles a feed currently holds. Used to detect a feed's *first*
+/// ingestion (zero articles) so the initial backfill can be depth-capped —
+/// a brand-new feed's first fetch otherwise ingests its whole history, and
+/// every historical item then triggers an auto-tag LLM call.
+pub fn feed_article_count(conn: &Connection, feed_id: i64) -> AppResult<i64> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM articles WHERE feed_id = ?1",
+        params![feed_id],
+        |r| r.get(0),
+    )?)
+}
+
 /// Record a failed fetch, keeping the previous content untouched.
 pub fn set_feed_error(conn: &Connection, id: i64, error: &str) -> AppResult<()> {
     conn.execute(
@@ -1242,6 +1254,43 @@ pub struct NewArticle {
     pub enclosures: Vec<Enclosure>,
 }
 
+/// Shrink `articles` to the `cap` most recent items by `published_at`, keeping
+/// the original document order for the survivors. Items without a publish date
+/// sort as oldest, so a feed whose XML is oldest-first still keeps its newest
+/// entries (unlike a blind first-N truncation). `cap == 0` is a no-op.
+///
+/// Feed XML timestamps here are RFC3339 from `parse::clamp_publish_date`, all
+/// produced by the same formatter, so lexicographic comparison is
+/// chronological; items with unparseable dates fall back to string order,
+/// which is harmless for a backfill cap.
+pub fn cap_newest_articles(articles: &mut Vec<NewArticle>, cap: usize) {
+    if cap == 0 || articles.len() <= cap {
+        return;
+    }
+    let mut order: Vec<(Option<String>, usize)> = articles
+        .iter()
+        .enumerate()
+        .map(|(i, a)| (a.published_at.clone(), i))
+        .collect();
+    // Newest first; missing date sorts last.
+    order.sort_by(|a, b| match (&a.0, &b.0) {
+        (Some(x), Some(y)) => y.cmp(x),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+    let mut keep = vec![false; articles.len()];
+    for (_, i) in order.iter().take(cap) {
+        keep[*i] = true;
+    }
+    let mut idx = 0usize;
+    articles.retain(|_| {
+        let k = keep[idx];
+        idx += 1;
+        k
+    });
+}
+
 /// True if `rule` (scoped to `feed_id`) matches the incoming article `a`.
 /// The query is a comma-separated keyword list; any substring hit fires it.
 fn rule_matches(rule: &Rule, feed_id: i64, a: &NewArticle) -> bool {
@@ -1382,7 +1431,21 @@ pub fn upsert_article(
     // transaction as the insert so a crash cannot strand an untagged row.
     let tag_enabled = setting_flag(&*tx, "auto_tag_enabled", false)
         || setting_flag(&*tx, "ai_tag_enabled", false);
-    if tag_enabled {
+    // Historical backfill is the token-cost spike source: a newly-added feed's
+    // first fetch ingests its whole history, and every old item would trigger
+    // a full-price LLM call. Skip enqueueing items published more than
+    // `ai_tag_max_age_days` ago (default 3; 0 = no age gate). Items without a
+    // parseable date are treated as fresh — they cost one call, not hundreds.
+    let stale = {
+        let max_age_days = setting_parsed::<i64>(&*tx, "ai_tag_max_age_days", 3);
+        max_age_days > 0
+            && a.published_at.as_deref().is_some_and(|p| {
+                chrono::DateTime::parse_from_rfc3339(p)
+                    .map(|dt| dt + chrono::Duration::days(max_age_days) < chrono::Utc::now())
+                    .unwrap_or(false)
+            })
+    };
+    if tag_enabled && !stale {
         tx.execute(
             "INSERT INTO auto_tag_queue(article_id, status, attempts, last_error, updated_at)
              VALUES (?1, 'pending', 0, NULL, datetime('now'))
@@ -3337,6 +3400,19 @@ pub fn record_ai_usage(
     Ok(())
 }
 
+/// Number of completed LLM calls for `feature` since the start of today (UTC).
+/// Used by the auto-tag workers to enforce the daily call budget
+/// (`ai_tag_daily_budget`), so a content spike can never surprise-bill the
+/// account — the queue simply waits until the next day.
+pub fn count_ai_usage_today(conn: &Connection, feature: &str) -> AppResult<i64> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM ai_usage
+         WHERE feature = ?1 AND created_at >= date('now')",
+        params![feature],
+        |r| r.get(0),
+    )?)
+}
+
 /// Aggregate AI usage over the trailing `days` (clamped to 1–366), bucketed by
 /// feature, with grand totals in `total`.
 pub fn ai_usage_stats(conn: &Connection, days: i64) -> AppResult<AiUsageStats> {
@@ -4620,6 +4696,97 @@ mod tests {
             terms.iter().any(|t| t == "Pentagon"),
             "expected the longer-alias canonical in terms, got {terms:?}"
         );
+    }
+
+    #[test]
+    fn cap_newest_articles_keeps_recent_by_date_in_original_order() {
+        let mk = |guid: &str, published: Option<&str>| NewArticle {
+            guid: guid.into(),
+            url: Some(format!("https://example.com/{guid}")),
+            title: "T".into(),
+            author: None,
+            summary: None,
+            content_html: None,
+            body_text: "b".into(),
+            image_url: None,
+            published_at: published.map(|p| p.to_string()),
+            enclosures: Vec::new(),
+        };
+        // Dates deliberately out of document order to prove the selection is
+        // date-based (newest kept), not first-N; the missing-date item is oldest.
+        let mut articles = vec![
+            mk("jan", Some("2026-01-01T00:00:00+00:00")),
+            mk("mar", Some("2026-03-01T00:00:00+00:00")),
+            mk("nodate", None),
+            mk("feb", Some("2026-02-01T00:00:00+00:00")),
+        ];
+        cap_newest_articles(&mut articles, 2);
+        let kept: Vec<&str> = articles.iter().map(|a| a.guid.as_str()).collect();
+        // Newest two by date: mar (03-01) and feb (02-01), in original order.
+        assert_eq!(kept, vec!["mar", "feb"]);
+
+        // cap == 0 is a no-op; oversized caps are a no-op too.
+        let mut all = vec![mk("a", None), mk("b", None)];
+        cap_newest_articles(&mut all, 0);
+        assert_eq!(all.len(), 2);
+        cap_newest_articles(&mut all, 99);
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn stale_articles_are_not_enqueued_for_auto_tag() {
+        // A newly-added feed backfills its history on first fetch; those old
+        // items must not each trigger a full-price LLM tagging call.
+        let (conn, feed_id) = test_db();
+        set_setting(&conn, "ai_tag_enabled", "1").unwrap();
+        let old = (chrono::Utc::now() - chrono::Duration::days(10)).to_rfc3339();
+        let fresh = chrono::Utc::now().to_rfc3339();
+        let mk = |guid: &str, published: String| NewArticle {
+            guid: guid.into(),
+            url: Some(format!("https://example.com/{guid}")),
+            title: "T".into(),
+            author: None,
+            summary: None,
+            content_html: None,
+            body_text: "b".into(),
+            image_url: None,
+            published_at: Some(published),
+            enclosures: Vec::new(),
+        };
+        assert!(upsert_article(&conn, feed_id, &mk("old", old), false, &[]).unwrap());
+        assert!(upsert_article(&conn, feed_id, &mk("fresh", fresh), false, &[]).unwrap());
+
+        let queued: Vec<(i64, String)> = conn
+            .prepare("SELECT q.article_id, a.guid FROM auto_tag_queue q JOIN articles a ON a.id = q.article_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(queued.len(), 1, "only the fresh article may be enqueued");
+        assert_eq!(queued[0].1, "fresh");
+    }
+
+    #[test]
+    fn count_ai_usage_today_counts_only_today() {
+        let (conn, _) = test_db();
+        conn.execute(
+            "INSERT INTO ai_usage(feature, prompt_tokens) VALUES ('auto-tag', 10)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ai_usage(feature, prompt_tokens, created_at) \
+             VALUES ('auto-tag', 10, datetime('now', '-2 days'))",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ai_usage(feature, prompt_tokens) VALUES ('summarize', 10)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(count_ai_usage_today(&conn, "auto-tag").unwrap(), 1);
     }
 
     #[test]

@@ -83,6 +83,31 @@ async fn upsert_articles(
     new_count
 }
 
+/// Depth-cap a feed's *first* ingestion (`feed_initial_backfill`, default 50,
+/// 0 = unlimited) so a newly-added feed does not backfill its entire history.
+/// Every historical item would otherwise be ingested AND auto-tagged, which is
+/// how a batch of added feeds (e.g. one feed-source sync) turns into a token
+/// spike: the observed 8/21 incident added a NYTimes batch and produced 1.6k
+/// articles / 123M prompt tokens in a day.
+async fn cap_first_fetch(
+    db: &Mutex<Connection>,
+    feed_id: i64,
+    articles: &mut Vec<db::NewArticle>,
+) {
+    let cap = {
+        let conn = db.lock().await;
+        // Only the very first ingestion of a feed is capped; subsequent
+        // fetches deliver incremental items and are never truncated.
+        if db::feed_article_count(&conn, feed_id).unwrap_or(0) > 0 {
+            return;
+        }
+        db::setting_parsed::<i64>(&conn, "feed_initial_backfill", 50).max(0)
+    };
+    if cap > 0 {
+        db::cap_newest_articles(articles, cap as usize);
+    }
+}
+
 /// Outcome of fetching one feed.
 enum Outcome {
     NotModified,
@@ -217,10 +242,11 @@ pub async fn refresh_core(
                 error = Some(e);
             }
             Outcome::Updated {
-                parsed,
+                mut parsed,
                 etag,
                 last_modified,
             } => {
+                cap_first_fetch(db, feed_id, &mut parsed.articles).await;
                 new_here +=
                     upsert_articles(db, feed_id, &parsed.articles, dedup, &rules, "rss").await;
                 let conn = db.lock().await;
@@ -414,6 +440,10 @@ mod tests {
     /// with the body; used to exercise the real fetch → parse → ingest path
     /// without external network access.
     async fn serve_feed(body: &'static str, requests: u32) -> String {
+        serve_body(body.to_string(), requests).await
+    }
+
+    async fn serve_body(body: String, requests: u32) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -534,5 +564,54 @@ mod tests {
             .query_row("SELECT title FROM articles LIMIT 1", [], |r| r.get(0))
             .unwrap();
         assert_eq!(title, "美国国防部 invests heavily");
+    }
+
+    #[tokio::test]
+    async fn first_fetch_of_new_feed_is_depth_capped() {
+        // Regression for the token spike: a newly-added feed's first fetch used
+        // to ingest its whole history (hundreds of items), each triggering an
+        // auto-tag LLM call. `feed_initial_backfill` caps the initial backfill.
+        let items: String = (0..60)
+            .map(|i| {
+                format!(
+                    "<item><title>Story {i}</title><guid>g{i}</guid>\
+                     <link>http://e.test/{i}</link><description>d</description></item>"
+                )
+            })
+            .collect();
+        let body = format!(
+            "<rss version=\"2.0\"><channel><title>T</title>\
+             <link>http://e.test/</link><description>d</description>{items}</channel></rss>"
+        );
+        let url = serve_body(body, 1).await;
+        let (_path, db) = test_state();
+        {
+            let conn = db.lock().await;
+            db::set_setting(&conn, "feed_initial_backfill", "50").unwrap();
+            db::insert_feed(
+                &conn,
+                &url,
+                None,
+                "Test Feed",
+                None,
+                SourceType::Rss,
+                None,
+            )
+            .unwrap();
+        }
+        let client = fetch::build_client(10, "none");
+        let summary = refresh_core(&db, &client, RefreshScope::All, |_| {})
+            .await
+            .unwrap();
+        assert!(summary.ran);
+        assert_eq!(
+            summary.new_articles, 50,
+            "first fetch must be capped at feed_initial_backfill, not ingest all 60"
+        );
+        let conn = db.lock().await;
+        let articles: i64 = conn
+            .query_row("SELECT COUNT(*) FROM articles", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(articles, 50);
     }
 }

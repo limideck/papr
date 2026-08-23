@@ -547,7 +547,17 @@ pub async fn scan(
                     let _ = db::update_feed_meta(&conn, id, Some(&title), None, None, None);
                     let rules = db::active_rules(&conn).unwrap_or_default();
                     let dedup = db::setting_flag(&conn, "dedup_enabled", true);
-                    for article in &parsed.articles {
+                    // First ingestion of a never-fetched feed is depth-capped
+                    // (same `feed_initial_backfill` rule as the refresh loop):
+                    // backfilling a whole history here would ingest hundreds of
+                    // old items that each trigger an auto-tag LLM call.
+                    let mut articles = parsed.articles;
+                    let first = db::feed_article_count(&conn, id).unwrap_or(0) == 0;
+                    let cap = db::setting_parsed::<i64>(&conn, "feed_initial_backfill", 50).max(0);
+                    if first && cap > 0 {
+                        db::cap_newest_articles(&mut articles, cap as usize);
+                    }
+                    for article in &articles {
                         let _ = db::upsert_article(&conn, id, article, dedup, &rules);
                     }
                     let _ = db::touch_feed(&conn, id);

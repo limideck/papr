@@ -147,16 +147,24 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use tower::ServiceExt;
 
+    // macOS `SystemTime` has microsecond resolution, so two parallel tests
+    // calling `test_app()` within the same microsecond would collide on the
+    // same temp path — one would open the other's half-migrated DB. The atomic
+    // sequence makes every path unique within the process.
+    static TEST_DB_SEQ: AtomicU64 = AtomicU64::new(0);
+
     fn test_app() -> Router {
+        let seq = TEST_DB_SEQ.fetch_add(1, Ordering::SeqCst);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "papr-server-test-{}-{}.db",
+            "papr-server-test-{}-{nanos}-{seq}.db",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
         ));
         let state = AppState::new(&path).expect("test state");
         routes::api_router().with_state(state)
