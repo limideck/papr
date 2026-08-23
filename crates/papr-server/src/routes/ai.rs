@@ -23,12 +23,6 @@ use serde_json::Value;
 use std::convert::Infallible;
 use tokio_stream::wrappers::ReceiverStream;
 
-/// The digest feeds ~30 articles (often 15–20k chars) to the model; at
-/// `ai::MAX_TOKENS` (1024) a reasoning model spends the whole budget thinking
-/// and emits no content. A larger budget lets the reasoning phase finish and
-/// the briefing actually stream out.
-const DIGEST_MAX_TOKENS: u32 = 4096;
-
 /// The provider/model to attribute in the ledger for an already-resolved
 /// translation backend — empty for keyless machine-translation engines (which
 /// report zero usage and are skipped by the db layer anyway).
@@ -82,15 +76,20 @@ fn translate_target_lang(conn: &Connection) -> String {
         .unwrap_or_else(|| "en".to_string())
 }
 
-/// Resolve a translation engine (`google` / `bing` / `deepl` / `llm`; anything
-/// else falls back to the LLM). Google, DeepL and Bing are keyless free
-/// endpoints; only the LLM path needs the shared AI provider config.
+/// Resolve a translation engine (`google` / `bing` / `deepl` / `llm`). Google,
+/// DeepL and Bing are keyless free endpoints; only the LLM path needs the
+/// shared AI provider config. Unknown engine strings are rejected loudly
+/// instead of silently falling back to the (billable) LLM path — a typo or a
+/// newly added engine name would otherwise burn DeepSeek tokens unnoticed.
 fn build_translate_selection(conn: &Connection, engine: &str) -> ApiResult<translate::Selection> {
     Ok(match engine {
         "google" => translate::Selection::Google,
         "bing" => translate::Selection::Bing,
         "deepl" => translate::Selection::Deepl,
-        _ => translate::Selection::Llm(load_ai_config(conn)?),
+        "llm" => translate::Selection::Llm(load_ai_config(conn)?),
+        _ => {
+            return Err(ApiError::from(AppError::code("unknownTranslateEngine")));
+        }
     })
 }
 
@@ -284,11 +283,21 @@ pub async fn ask(
 }
 
 /// `POST /api/ai/digest` — synthesize a briefing of the most recent articles.
+/// Serves a cached briefing within the TTL instead of regenerating it.
 pub async fn digest(
     State(state): State<AppState>,
     _user: AuthUser,
     Json(_): Json<Value>,
 ) -> ApiResult<Response> {
+    // Cache hit: replay the stored briefing as the same SSE stream a fresh
+    // generation would emit, spending zero LLM tokens.
+    let cached = {
+        let conn = state.db.lock().await;
+        db::get_digest_cache(&conn).map_err(ApiError::from)?
+    };
+    if let Some(text) = cached {
+        return Ok(cached_digest_sse(&text));
+    }
     let (cfg, articles, lang) = {
         let conn = state.db.lock().await;
         (
@@ -313,7 +322,7 @@ pub async fn digest(
     let user = format!("Recent articles from my feeds:\n\n{corpus}");
     let (provider, model) = (cfg.provider_name(), cfg.model().to_string());
     let db = state.db.clone();
-    stream_chat_sse(&state.http, cfg, system, user, DIGEST_MAX_TOKENS, move |outcome| {
+    stream_chat_sse(&state.http, cfg, system, user, ai::DIGEST_MAX_TOKENS, move |outcome| {
         if outcome.completed {
             let conn = blocking_lock(&db);
             let _ = db::record_ai_usage(
@@ -323,9 +332,27 @@ pub async fn digest(
                 &model,
                 outcome.usage,
             );
+            // Persist only a completed, non-empty briefing so a truncated
+            // fragment (dropped client) is never cached.
+            if !outcome.text.trim().is_empty() {
+                let _ = db::set_digest_cache(&conn, outcome.text.trim());
+            }
         }
     })
     .await
+}
+
+/// Replay a cached digest as the same SSE stream a fresh generation produces —
+/// one `Delta` carrying the whole briefing, then `Done` — so the client needs
+/// no cache-aware branch.
+fn cached_digest_sse(text: &str) -> Response {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(4);
+    let text = text.to_string();
+    tokio::spawn(async move {
+        let _ = tx.send(Ok(sse_frame(&AiEvent::Delta(text)))).await;
+        let _ = tx.send(Ok(sse_frame(&AiEvent::Done))).await;
+    });
+    Sse::new(ReceiverStream::new(rx)).into_response()
 }
 
 #[derive(Deserialize)]
@@ -615,4 +642,65 @@ pub async fn usage(
     // Defaults are official deepseek-v4-flash prices.
     let estimated_cost = db::estimate_ai_cost_cny(&conn, &stats);
     Ok(Json(AiUsageReport { stats, estimated_cost }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use papr_core::translate;
+
+    fn test_conn() -> rusqlite::Connection {
+        let path = std::env::temp_dir().join(format!(
+            "papr-ai-route-test-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        papr_core::db::open(&path).unwrap()
+    }
+
+    #[test]
+    fn translate_selection_known_engines_and_rejects_unknown() {
+        let conn = test_conn();
+        // The llm branch needs provider config; seed minimal settings.
+        for (k, v) in [
+            ("ai_provider", "deepseek"),
+            ("ai_api_key", "sk-test"),
+            ("ai_model", "deepseek-v4-flash"),
+            ("ai_base_url", "https://api.deepseek.com"),
+        ] {
+            papr_core::db::set_setting(&conn, k, v).unwrap();
+        }
+
+        assert!(matches!(
+            build_translate_selection(&conn, "google").unwrap(),
+            translate::Selection::Google
+        ));
+        assert!(matches!(
+            build_translate_selection(&conn, "bing").unwrap(),
+            translate::Selection::Bing
+        ));
+        assert!(matches!(
+            build_translate_selection(&conn, "deepl").unwrap(),
+            translate::Selection::Deepl
+        ));
+        assert!(matches!(
+            build_translate_selection(&conn, "llm").unwrap(),
+            translate::Selection::Llm(_)
+        ));
+
+        // Regression: unknown engine strings must NOT silently fall back to
+        // the billable LLM path.
+        for bad in ["baidu", ""] {
+            match build_translate_selection(&conn, bad) {
+                Ok(_) => panic!("unknown engine {bad:?} must be rejected, not routed to LLM"),
+                Err(e) => assert!(
+                    matches!(e.error, papr_core::error::AppError::Coded("unknownTranslateEngine")),
+                    "unexpected error for {bad:?}"
+                ),
+            }
+        }
+    }
 }

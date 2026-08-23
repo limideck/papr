@@ -42,6 +42,14 @@ const AI_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 /// it. Translation overrides it with [`TRANSLATE_MAX_TOKENS`].
 pub const MAX_TOKENS: u32 = 1024;
 
+/// Output token cap for the article digest / briefing. The digest feeds ~30
+/// articles (~15–20k chars) to the model; at [`MAX_TOKENS`] (1024) a reasoning
+/// model spends the whole budget thinking and emits no content. A larger
+/// budget lets the reasoning phase finish and the briefing actually stream
+/// out. Shared by the HTTP route and the Tauri (desktop) command so the two
+/// paths can never drift apart again.
+pub const DIGEST_MAX_TOKENS: u32 = 4096;
+
 /// Output token cap for one translation batch. A batch's translated HTML tracks
 /// its input length (tags are echoed too), so it needs far more room than a
 /// summary. Paired with [`TRANSLATE_CHUNK_BUDGET`] so a batch fits under it.

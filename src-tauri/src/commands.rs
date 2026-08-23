@@ -692,9 +692,10 @@ async fn stream_to_channel(
 
 /// Resolve a translation engine chosen by the caller (the reader's translate
 /// switcher) into what it needs. `engine` is one of `google` / `bing` / `deepl`
-/// / `llm`; anything else falls back to the LLM. Google, DeepL and Bing are
-/// keyless free endpoints; only the LLM path needs credentials (the shared AI
-/// provider config). The engine is picked per translation.
+/// / `llm`. Google, DeepL and Bing are keyless free endpoints; only the LLM
+/// path needs credentials (the shared AI provider config). The engine is
+/// picked per translation. Unknown engine strings are rejected loudly instead
+/// of silently falling back to the (billable) LLM path.
 fn build_translate_selection(
     conn: &rusqlite::Connection,
     engine: &str,
@@ -703,7 +704,8 @@ fn build_translate_selection(
         "google" => translate::Selection::Google,
         "bing" => translate::Selection::Bing,
         "deepl" => translate::Selection::Deepl,
-        _ => translate::Selection::Llm(load_ai_config(conn)?),
+        "llm" => translate::Selection::Llm(load_ai_config(conn)?),
+        _ => return Err(AppError::code("unknownTranslateEngine")),
     })
 }
 
@@ -860,11 +862,22 @@ pub async fn ai_ask(
 }
 
 /// Stream an AI briefing that synthesizes the most recent articles by theme.
+/// Serves a cached briefing within the TTL instead of regenerating it.
 #[tauri::command]
 pub async fn ai_digest(
     state: State<'_, AppState>,
     on_token: Channel<AiEvent>,
 ) -> AppResult<()> {
+    // Cache hit: replay the stored briefing token-for-token, zero LLM spend.
+    let cached = {
+        let conn = state.db.lock().await;
+        db::get_digest_cache(&conn)?
+    };
+    if let Some(text) = cached {
+        let _ = on_token.send(AiEvent::Delta(text));
+        let _ = on_token.send(AiEvent::Done);
+        return Ok(());
+    }
     let (cfg, articles, lang) = {
         let conn = state.read().await;
         (
@@ -891,7 +904,8 @@ pub async fn ai_digest(
     let user = format!("Recent articles from my feeds:\n\n{corpus}");
 
     let http = state.http();
-    let outcome = stream_to_channel(&http, &cfg, &system, &user, &on_token, ai::MAX_TOKENS).await?;
+    let outcome = stream_to_channel(&http, &cfg, &system, &user, &on_token, ai::DIGEST_MAX_TOKENS)
+        .await?;
     if outcome.completed {
         let conn = state.db.lock().await;
         db::record_ai_usage(
@@ -901,6 +915,11 @@ pub async fn ai_digest(
             cfg.model(),
             outcome.usage,
         )?;
+        // Persist only a completed, non-empty briefing so a truncated fragment
+        // (closed window) is never cached.
+        if !outcome.text.trim().is_empty() {
+            let _ = db::set_digest_cache(&conn, outcome.text.trim());
+        }
     }
     Ok(())
 }

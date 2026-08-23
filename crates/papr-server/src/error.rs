@@ -6,6 +6,7 @@ use axum::Json;
 use papr_core::error::AppError;
 use serde_json::json;
 
+#[derive(Debug)]
 pub struct ApiError {
     pub status: StatusCode,
     pub error: AppError,

@@ -3413,6 +3413,48 @@ pub fn count_ai_usage_today(conn: &Connection, feature: &str) -> AppResult<i64> 
     )?)
 }
 
+/// TTL for the AI digest cache (seconds). The digest feeds ~30 articles to the
+/// model, so regenerating it on every click burns ~5k prompt + 4k output
+/// tokens for a briefing the user just saw. A pure TTL (no article-level
+/// invalidation) is the right trade: the briefing is a snapshot, and new
+/// articles arrive constantly — invalidating on each one would defeat the
+/// cache.
+pub const DIGEST_CACHE_TTL_SECS: i64 = 3600;
+
+/// The cached AI digest, if one exists and is still fresh. Stored under
+/// ordinary settings keys so no schema change is needed.
+pub fn get_digest_cache(conn: &Connection) -> AppResult<Option<String>> {
+    let Some(at) = get_setting(conn, "digest_cache_at")? else {
+        return Ok(None);
+    };
+    let Ok(naive) = chrono::NaiveDateTime::parse_from_str(&at, "%Y-%m-%d %H:%M:%S") else {
+        return Ok(None);
+    };
+    let age = chrono::Utc::now()
+        .naive_utc()
+        .signed_duration_since(naive)
+        .num_seconds();
+    if !(0..=DIGEST_CACHE_TTL_SECS).contains(&age) {
+        return Ok(None);
+    }
+    let text = get_setting(conn, "digest_cache_text")?;
+    match text {
+        Some(t) if !t.trim().is_empty() => Ok(Some(t)),
+        _ => Ok(None),
+    }
+}
+
+/// Store a freshly generated digest (callers persist only completed, non-empty
+/// text so a truncated fragment is never cached).
+pub fn set_digest_cache(conn: &Connection, text: &str) -> AppResult<()> {
+    set_setting(conn, "digest_cache_text", text)?;
+    set_setting(
+        conn,
+        "digest_cache_at",
+        &chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+    )
+}
+
 /// Aggregate AI usage over the trailing `days` (clamped to 1–366), bucketed by
 /// feature, with grand totals in `total`.
 pub fn ai_usage_stats(conn: &Connection, days: i64) -> AppResult<AiUsageStats> {
@@ -4787,6 +4829,33 @@ mod tests {
         )
         .unwrap();
         assert_eq!(count_ai_usage_today(&conn, "auto-tag").unwrap(), 1);
+    }
+
+    #[test]
+    fn digest_cache_respects_ttl() {
+        let (conn, _) = test_db();
+        assert!(get_digest_cache(&conn).unwrap().is_none(), "empty cache");
+
+        set_digest_cache(&conn, "Fresh briefing").unwrap();
+        assert_eq!(
+            get_digest_cache(&conn).unwrap().as_deref(),
+            Some("Fresh briefing")
+        );
+
+        // Expire the entry: a stale cache must be ignored (regenerate).
+        conn.execute(
+            "UPDATE settings SET value = datetime('now', '-2 hours') WHERE key = 'digest_cache_at'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            get_digest_cache(&conn).unwrap().is_none(),
+            "stale digest must not be served"
+        );
+
+        // Empty text is never served as a hit.
+        set_digest_cache(&conn, "   ").unwrap();
+        assert!(get_digest_cache(&conn).unwrap().is_none());
     }
 
     #[test]
