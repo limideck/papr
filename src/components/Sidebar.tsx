@@ -1,5 +1,6 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useRef, useState } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import * as api from "../api";
 import { useAuth } from "../auth";
@@ -423,6 +424,29 @@ export default function Sidebar({
   // Feeds tab: all interest tags by current update/name sort.
   const topTags = sortInterestTags(interestTags);
   const isActive = (q: ArticleQuery) => sameQuery(q, query);
+
+  // ── Tags tab: virtualized AI-tag list ──
+  // The AI vocabulary can reach tens of thousands of rows; rendering all of
+  // them as DOM nodes blew up sidebar memory. Only the rows near the viewport
+  // are mounted; the list stays fully scrollable.
+  const tagsScrollRef = useRef<HTMLDivElement>(null);
+  const tagsHeadRef = useRef<HTMLDivElement>(null);
+  const [tagsHeadH, setTagsHeadH] = useState(0);
+  useEffect(() => {
+    if (tagsHeadRef.current) {
+      setTagsHeadH(tagsHeadRef.current.offsetHeight);
+    }
+  }, [sideTab, aiTags.length]);
+  const sortedAiTags = useMemo(() => sortTags(aiTags), [aiTags, tagSort]);
+  const tagsVirt = useVirtualizer({
+    count: sortedAiTags.length,
+    getScrollElement: () => tagsScrollRef.current,
+    estimateSize: () => 28,
+    overscan: 12,
+    // The virtual rows start below the card head, which lives in the same
+    // scroll element — offset the item coordinate space by its height.
+    scrollMargin: tagsHeadH,
+  });
 
   // Keep the selected feed in view. Opening an article from search jumps the
   // selection to a feed that may be scrolled out of sight — or hidden inside a
@@ -902,9 +926,9 @@ export default function Sidebar({
       {sideTab === "cloud" ? (
         <WordCloudPanel onSelectTerm={onCloudTerm} />
       ) : sideTab === "tags" ? (
-        <div className="sidebar-scroll sb-tags-tab">
+        <div className="sidebar-scroll sb-tags-tab" ref={tagsScrollRef}>
           <div className="sb-tags-card">
-            <div className="sb-tags-card-head">
+            <div className="sb-tags-card-head" ref={tagsHeadRef}>
               <span>{t("sidebar.tabTags")}</span>
               <span className="sb-section-actions">
                 <span
@@ -956,18 +980,40 @@ export default function Sidebar({
                 </span>
               </span>
             </div>
-            {aiTags.length === 0 ? (
+            {sortedAiTags.length === 0 ? (
               <div className="sb-tags-empty">{t("sidebar.aiTagsEmptyHint")}</div>
             ) : (
-              sortTags(aiTags).map((tag) =>
-                tagRow(tag, {
-                  // Client-side sort owns display order; drag-reorder would
-                  // fight the selected mode (same idea as the Feeds list).
-                  reorderable: false,
-                  alwaysCount: true,
-                  showUnread: true,
-                }),
-              )
+              <div
+                style={{
+                  height: tagsVirt.getTotalSize(),
+                  position: "relative",
+                  width: "100%",
+                }}
+              >
+                {tagsVirt.getVirtualItems().map((vi) => {
+                  const tag = sortedAiTags[vi.index];
+                  return (
+                    <div
+                      key={tag.id}
+                      style={{
+                        position: "absolute",
+                        top: 0,
+                        left: 0,
+                        width: "100%",
+                        transform: `translateY(${vi.start}px)`,
+                      }}
+                    >
+                      {tagRow(tag, {
+                        // Client-side sort owns display order; drag-reorder
+                        // would fight the selected mode (same idea as Feeds).
+                        reorderable: false,
+                        alwaysCount: true,
+                        showUnread: true,
+                      })}
+                    </div>
+                  );
+                })}
+              </div>
             )}
           </div>
           <div style={{ height: 20 }} />
