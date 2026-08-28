@@ -17,6 +17,7 @@ use serde_json::json;
 use state::AppState;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
@@ -51,6 +52,10 @@ async fn main() -> anyhow::Result<()> {
         .merge(routes::api_router())
         .layer(TraceLayer::new_for_http())
         .layer(cors)
+        // gzip/brotli for API JSON + static assets. The default predicate
+        // leaves `text/event-stream` (SSE streams) uncompressed so token
+        // streaming is never buffered.
+        .layer(CompressionLayer::new())
         .with_state(state.clone());
 
     if let Some(dir) = &static_dir {
