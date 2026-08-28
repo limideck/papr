@@ -925,7 +925,10 @@
     "noKindleConfig": "設定 → 連携 で Kindle アドレスと SMTP サーバーを設定してください",
     "incorrectPassword": "現在のパスワードが正しくありません",
     "passwordTooShort": "パスワードは6文字以上にしてください",
-    "passwordUnchanged": "新しいパスワードは現在のものと異なる必要があります"
+    "passwordUnchanged": "新しいパスワードは現在のものと異なる必要があります",
+    "unauthorized": "ユーザー名またはパスワードが正しくありません",
+    "forbidden": "この操作を行う権限がありません",
+    "emptyUsername": "ユーザー名を入力してください"
   },
   "highlights": {
     "toolbarLabel": "ハイライトの色",

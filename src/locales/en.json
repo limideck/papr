@@ -925,7 +925,10 @@
     "noKindleConfig": "Configure your Kindle address and SMTP server in Settings → Integrations",
     "incorrectPassword": "Current password is incorrect",
     "passwordTooShort": "Password must be at least 6 characters",
-    "passwordUnchanged": "New password must differ from the current one"
+    "passwordUnchanged": "New password must differ from the current one",
+    "unauthorized": "Invalid username or password",
+    "forbidden": "You don't have permission to do that",
+    "emptyUsername": "Username cannot be empty"
   },
   "highlights": {
     "toolbarLabel": "Highlight color",

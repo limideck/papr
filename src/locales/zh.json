@@ -925,7 +925,10 @@
     "noKindleConfig": "请在 设置 → 集成 中配置 Kindle 地址和 SMTP 服务器",
     "incorrectPassword": "当前密码不正确",
     "passwordTooShort": "密码至少需要 6 个字符",
-    "passwordUnchanged": "新密码不能与当前密码相同"
+    "passwordUnchanged": "新密码不能与当前密码相同",
+    "unauthorized": "用户名或密码错误",
+    "forbidden": "没有权限执行此操作",
+    "emptyUsername": "用户名不能为空"
   },
   "highlights": {
     "toolbarLabel": "高亮颜色",
