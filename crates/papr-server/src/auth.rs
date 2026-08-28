@@ -64,11 +64,66 @@ pub async fn login(
     let conn = state.db.lock().await;
     let Some((user, hash)) = auth::find_user_by_username(&conn, username).map_err(ApiError::from)?
     else {
-        return Err(ApiError::unauthorized());
+        // Distinct code (still HTTP 401) so the login form can tell the user
+        // the username is unknown. Note: this reveals username existence —
+        // acceptable for this single-tenant, admin-managed reader; both
+        // failure modes keep the same 401 status so transport-level probing
+        // sees no difference.
+        return Err(ApiError::new(
+            axum::http::StatusCode::UNAUTHORIZED,
+            papr_core::error::AppError::code("userNotFound"),
+        ));
     };
     if !auth::verify_password(password, &hash) {
-        return Err(ApiError::unauthorized());
+        return Err(ApiError::new(
+            axum::http::StatusCode::UNAUTHORIZED,
+            papr_core::error::AppError::code("wrongPassword"),
+        ));
     }
     let token = auth::create_session(&conn, user.id).map_err(ApiError::from)?;
     Ok((user, token))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use papr_core::error::AppError;
+
+    fn test_state() -> AppState {
+        let path = std::env::temp_dir().join(format!(
+            "papr-auth-test-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        AppState::new(&path).expect("test state")
+    }
+
+    #[tokio::test]
+    async fn login_distinguishes_unknown_user_and_wrong_password() {
+        let state = test_state();
+        {
+            let conn = state.db.lock().await;
+            papr_core::auth::create_user(&conn, "alice", "secret123", false).unwrap();
+        }
+
+        // Unknown username → userNotFound.
+        match login(&state, "bob", "secret123").await {
+            Err(e) => assert!(matches!(e.error, AppError::Coded("userNotFound"))),
+            Ok(_) => panic!("unknown user must not log in"),
+        }
+        // Known user, wrong password → wrongPassword.
+        match login(&state, "alice", "wrongpass").await {
+            Err(e) => assert!(matches!(e.error, AppError::Coded("wrongPassword"))),
+            Ok(_) => panic!("wrong password must not log in"),
+        }
+        // Correct credentials → success.
+        let (user, _token) = login(&state, "alice", "secret123").await.expect("login");
+        assert_eq!(user.username, "alice");
+        // Case-insensitive username lookup still works.
+        let (user, _token) = login(&state, "ALICE", "secret123").await.expect("login");
+        assert_eq!(user.username, "alice");
+    }
 }

@@ -928,7 +928,9 @@
     "passwordUnchanged": "新しいパスワードは現在のものと異なる必要があります",
     "unauthorized": "ユーザー名またはパスワードが正しくありません",
     "forbidden": "この操作を行う権限がありません",
-    "emptyUsername": "ユーザー名を入力してください"
+    "emptyUsername": "ユーザー名を入力してください",
+    "userNotFound": "ユーザー名が存在しません",
+    "wrongPassword": "パスワードが正しくありません"
   },
   "highlights": {
     "toolbarLabel": "ハイライトの色",
