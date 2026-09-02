@@ -828,7 +828,7 @@ struct JobContext {
     title: String,
     summary: String,
     interest_names: Vec<String>,
-    /// Top AI tags by usage (`ai_tag_prompt_cap`, default 200) shown to the
+    /// Top AI tags by usage (`ai_tag_prompt_cap`, default 150) shown to the
     /// model as the reuse vocabulary. Without any list the model invented a
     /// fresh near-synonym per article (30k+ tags, 66% used once) and hot
     /// topics fragmented across dozens of spellings ("Middle East" vs
@@ -864,7 +864,10 @@ fn load_job_context(conn: &Connection, article_id: i64) -> AppResult<JobContext>
         .map(|t| t.name)
         .collect();
     // Bounded, usage-ranked reuse list for the free-form tags. 0 = no list.
-    let ai_cap = db::setting_parsed::<i64>(conn, "ai_tag_prompt_cap", 200).max(0);
+    // 150 names ≈ 1-2k tokens of prompt context — balances reuse coverage
+    // (hot topics stay listed) against per-call cost (format rules added
+    // ~10% tokens in the P0/P1 rework).
+    let ai_cap = db::setting_parsed::<i64>(conn, "ai_tag_prompt_cap", 150).max(0);
     let ai_names = db::top_tag_names(conn, TAG_KIND_AI, ai_cap)?;
     let cfg = AiConfig::new(
         db::get_setting(conn, "ai_provider")?,
