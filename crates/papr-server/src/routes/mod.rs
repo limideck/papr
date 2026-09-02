@@ -94,6 +94,7 @@ pub fn api_router() -> Router<AppState> {
             patch(tags::update).delete(tags::delete),
         )
         .route("/api/tags/reorder", post(tags::reorder))
+        .route("/api/tags/{id}/merge", post(tags::merge))
         .route("/api/tags/cleanup-empty", post(tags::cleanup_empty))
         .route(
             "/api/tags/aliases",

@@ -2708,6 +2708,14 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
   const [confirmDelete, setConfirmDelete] = useState<Tag | null>(null);
   const [confirmCleanupEmpty, setConfirmCleanupEmpty] = useState(false);
   const [cleanupBusy, setCleanupBusy] = useState(false);
+  // Tag merge: pick a source tag, then search the same-kind vocabulary for a
+  // canonical target. Used to repair AI-taxonomy fragmentation (one topic
+  // split across dozens of near-synonym tags).
+  const [mergeSource, setMergeSource] = useState<Tag | null>(null);
+  const [mergeQuery, setMergeQuery] = useState("");
+  const [mergeCandidates, setMergeCandidates] = useState<Tag[]>([]);
+  const [mergeTarget, setMergeTarget] = useState<Tag | null>(null);
+  const [mergeBusy, setMergeBusy] = useState(false);
   const [tagSort, setTagSort] = useState<{
     mode: TagSortMode;
     dir: TagSortDir;
@@ -2829,6 +2837,52 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
       setConfirmDelete(null);
     }
   };
+
+  // Open the merge picker: load the whole same-kind vocabulary once and let
+  // the admin search for a canonical target (e.g. merge 中东 → Middle East).
+  const openMerge = async (tag: Tag) => {
+    setMergeSource(tag);
+    setMergeQuery("");
+    setMergeTarget(null);
+    try {
+      const all = await api.listTags(tag.kind as "ai" | "interest");
+      setMergeCandidates(all.filter((t) => t.id !== tag.id));
+    } catch (e) {
+      reportError(e);
+      setMergeSource(null);
+    }
+  };
+
+  const runMerge = async () => {
+    if (!mergeSource || !mergeTarget) return;
+    setMergeBusy(true);
+    try {
+      const res = await api.mergeTags(mergeSource.id, mergeTarget.id);
+      refreshTags();
+      onToast(
+        t("settings.autoTag.mergeDone", {
+          from: mergeSource.name,
+          to: mergeTarget.name,
+          count: res.moved,
+        }),
+      );
+      setMergeSource(null);
+    } catch (e) {
+      reportError(e);
+    } finally {
+      setMergeBusy(false);
+      setMergeTarget(null);
+    }
+  };
+
+  // Candidates matching the query, most-used first, capped for the picker.
+  const mergeMatches = mergeCandidates
+    .filter((t) => {
+      const q = mergeQuery.trim().toLowerCase();
+      return !q || t.name.toLowerCase().includes(q);
+    })
+    .sort((a, b) => b.articleCount - a.articleCount)
+    .slice(0, 50);
 
   const addAlias = async () => {
     const alias = aliasDraft.trim();
@@ -3099,6 +3153,14 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
                   onClick={() => renameTag(tag)}
                 >
                   <Icon name="settings" size={13} />
+                </button>
+                <button
+                  className="icon-btn"
+                  type="button"
+                  title={t("settings.autoTag.mergeTag")}
+                  onClick={() => void openMerge(tag)}
+                >
+                  <span aria-hidden>⇄</span>
                 </button>
                 <button
                   className="icon-btn"
@@ -3541,6 +3603,98 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
           danger
           onConfirm={() => void runClearQueue()}
           onClose={() => setConfirmClearQueue(false)}
+        />
+      )}
+      {mergeSource && (
+        <div
+          className="modal-backdrop"
+          onClick={() => setMergeSource(null)}
+        >
+          <div
+            className="modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label={t("settings.autoTag.mergeTitle", {
+              name: mergeSource.name,
+            })}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2>
+              {t("settings.autoTag.mergeTitle", { name: mergeSource.name })}
+            </h2>
+            <input
+              className="modal-input"
+              type="search"
+              value={mergeQuery}
+              autoFocus
+              placeholder={t("settings.autoTag.mergeSearchPlaceholder")}
+              aria-label={t("settings.autoTag.mergeSearchPlaceholder")}
+              onChange={(e) => setMergeQuery(e.target.value)}
+              style={{ marginTop: 8 }}
+            />
+            <div
+              className="s-interest-tags"
+              style={{ maxHeight: 260, overflowY: "auto", marginTop: 8 }}
+            >
+              {mergeMatches.length === 0 ? (
+                <p className="settings-group-desc">
+                  {t("settings.autoTag.mergeNoMatches")}
+                </p>
+              ) : (
+                mergeMatches.map((t) => (
+                  <div
+                    key={t.id}
+                    className="s-interest-tag-row"
+                    style={{ cursor: "pointer" }}
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => setMergeTarget(t)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") setMergeTarget(t);
+                    }}
+                  >
+                    <span
+                      className="s-interest-tag-dot"
+                      style={{ background: tagColor(t.color) }}
+                      aria-hidden
+                    />
+                    <span className="s-interest-tag-name">{t.name}</span>
+                    <span className="s-interest-tag-count">
+                      {t.articleCount} 篇
+                    </span>
+                    {mergeTarget?.id === t.id && <Icon name="check" size={13} />}
+                  </div>
+                ))
+              )}
+            </div>
+            <div className="modal-actions">
+              <button
+                className="s-btn"
+                onClick={() => setMergeSource(null)}
+              >
+                {t("common.cancel")}
+              </button>
+              <button
+                className="s-btn primary"
+                disabled={!mergeTarget || mergeBusy}
+                onClick={() => void runMerge()}
+              >
+                {mergeBusy ? t("common.loading") : t("settings.autoTag.mergeTag")}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {mergeTarget && mergeSource && (
+        <ConfirmDialog
+          title={t("settings.autoTag.mergeConfirmTitle")}
+          message={t("settings.autoTag.mergeConfirmMessage", {
+            from: mergeSource.name,
+            to: mergeTarget.name,
+          })}
+          confirmLabel={t("settings.autoTag.mergeTag")}
+          onConfirm={() => void runMerge()}
+          onClose={() => setMergeTarget(null)}
         />
       )}
     </>

@@ -632,7 +632,14 @@
       "clearQueueDesc": "空にしたあと、もう一度バックフィルを実行すると、取り込み時刻が新しい記事から優先処理されます。",
       "clearQueueConfirm": "進行中のタグ付けを止め、待機・処理中・失敗の項目を削除します。完了履歴は残ります。自動では再キューしません — 準備できたら「バックフィル開始」を押してください。",
       "clearQueueDone": "キューから {{count}} 件を削除しました",
-      "saved": "保存しました"
+      "saved": "保存しました",
+      "mergeTag": "マージ先…",
+      "mergeTitle": "「{{name}}」をどのタグにマージしますか？",
+      "mergeSearchPlaceholder": "同種タグを検索…",
+      "mergeNoMatches": "一致するタグがありません。",
+      "mergeConfirmTitle": "マージの確認",
+      "mergeConfirmMessage": "「{{from}}」が付いた記事はすべて「{{to}}」に変更され、「{{from}}」は削除されます。続行しますか？",
+      "mergeDone": "{{from}} → {{to}} にマージ（{{count}} 件移動）"
     },
     "stats": {
       "overview": "概要",

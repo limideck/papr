@@ -2124,6 +2124,39 @@ pub fn list_tags(conn: &Connection, kind: Option<&str>) -> AppResult<Vec<Tag>> {
     Ok(rows)
 }
 
+/// Merge `from_id` into `to_id` (same kind): every article tagged
+/// `from_id` is re-attached to `to_id` (existing attachments untouched), then
+/// `from_id` is deleted (its remaining `article_tags` rows cascade). Returns
+/// the number of articles newly attached to the target.
+///
+/// This is the tool for repairing taxonomy fragmentation — the AI vocabulary
+/// accumulated ~33k tags with dozens of near-synonyms for one topic (中东 /
+/// Middle East / 中东冲突 / …). An admin merges the variants onto a canonical
+/// tag so clicking it surfaces the whole topic.
+pub fn merge_tags(conn: &Connection, from_id: i64, to_id: i64) -> AppResult<usize> {
+    let tx = conn.unchecked_transaction()?;
+    let from_kind: Option<String> = tx
+        .query_row("SELECT kind FROM tags WHERE id = ?1", params![from_id], |r| r.get(0))
+        .optional()?;
+    let to_kind: Option<String> = tx
+        .query_row("SELECT kind FROM tags WHERE id = ?1", params![to_id], |r| r.get(0))
+        .optional()?;
+    if from_id == to_id || from_kind.is_none() || to_kind.is_none() {
+        return Err(AppError::code("tagNotFound"));
+    }
+    if from_kind != to_kind {
+        return Err(AppError::code("tagKindMismatch"));
+    }
+    let moved = tx.execute(
+        "INSERT OR IGNORE INTO article_tags(article_id, tag_id)
+         SELECT article_id, ?1 FROM article_tags WHERE tag_id = ?2",
+        params![to_id, from_id],
+    )?;
+    tx.execute("DELETE FROM tags WHERE id = ?1", params![from_id])?;
+    tx.commit()?;
+    Ok(moved)
+}
+
 /// Create a tag of the given kind, auto-assigning colour and list position.
 ///
 /// Idempotent on `(kind, name)`: matching is case-insensitive within the kind,
@@ -4734,6 +4767,65 @@ mod tests {
         assert!(
             order.iter().position(|&x| x == a) < order.iter().position(|&x| x == zoo),
         );
+    }
+
+    #[test]
+    fn merge_tags_moves_articles_and_dedups() {
+        let (conn, feed_id) = test_db();
+        // Two extra articles so the source tag has multiple attachments.
+        for i in 0..2 {
+            let a = NewArticle {
+                guid: format!("m{i}"),
+                url: Some(format!("https://example.com/m{i}")),
+                title: "Merge test".into(),
+                author: None,
+                summary: None,
+                content_html: None,
+                body_text: "b".into(),
+                image_url: None,
+                published_at: None,
+                enclosures: Vec::new(),
+            };
+            upsert_article(&conn, feed_id, &a, false, &[]).unwrap();
+        }
+        let ids: Vec<i64> = conn
+            .prepare("SELECT id FROM articles ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let source = create_tag(&conn, "中东", TAG_KIND_AI).unwrap();
+        let target = create_tag(&conn, "Middle East", TAG_KIND_AI).unwrap();
+        let interest = create_tag(&conn, "中东局势", TAG_KIND_INTEREST).unwrap();
+        // Source: articles 1,2,3. Target already has article 2 (dedup case).
+        for id in &ids {
+            set_article_tag(&conn, *id, source, true).unwrap();
+        }
+        set_article_tag(&conn, ids[1], target, true).unwrap();
+
+        // Same-kind merge moves the two new attachments and keeps the dup.
+        let moved = merge_tags(&conn, source, target).unwrap();
+        assert_eq!(moved, 2, "article 2 already carried the target tag");
+        let target_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM article_tags WHERE tag_id = ?1",
+                params![target],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(target_count, ids.len() as i64);
+        // Source tag is gone.
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tags WHERE id = ?1", params![source], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0);
+
+        // Cross-kind merges are rejected.
+        let err = merge_tags(&conn, target, interest).unwrap_err();
+        assert!(matches!(err, AppError::Coded("tagKindMismatch")));
+        // Unknown ids are rejected too.
+        assert!(merge_tags(&conn, 99999, target).is_err());
     }
 
     #[test]

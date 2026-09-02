@@ -632,7 +632,14 @@
       "clearQueueDesc": "After clearing, run backfill again — newest by ingest time are processed first.",
       "clearQueueConfirm": "This stops current tagging and removes pending, processing, and failed items. Done history is kept. Nothing is re-queued automatically — click Run backfill when ready.",
       "clearQueueDone": "Cleared {{count}} queue items",
-      "saved": "Saved"
+      "saved": "Saved",
+      "mergeTag": "Merge into…",
+      "mergeTitle": "Merge “{{name}}” into which tag?",
+      "mergeSearchPlaceholder": "Search same-kind tags…",
+      "mergeNoMatches": "No matching tags.",
+      "mergeConfirmTitle": "Confirm merge",
+      "mergeConfirmMessage": "Every article tagged “{{from}}” will be re-tagged “{{to}}”, then “{{from}}” is deleted. Continue?",
+      "mergeDone": "Merged {{from}} → {{to}} ({{count}} articles moved)"
     },
     "stats": {
       "overview": "Overview",

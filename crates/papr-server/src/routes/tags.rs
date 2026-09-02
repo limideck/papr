@@ -92,6 +92,28 @@ pub struct CleanupEmptyBody {
 
 /// Delete unused AI tags (`article_count = 0`). Admin only.
 /// Interest cleanup is rejected — empty interest tags stay as vocabulary.
+
+/// `POST /api/tags/{id}/merge` — merge tag `{id}` into `targetTagId` (same
+/// kind): every article of the source tag is re-attached to the target, then
+/// the source tag is deleted. Admin only. Used to repair AI-taxonomy
+/// fragmentation (near-synonym tags split across dozens of spellings).
+#[derive(Deserialize)]
+pub struct MergeBody {
+    pub target_tag_id: i64,
+}
+
+pub async fn merge(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+    Json(body): Json<MergeBody>,
+) -> ApiResult<Json<Value>> {
+    user.require_admin()?;
+    let conn = state.db.lock().await;
+    let moved = db::merge_tags(&conn, id, body.target_tag_id).map_err(ApiError::from)?;
+    Ok(Json(json!({ "moved": moved })))
+}
+
 pub async fn cleanup_empty(
     State(state): State<AppState>,
     user: AuthUser,

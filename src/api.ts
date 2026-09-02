@@ -567,6 +567,11 @@ export const renameTag = (id: number, name: string) =>
     method: "PATCH",
     body: JSON.stringify({ name }),
   });
+export const mergeTags = (fromId: number, toId: number) =>
+  apiJson<{ moved: number }>(`${API}/tags/${fromId}/merge`, {
+    method: "POST",
+    body: JSON.stringify({ targetTagId: toId }),
+  });
 export const setTagColor = (id: number, color: string) =>
   apiJson<void>(`${API}/tags/${id}`, {
     method: "PATCH",
