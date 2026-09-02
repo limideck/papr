@@ -257,7 +257,7 @@ pub async fn stream_chat(
     max_tokens: u32,
 ) -> AppResult<ChatOutcome> {
     if cfg.provider.is_openai_compatible() {
-        stream_openai(client, cfg, system, user, sink, max_tokens, false).await
+        stream_openai(client, cfg, system, user, sink, max_tokens, false, false).await
     } else {
         stream_anthropic(client, cfg, system, user, sink, max_tokens).await
     }
@@ -273,7 +273,21 @@ pub async fn complete_chat(
     user: &str,
     max_tokens: u32,
 ) -> AppResult<ChatOutcome> {
-    complete_chat_inner(client, cfg, system, user, max_tokens, false).await
+    complete_chat_inner(client, cfg, system, user, max_tokens, false, false).await
+}
+
+/// Like [`complete_chat`], but disables DeepSeek chain-of-thought so a
+/// small-budget classification/extraction call never burns `max_tokens` on
+/// reasoning (and never comes back empty). Used by auto-tagging, which emits
+/// a plain `@tag` list rather than JSON.
+pub async fn complete_chat_classify(
+    client: &Client,
+    cfg: &AiConfig,
+    system: &str,
+    user: &str,
+    max_tokens: u32,
+) -> AppResult<ChatOutcome> {
+    complete_chat_inner(client, cfg, system, user, max_tokens, false, true).await
 }
 
 /// Like [`complete_chat`], but asks OpenAI-compatible providers for a JSON
@@ -286,7 +300,7 @@ pub async fn complete_chat_json(
     user: &str,
     max_tokens: u32,
 ) -> AppResult<ChatOutcome> {
-    complete_chat_inner(client, cfg, system, user, max_tokens, true).await
+    complete_chat_inner(client, cfg, system, user, max_tokens, true, true).await
 }
 
 async fn complete_chat_inner(
@@ -296,6 +310,7 @@ async fn complete_chat_inner(
     user: &str,
     max_tokens: u32,
     json_object: bool,
+    disable_thinking: bool,
 ) -> AppResult<ChatOutcome> {
     // A sink that discards deltas; `consume_sse` still accumulates the full text.
     let mut discard = |_: &str| true;
@@ -308,6 +323,7 @@ async fn complete_chat_inner(
             &mut discard,
             max_tokens,
             json_object,
+            disable_thinking,
         )
         .await
     } else {
@@ -351,6 +367,7 @@ async fn stream_openai(
     sink: &mut DeltaSink<'_>,
     max_tokens: u32,
     json_object: bool,
+    disable_thinking: bool,
 ) -> AppResult<ChatOutcome> {
     let mut body = json!({
         "model": cfg.model,
@@ -361,20 +378,21 @@ async fn stream_openai(
             { "role": "user", "content": user },
         ],
     });
-    // Prefer structured JSON when the caller needs an object (auto-tag).
-    // Some local OpenAI-compatible servers ignore unknown fields; ones that
-    // reject `response_format` will surface a 4xx which the caller can treat
-    // as a hard failure / retry without the flag if needed.
+    // Prefer structured JSON when the caller needs an object. Some local
+    // OpenAI-compatible servers ignore unknown fields; ones that reject
+    // `response_format` will surface a 4xx which the caller can treat as a
+    // hard failure / retry without the flag if needed.
     if json_object {
         body["response_format"] = json!({ "type": "json_object" });
-        // DeepSeek V4 enables thinking by default; reasoning tokens count
-        // against `max_tokens`. With a small budget (tagging), the model can
-        // spend the entire cap on chain-of-thought and return empty `content`
-        // — soft-empty success with zero tags. Disable thinking for JSON
-        // extraction; tagging is classification, not multi-step reasoning.
-        if cfg.provider == Provider::DeepSeek {
-            body["thinking"] = json!({ "type": "disabled" });
-        }
+    }
+    // DeepSeek V4 enables thinking by default; reasoning tokens count against
+    // `max_tokens`, so a small-budget classification/extraction call (tagging,
+    // JSON parsing) can spend the entire cap on chain-of-thought and return
+    // empty `content`. Classification is not multi-step reasoning, so callers
+    // of the tagging/JSON paths disable thinking explicitly — independent of
+    // the response format (the @tag output format also needs it off).
+    if disable_thinking && cfg.provider == Provider::DeepSeek {
+        body["thinking"] = json!({ "type": "disabled" });
     }
     let mut req = client
         .post(format!("{}/chat/completions", cfg.base_url))

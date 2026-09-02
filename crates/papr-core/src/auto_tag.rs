@@ -22,9 +22,9 @@ pub const DEFAULT_MAX_TAGS_PER_ARTICLE: i64 = 5;
 /// Failed jobs stop retrying after this many attempts.
 pub const MAX_ATTEMPTS: i64 = 3;
 
-/// Output token cap for tagging. JSON is tiny; keep modest headroom for a
-/// short object (DeepSeek thinking is disabled on the JSON path so this
-/// budget is for visible content, not chain-of-thought).
+/// Output token cap for tagging. The model replies with a short @tag line;
+/// keep modest headroom (DeepSeek thinking is disabled on the classify path,
+/// so this budget is for visible content, not chain-of-thought).
 pub const TAG_MAX_TOKENS: u32 = 512;
 
 /// Record a completed auto-tag call in the usage ledger. Only meaningful for
@@ -471,14 +471,15 @@ pub fn prompt_interest(title: &str, summary: &str, existing: &[String]) -> (Stri
     let title = sanitize_prompt_text(title);
     let summary = sanitize_prompt_text(summary);
     let system = "You tag news articles for an RSS reader. \
-Reply with ONLY a JSON object, no markdown, no commentary. \
-Format: {\"tags\":[\"name1\",\"name2\"]}. \
-Choose ONLY from the existing-tags list (exact spelling). \
+Reply with ONLY the tags on a single line, each prefixed with @ and separated \
+by spaces. No JSON, no markdown, no commentary. \
+Format: @word @word-word \
+Choose ONLY tags from the existing-tags list (exact spelling). \
 Never invent or propose new tag names. \
 Match places, topics, and events named in the title/summary whenever they appear in the list. \
 Use at most 5 tags. \
-Return {\"tags\":[]} only when none of the listed tags genuinely apply — \
-not merely because the story is general news.";
+If none of the listed tags genuinely apply — not merely because the story is \
+general news — reply with exactly @none.";
     let existing_list = if existing.is_empty() {
         "(none yet)".to_string()
     } else {
@@ -495,21 +496,26 @@ pub fn prompt_ai(title: &str, summary: &str, existing_ai: &[String]) -> (String,
     let title = sanitize_prompt_text(title);
     let summary = sanitize_prompt_text(summary);
     let system = "You tag news articles for an RSS reader. \
-Reply with ONLY a JSON object, no markdown, no commentary. \
-Format: {\"tags\":[\"name1\",\"name2\"]}. \
+Reply with ONLY the tags on a single line, each prefixed with @ and separated \
+by spaces. No JSON, no markdown, no commentary, no bullet points. \
+Format: @word @word-word @word-2 \
+Tag formatting rules (mandatory): \
+- lowercase only; multi-word tags are kebab-case (@middle-east); \
+- pluralize when natural (@market-trend -> @market-trends); \
+- expand abbreviations (@ai -> @artificial-intelligence, @usa -> @united-states-of-america); \
+- proper names keep their form (@charles-darwin, @new-york, CJK like @中东局势 stays as-is). \
 Suggest short topical tags (1-3 words each) grounded in the title and summary — \
-places, topics, people, events (e.g. Spain, Migration, Ceuta). \
+places, topics, people, events (e.g. @spain @migration @ceuta). \
 The Existing tags list is your working vocabulary: REUSE exact names from it \
 whenever they fit — prefer a listed tag over a near-synonym, so the same \
 topic always collapses to the same tag. \
-Invent a new tag name ONLY when no listed tag covers the story, and only if it \
+Invent a new tag ONLY when no listed tag covers the story, and only if it \
 is genuinely distinct from every listed name. \
 Do not repeat the article title or quote long phrases as tags. \
 Clear news (geopolitics, migration, disasters, politics, business, science, sports) \
 MUST receive 2-5 tags. \
-Use at most 5 tags. \
-Return {\"tags\":[]} only for empty or placeholder fluff with no identifiable topic — \
-never for a real news headline.";
+If the story is empty or placeholder fluff with no identifiable topic, reply \
+with exactly @none — never for a real news headline.";
     let existing_list = if existing_ai.is_empty() {
         "(none yet)".to_string()
     } else {
@@ -531,18 +537,21 @@ pub fn prompt_combined(
     let title = sanitize_prompt_text(title);
     let summary = sanitize_prompt_text(summary);
     let system = "You tag news articles for an RSS reader. \
-Reply with ONLY a JSON object, no markdown, no commentary. \
-Format: {\"interest\":[\"name1\"],\"tags\":[\"name2\"]}. \
-For \"interest\": choose ONLY from the interest-tags list (exact spelling); never invent; \
-match places/topics/events from the article when they appear in that list. \
-For \"tags\": short topical free-form labels (1-3 words) grounded in the title/summary. \
+Reply with ONLY the tags on a single line, each prefixed with @ and separated \
+by spaces. No JSON, no markdown, no commentary, no bullet points. \
+Format: @word @word-word \
+Tag formatting rules (mandatory): lowercase; kebab-case for multi-word \
+(@middle-east); pluralize when natural; expand abbreviations (@ai -> \
+@artificial-intelligence); proper names keep their form (CJK like @中东局势 as-is). \
+The Interest-tags list is a closed vocabulary: when the article genuinely \
+concerns one of these topics, include that name verbatim (exact spelling) in \
+your list so it can be routed to the interest taxonomy. \
 The Existing AI tags list is your working vocabulary: REUSE exact names from it \
 whenever they fit; invent a new name ONLY when no listed tag covers the story, \
 and only if it is genuinely distinct from every listed name. \
-Clear news stories MUST get useful free-form tags (2-5) even when no interest tags match. \
-Use at most 5 names in each array. \
-Empty arrays only when that taxonomy truly has nothing applicable — \
-not for ordinary news coverage.";
+Clear news stories MUST get useful tags even when no interest topic fits. \
+Use at most 8 tags in total, minimum 2 for real news. \
+If nothing is applicable — not for ordinary news coverage — reply with exactly @none.";
     let interest_list = if interest.is_empty() {
         "(none yet)".to_string()
     } else {
@@ -558,6 +567,49 @@ not for ordinary news coverage.";
         "Interest tags: {interest_list}\nExisting AI tags: {ai_list}\n\nTitle: {title}\n\nSummary: {summary}"
     );
     (system.to_string(), user)
+}
+
+/// One `@tag` token from the model: a run of Unicode letters/numbers/hyphens
+/// right after `@` (`@middle-east`, `@中东局势`). The @-delimited output format
+/// is deliberately JSON-free — regex extraction is immune to the formatting
+/// drift (fences, prose, partial JSON) that the old JSON parser had to repair.
+static RE_AT_TAG: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"@([\p{L}\p{N}][\p{L}\p{N}-]*)").unwrap());
+
+/// Parse a model reply into an ordered, de-duplicated list of tag names.
+/// No `@tag` at all (blank reply, or the model ignored the format) is
+/// [`JsonParseOutcome::SoftEmpty`], which the caller turns into one repair
+/// attempt when the article actually had content.
+fn parse_at_tags_outcome(text: &str) -> JsonParseOutcome<Vec<String>> {
+    let cleaned = preprocess_model_text(text);
+    if cleaned.is_empty() {
+        return JsonParseOutcome::SoftEmpty;
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut tags: Vec<String> = Vec::new();
+    for cap in RE_AT_TAG.captures_iter(&cleaned) {
+        if let Some(m) = cap.get(1) {
+            let raw = m.as_str().to_lowercase();
+            if let Some(n) = normalize_tag_name(&raw) {
+                if seen.insert(n.clone()) {
+                    tags.push(n);
+                }
+            }
+        }
+    }
+    // The prompts use `@none` as an explicit "nothing applies" marker — the
+    // JSON-era analogue of `{"tags":[]}`: a *successful* empty result, so a
+    // real article with genuinely no matching tag does not burn a repair
+    // call. A bare/blank reply (no @token at all) stays SoftEmpty.
+    if !tags.is_empty() && tags.iter().all(|t| t == "none") {
+        return JsonParseOutcome::Ok(Vec::new());
+    }
+    tags.retain(|t| t != "none");
+    if tags.is_empty() {
+        JsonParseOutcome::SoftEmpty
+    } else {
+        JsonParseOutcome::Ok(tags)
+    }
 }
 
 /// Back-compat alias for the closed-vocab interest prompt.
@@ -714,6 +766,64 @@ fn surface_alnum_key(name: &str) -> String {
         .collect()
 }
 
+/// Resolve a model `@token` to the stored canonical name of an interest tag,
+/// or `None` when the token refers to no closed-vocabulary topic. Checks (1)
+/// exact name / pinned alias, then (2) a surface-variant match. The surface
+/// step keeps spaced vocab entries reachable: with the @ format a token like
+/// `@middle-east` is the only way the model can write `Middle East`, and
+/// without this the token would fall through to the free-form AI taxonomy as
+/// a brand-new duplicate.
+fn resolve_interest_name(conn: &Connection, token: &str) -> AppResult<Option<String>> {
+    if let Some(id) = db::resolve_tag_by_name_or_alias(conn, TAG_KIND_INTEREST, token)? {
+        let name: String = conn.query_row(
+            "SELECT name FROM tags WHERE id = ?1",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )?;
+        return Ok(Some(name));
+    }
+    let key = surface_alnum_key(token);
+    if key.is_empty() {
+        return Ok(None);
+    }
+    let mut stmt = conn.prepare("SELECT name FROM tags WHERE kind = ?1")?;
+    let mut rows = stmt.query_map(rusqlite::params![TAG_KIND_INTEREST], |r| {
+        r.get::<_, String>(0)
+    })?;
+    while let Some(row) = rows.next() {
+        let name = row?;
+        if surface_alnum_key(&name) == key {
+            return Ok(Some(name));
+        }
+    }
+    Ok(None)
+}
+
+/// Split one flat @-list (combined prompt) into interest vs AI buckets.
+///
+/// Each token is routed deterministically: when it names an interest-vocab
+/// tag (exact name, alias, or surface variant), its stored canonical name
+/// goes to the interest bucket (de-duplicated, order kept); anything else is
+/// free-form AI (whose write path resolves variants/aliases before creating).
+fn route_tag_buckets(
+    conn: &Connection,
+    names: Vec<String>,
+) -> AppResult<(Vec<String>, Vec<String>)> {
+    let mut interest: Vec<String> = Vec::new();
+    let mut ai: Vec<String> = Vec::new();
+    let mut seen_interest = std::collections::HashSet::new();
+    for name in names {
+        if let Some(canonical) = resolve_interest_name(conn, &name)? {
+            if seen_interest.insert(canonical.clone()) {
+                interest.push(canonical);
+            }
+        } else {
+            ai.push(name);
+        }
+    }
+    Ok((interest, ai))
+}
+
 struct JobContext {
     title: String,
     summary: String,
@@ -788,17 +898,21 @@ fn record_outcome(conn: &Connection, cfg: &AiConfig, outcome: &ChatOutcome) {
     record_usage(conn, cfg, "auto-tag", outcome.usage);
 }
 
-async fn complete_tag_json(
+async fn complete_tag_ats(
     client: &reqwest::Client,
     cfg: &AiConfig,
     system: &str,
     user: &str,
 ) -> AppResult<ChatOutcome> {
-    ai::complete_chat_json(client, cfg, system, user, TAG_MAX_TOKENS).await
+    // Plain-text @tag output with DeepSeek chain-of-thought disabled: tagging
+    // is classification, and reasoning tokens would eat the small budget (and
+    // could come back empty). `complete_chat_classify` keeps thinking off
+    // without forcing JSON output.
+    ai::complete_chat_classify(client, cfg, system, user, TAG_MAX_TOKENS).await
 }
 
-/// One repair call: ask the model to reply with JSON only.
-async fn repair_tag_json(
+/// One repair call: ask the model to reply with @tags only.
+async fn repair_tag_ats(
     client: &reqwest::Client,
     cfg: &AiConfig,
     system: &str,
@@ -806,10 +920,10 @@ async fn repair_tag_json(
 ) -> AppResult<ChatOutcome> {
     let snippet: String = previous.chars().take(240).collect();
     let user = format!(
-        "Your previous reply was not valid JSON. Reply with JSON only (no markdown, no commentary).\n\
-Previous output:\n{snippet}"
+        "Your previous reply contained no @tags. Reply again with ONLY @-prefixed \
+tags on a single line, no other text.\nPrevious output:\n{snippet}"
     );
-    ai::complete_chat_json(client, cfg, system, &user, TAG_MAX_TOKENS).await
+    ai::complete_chat_classify(client, cfg, system, &user, TAG_MAX_TOKENS).await
 }
 
 async fn tags_from_model<T, F>(
@@ -825,11 +939,11 @@ where
     F: Fn(&str) -> JsonParseOutcome<T>,
     T: Clone,
 {
-    let mut outcome = complete_tag_json(client, cfg, system, user).await?;
+    let mut outcome = complete_tag_ats(client, cfg, system, user).await?;
     let first = parse(&outcome.text);
-    // SoftEmpty is only a success when the article itself is empty fluff, or
-    // (via Ok) when the model returned explicit empty JSON. Blank/prose replies
-    // on a real headline get one repair attempt.
+    // SoftEmpty is only a success when the article itself is empty fluff; a
+    // model reply of exactly `@none` (or a real tag list) parses as `Ok`, so
+    // only blank/prose replies on a real headline get one repair attempt.
     let needs_repair = match &first {
         JsonParseOutcome::Ok(_) => false,
         JsonParseOutcome::SoftEmpty => article_has_content,
@@ -843,7 +957,7 @@ where
         };
     }
 
-    match repair_tag_json(client, cfg, system, &outcome.text).await {
+    match repair_tag_ats(client, cfg, system, &outcome.text).await {
         Ok(repaired) => {
             outcome.usage += repaired.usage;
             let text = repaired.text;
@@ -880,7 +994,8 @@ where
 
 /// Run one auto-tag job end-to-end (caller holds no DB lock across the AI call).
 ///
-/// Steps: load context → skip if at caps → LLM (+ one JSON repair) → apply tags.
+/// Steps: load context → skip if at caps → LLM (one @tag repair attempt) →
+/// route/apply tags.
 /// At-cap skip still applies because apply_* cannot attach more tags past the
 /// configured max (force backfill may re-queue `done`, but capped articles
 /// skip the LLM).
@@ -915,18 +1030,23 @@ pub async fn process_article(
             prompt_combined(
                 &ctx.title, &ctx.summary, &ctx.interest_names, &ctx.ai_names,
             );
-        let ((interest, ai_tags), outcome) = tags_from_model(
+        let (flat, outcome) = tags_from_model(
             client,
             &ctx.cfg,
             &system,
             &user,
-            parse_combined_payload_outcome,
-            (Vec::new(), Vec::new()),
+            parse_at_tags_outcome,
+            Vec::new(),
             has_content,
         )
         .await?;
         let conn = db.lock().await;
         record_outcome(&conn, &ctx.cfg, &outcome);
+        // The model emits one @-list; route each tag deterministically: a
+        // spelling that names an interest-vocab tag (exact/alias/surface)
+        // goes to the closed interest taxonomy, everything else is a
+        // free-form AI tag.
+        let (interest, ai) = route_tag_buckets(&conn, flat)?;
         apply_suggested_tags(
             &conn,
             article_id,
@@ -935,8 +1055,8 @@ pub async fn process_article(
             ctx.interest_max,
             TAG_KIND_INTEREST,
         )?;
-        apply_ai_tags(&conn, article_id, &ai_tags, ctx.ai_max)?;
-        log_empty_ai_tags(article_id, &ctx.title, &ai_tags);
+        apply_ai_tags(&conn, article_id, &ai, ctx.ai_max)?;
+        log_empty_ai_tags(article_id, &ctx.title, &ai);
         return Ok(());
     }
 
@@ -947,17 +1067,21 @@ pub async fn process_article(
             &ctx.cfg,
             &system,
             &user,
-            parse_interest_payload_outcome,
+            parse_at_tags_outcome,
             Vec::new(),
             has_content,
         )
         .await?;
         let conn = db.lock().await;
         record_outcome(&conn, &ctx.cfg, &outcome);
+        // Closed vocab: keep only tokens that name an interest tag (exact,
+        // alias, or surface variant). Unknown tokens are dropped — the model
+        // was told not to invent names for this path.
+        let (interest, _ai) = route_tag_buckets(&conn, suggested)?;
         apply_suggested_tags(
             &conn,
             article_id,
-            &suggested,
+            &interest,
             &ctx.interest_names,
             ctx.interest_max,
             TAG_KIND_INTEREST,
@@ -972,7 +1096,7 @@ pub async fn process_article(
         &ctx.cfg,
         &system,
         &user,
-        parse_ai_payload_outcome,
+        parse_at_tags_outcome,
         Vec::new(),
         has_content,
     )
@@ -1127,6 +1251,93 @@ Final: {"tags":["Rust","Go"]}"#;
             parse_interest_payload_outcome("I looked at {the article} and found nothing."),
             JsonParseOutcome::Invalid(_)
         ));
+    }
+
+    #[test]
+    fn at_tags_extract_dedup_lowercase() {
+        // Flat @-list, mixed case, duplicates, CJK, fenced and prose-wrapped:
+        // regex extraction is immune to the formatting drift that used to
+        // require JSON repair.
+        let text = "```\n@Middle-East @SPAIN @中东局势 @spain @middle-east\n```";
+        assert_eq!(
+            parse_at_tags_outcome(text),
+            JsonParseOutcome::Ok(vec![
+                "middle-east".into(),
+                "spain".into(),
+                "中东局势".into(),
+            ])
+        );
+    }
+
+    #[test]
+    fn at_tags_no_token_is_soft_empty() {
+        // Blank reply or prose without a single @tag → SoftEmpty (one repair
+        // attempt for real articles; soft-skip for fluff).
+        assert_eq!(parse_at_tags_outcome(""), JsonParseOutcome::SoftEmpty);
+        assert_eq!(parse_at_tags_outcome("   "), JsonParseOutcome::SoftEmpty);
+        assert_eq!(
+            parse_at_tags_outcome("I could not identify any topic."),
+            JsonParseOutcome::SoftEmpty
+        );
+        // Symbols-only "tag" after @ is rejected by the token grammar.
+        assert_eq!(
+            parse_at_tags_outcome("Reply: @--- @!!!"),
+            JsonParseOutcome::SoftEmpty
+        );
+    }
+
+    #[test]
+    fn at_tags_none_marker_is_successful_empty() {
+        // Prompts ask for exactly @none when nothing applies — parsed as a
+        // *successful* empty (like old `{"tags":[]}`), not a repair-triggering
+        // SoftEmpty. Mixed output drops the marker and keeps the real tags.
+        assert_eq!(parse_at_tags_outcome("@none"), JsonParseOutcome::Ok(vec![]));
+        assert_eq!(
+            parse_at_tags_outcome("@NONE @none"),
+            JsonParseOutcome::Ok(vec![])
+        );
+        assert_eq!(
+            parse_at_tags_outcome("@none @spain"),
+            JsonParseOutcome::Ok(vec!["spain".into()])
+        );
+    }
+
+    #[test]
+    fn route_buckets_by_exact_alias_and_surface() {
+        let (conn, path) = temp_db();
+        // Spaced / mixed-case interest names are only expressible as kebab
+        // @tokens — the surface step must route them back to the canonical.
+        db::create_tag(&conn, "Middle East", TAG_KIND_INTEREST).unwrap();
+        // Pinned synonym from a merge: alias must also route to the canonical.
+        let iran = db::create_tag(&conn, "Iran", TAG_KIND_INTEREST).unwrap();
+        db::create_tag_alias(&conn, iran, "irán").unwrap();
+
+        let flat = vec![
+            "middle-east".to_string(), // surface variant of "Middle East"
+            "irán".to_string(),        // alias of "Iran"
+            "Ceuta".to_string(),       // unknown → AI bucket
+            "middle east".to_string(), // impossible @token, but routed identically
+        ];
+        let (interest, ai) = route_tag_buckets(&conn, flat).unwrap();
+        assert_eq!(interest, vec!["Middle East".to_string(), "Iran".to_string()]);
+        assert_eq!(ai, vec!["Ceuta".to_string()]);
+        remove_temp_db(conn, path);
+    }
+
+    #[test]
+    fn route_buckets_dedups_interest_and_keeps_ai_duplicates() {
+        let (conn, path) = temp_db();
+        db::create_tag(&conn, "Rust", TAG_KIND_INTEREST).unwrap();
+        let flat = vec![
+            "rust".to_string(),
+            "Rust".to_string(),
+            "Go".to_string(),
+            "Go".to_string(),
+        ];
+        let (interest, ai) = route_tag_buckets(&conn, flat).unwrap();
+        assert_eq!(interest, vec!["Rust".to_string()]);
+        assert_eq!(ai, vec!["Go".to_string(), "Go".to_string()]);
+        remove_temp_db(conn, path);
     }
 
     #[test]
