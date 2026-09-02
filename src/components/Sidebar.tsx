@@ -236,6 +236,24 @@ export default function Sidebar({
     );
   };
 
+  // Tags tab: usage floor for the AI list (0 = show every tag). The AI
+  // vocabulary is a long tail (2/3 of tags sit on a single article), so the
+  // alpha view is mostly one-off spellings; a persisted minimum-article-count
+  // filter lets the user view only tags that earn their row.
+  const AI_MIN_COUNT_KEY = "papr.aiTagMinCount";
+  const AI_MIN_COUNT_OPTIONS = [0, 1, 5, 10, 20];
+  const [aiMinCount, setAiMinCount] = useState<number>(() => {
+    try {
+      const raw = parseInt(localStorage.getItem(AI_MIN_COUNT_KEY) ?? "0", 10);
+      return Number.isFinite(raw) && raw >= 0 ? raw : 0;
+    } catch {
+      return 0;
+    }
+  });
+  useEffect(() => {
+    localStorage.setItem(AI_MIN_COUNT_KEY, String(aiMinCount));
+  }, [aiMinCount]);
+
   const tagUnread = (tag: Tag) => tag.unreadCount ?? 0;
 
   const sortTags = (list: Tag[]): Tag[] => {
@@ -439,7 +457,19 @@ export default function Sidebar({
       setTagsHeadH(tagsHeadRef.current.offsetHeight);
     }
   }, [sideTab, aiTags.length]);
-  const sortedAiTags = useMemo(() => sortTags(aiTags), [allTags, tagSort]);
+  // Apply the usage floor first so the header state, the count and the
+  // virtualized list all describe the visible set.
+  const visibleAiTags = useMemo(
+    () =>
+      aiMinCount > 0
+        ? aiTags.filter((tg) => tg.articleCount >= aiMinCount)
+        : aiTags,
+    [aiTags, aiMinCount],
+  );
+  const sortedAiTags = useMemo(
+    () => sortTags(visibleAiTags),
+    [visibleAiTags, tagSort],
+  );
   const tagsVirt = useVirtualizer({
     count: sortedAiTags.length,
     getScrollElement: () => tagsScrollRef.current,
@@ -980,10 +1010,30 @@ export default function Sidebar({
                       : "↓"}
                   </button>
                 </span>
+                <span className="sb-feed-sort-sep" aria-hidden="true">
+                  ·
+                </span>
+                <select
+                  className="sb-ai-min"
+                  aria-label={t("sidebar.aiMinCountLabel")}
+                  title={t("sidebar.aiMinCountLabel")}
+                  value={aiMinCount}
+                  onChange={(e) => setAiMinCount(Number(e.target.value))}
+                >
+                  {AI_MIN_COUNT_OPTIONS.map((v) => (
+                    <option key={v} value={v}>
+                      {v === 0 ? t("sidebar.aiMinAll") : `≥${v}`}
+                    </option>
+                  ))}
+                </select>
               </span>
             </div>
             {sortedAiTags.length === 0 ? (
-              <div className="sb-tags-empty">{t("sidebar.aiTagsEmptyHint")}</div>
+              <div className="sb-tags-empty">
+                {aiTags.length === 0
+                  ? t("sidebar.aiTagsEmptyHint")
+                  : t("sidebar.aiTagsNoMatch")}
+              </div>
             ) : (
               <div
                 style={{

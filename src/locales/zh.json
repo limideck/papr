@@ -883,7 +883,10 @@
     "tagsEmptyHint": "在设置里添加兴趣标签，或在阅读时给文章打标签。",
     "aiTagsEmptyHint": "AI 打标运行后，标签会出现在这里。可在 设置 → 标签管理 中启用。",
     "toastTagCreated": "已创建兴趣标签",
-    "toastTagDeleted": "已删除标签"
+    "toastTagDeleted": "已删除标签",
+    "aiMinCountLabel": "按最少文章数筛选",
+    "aiMinAll": "全部",
+    "aiTagsNoMatch": "没有符合筛选条件的标签"
   },
   "error": {
     "db": "数据库出错：{{detail}}",

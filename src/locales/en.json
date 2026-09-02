@@ -883,7 +883,10 @@
     "tagsEmptyHint": "Add interest tags in Settings, or tag articles while reading.",
     "aiTagsEmptyHint": "AI tags appear here after auto-tagging runs. Enable it in Settings → Tag management.",
     "toastTagCreated": "Interest tag created",
-    "toastTagDeleted": "Tag deleted"
+    "toastTagDeleted": "Tag deleted",
+    "aiMinCountLabel": "Filter by minimum article count",
+    "aiMinAll": "All",
+    "aiTagsNoMatch": "No tags match the filter"
   },
   "error": {
     "db": "Database error: {{detail}}",

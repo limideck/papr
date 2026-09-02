@@ -641,6 +641,27 @@ button { font-family: inherit; }
   padding: 0 1px;
   line-height: 1;
 }
+/* Minimum-article-count filter for the AI tag list (Tags tab). Native select
+   styled to match the neighbouring sort buttons. */
+.sb-section-actions .sb-ai-min {
+  background: none;
+  border: 0;
+  color: var(--muted);
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.4;
+  padding: 0 2px;
+  border-radius: 4px;
+  text-transform: none;
+  letter-spacing: 0;
+  max-width: 64px;
+}
+.sb-section-actions .sb-ai-min:hover {
+  color: var(--ink-2);
+  background: transparent;
+}
 .sb-section-title button {
   background: none;
   border: 0;

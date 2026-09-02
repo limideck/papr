@@ -883,7 +883,10 @@
     "tagsEmptyHint": "設定で興味タグを追加するか、記事を読みながらタグを付けてください。",
     "aiTagsEmptyHint": "自動タグ付けの後、AI タグがここに表示されます。設定 → タグ管理 で有効にできます。",
     "toastTagCreated": "興味タグを作成しました",
-    "toastTagDeleted": "タグを削除しました"
+    "toastTagDeleted": "タグを削除しました",
+    "aiMinCountLabel": "最少記事数で絞り込み",
+    "aiMinAll": "すべて",
+    "aiTagsNoMatch": "条件に一致するタグがありません"
   },
   "error": {
     "db": "データベースエラー：{{detail}}",
