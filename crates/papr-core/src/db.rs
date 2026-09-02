@@ -2228,6 +2228,29 @@ pub fn delete_tag(conn: &Connection, id: i64) -> AppResult<()> {
     Ok(())
 }
 
+/// The most frequently used tag names of `kind`, by article count — the
+/// "working vocabulary" the auto-tag prompt shows the LLM so it reuses
+/// established tags (e.g. "Middle East", 455 articles) instead of inventing a
+/// fresh near-synonym per article. Bounded and usage-ranked, so the prompt
+/// stays small and stable while the model gets an actionable reuse list.
+pub fn top_tag_names(conn: &Connection, kind: &str, limit: i64) -> AppResult<Vec<String>> {
+    let kind = normalize_tag_kind(kind)?;
+    if limit <= 0 {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT t.name FROM tags t
+         WHERE t.kind = ?1
+         ORDER BY (SELECT COUNT(*) FROM article_tags at WHERE at.tag_id = t.id) DESC,
+                  t.name COLLATE NOCASE
+         LIMIT ?2",
+    )?;
+    let rows = stmt
+        .query_map(params![kind, limit], |r| r.get(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 // ─────────────────────────── tag aliases ───────────────────────────
 
 fn map_tag_alias_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TagAlias> {

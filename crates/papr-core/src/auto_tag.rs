@@ -491,7 +491,7 @@ not merely because the story is general news.";
     (system.to_string(), user)
 }
 
-pub fn prompt_ai(title: &str, summary: &str) -> (String, String) {
+pub fn prompt_ai(title: &str, summary: &str, existing_ai: &[String]) -> (String, String) {
     let title = sanitize_prompt_text(title);
     let summary = sanitize_prompt_text(summary);
     let system = "You tag news articles for an RSS reader. \
@@ -499,16 +499,26 @@ Reply with ONLY a JSON object, no markdown, no commentary. \
 Format: {\"tags\":[\"name1\",\"name2\"]}. \
 Suggest short topical tags (1-3 words each) grounded in the title and summary — \
 places, topics, people, events (e.g. Spain, Migration, Ceuta). \
-Use the natural, established name for each topic and stay consistent: \
-the same topic must always get the same tag. \
+The Existing tags list is your working vocabulary: REUSE exact names from it \
+whenever they fit — prefer a listed tag over a near-synonym, so the same \
+topic always collapses to the same tag. \
+Invent a new tag name ONLY when no listed tag covers the story, and only if it \
+is genuinely distinct from every listed name. \
 Do not repeat the article title or quote long phrases as tags. \
 Clear news (geopolitics, migration, disasters, politics, business, science, sports) \
 MUST receive 2-5 tags. \
 Use at most 5 tags. \
 Return {\"tags\":[]} only for empty or placeholder fluff with no identifiable topic — \
 never for a real news headline.";
+    let existing_list = if existing_ai.is_empty() {
+        "(none yet)".to_string()
+    } else {
+        existing_ai.join(", ")
+    };
     let summary = truncate_summary(&summary);
-    let user = format!("Title: {title}\n\nSummary: {summary}");
+    let user = format!(
+        "Existing tags: {existing_list}\n\nTitle: {title}\n\nSummary: {summary}"
+    );
     (system.to_string(), user)
 }
 
@@ -516,6 +526,7 @@ pub fn prompt_combined(
     title: &str,
     summary: &str,
     interest: &[String],
+    existing_ai: &[String],
 ) -> (String, String) {
     let title = sanitize_prompt_text(title);
     let summary = sanitize_prompt_text(summary);
@@ -524,9 +535,10 @@ Reply with ONLY a JSON object, no markdown, no commentary. \
 Format: {\"interest\":[\"name1\"],\"tags\":[\"name2\"]}. \
 For \"interest\": choose ONLY from the interest-tags list (exact spelling); never invent; \
 match places/topics/events from the article when they appear in that list. \
-For \"tags\": short topical free-form labels (1-3 words) grounded in the title/summary; \
-use the natural, established name for each topic and stay consistent — \
-the same topic must always get the same tag; do not quote long phrases as tags. \
+For \"tags\": short topical free-form labels (1-3 words) grounded in the title/summary. \
+The Existing AI tags list is your working vocabulary: REUSE exact names from it \
+whenever they fit; invent a new name ONLY when no listed tag covers the story, \
+and only if it is genuinely distinct from every listed name. \
 Clear news stories MUST get useful free-form tags (2-5) even when no interest tags match. \
 Use at most 5 names in each array. \
 Empty arrays only when that taxonomy truly has nothing applicable — \
@@ -536,9 +548,14 @@ not for ordinary news coverage.";
     } else {
         interest.join(", ")
     };
+    let ai_list = if existing_ai.is_empty() {
+        "(none yet)".to_string()
+    } else {
+        existing_ai.join(", ")
+    };
     let summary = truncate_summary(&summary);
     let user = format!(
-        "Interest tags: {interest_list}\n\nTitle: {title}\n\nSummary: {summary}"
+        "Interest tags: {interest_list}\nExisting AI tags: {ai_list}\n\nTitle: {title}\n\nSummary: {summary}"
     );
     (system.to_string(), user)
 }
@@ -651,6 +668,12 @@ struct JobContext {
     title: String,
     summary: String,
     interest_names: Vec<String>,
+    /// Top AI tags by usage (`ai_tag_prompt_cap`, default 200) shown to the
+    /// model as the reuse vocabulary. Without any list the model invented a
+    /// fresh near-synonym per article (30k+ tags, 66% used once) and hot
+    /// topics fragmented across dozens of spellings ("Middle East" vs
+    /// "中东" vs "中东冲突"…). A small usage-ranked list restores reuse.
+    ai_names: Vec<String>,
     interest_on: bool,
     ai_on: bool,
     interest_max: i64,
@@ -680,6 +703,9 @@ fn load_job_context(conn: &Connection, article_id: i64) -> AppResult<JobContext>
         .into_iter()
         .map(|t| t.name)
         .collect();
+    // Bounded, usage-ranked reuse list for the free-form tags. 0 = no list.
+    let ai_cap = db::setting_parsed::<i64>(conn, "ai_tag_prompt_cap", 200).max(0);
+    let ai_names = db::top_tag_names(conn, TAG_KIND_AI, ai_cap)?;
     let cfg = AiConfig::new(
         db::get_setting(conn, "ai_provider")?,
         db::get_setting(conn, "ai_api_key")?,
@@ -690,6 +716,7 @@ fn load_job_context(conn: &Connection, article_id: i64) -> AppResult<JobContext>
         title,
         summary,
         interest_names,
+        ai_names,
         interest_on,
         ai_on,
         interest_max,
@@ -835,7 +862,9 @@ pub async fn process_article(
 
     if run_interest && run_ai {
         let (system, user) =
-            prompt_combined(&ctx.title, &ctx.summary, &ctx.interest_names);
+            prompt_combined(
+                &ctx.title, &ctx.summary, &ctx.interest_names, &ctx.ai_names,
+            );
         let ((interest, ai_tags), outcome) = tags_from_model(
             client,
             &ctx.cfg,
@@ -887,7 +916,7 @@ pub async fn process_article(
     }
 
     // AI-only path.
-    let (system, user) = prompt_ai(&ctx.title, &ctx.summary);
+    let (system, user) = prompt_ai(&ctx.title, &ctx.summary, &ctx.ai_names);
     let (suggested, outcome) = tags_from_model(
         client,
         &ctx.cfg,
@@ -1070,7 +1099,7 @@ Final: {"tags":["Rust","Go"]}"#;
     fn prompt_ai_contains_cleaned_title_and_summary() {
         let title = "Spain plans burials\u{200B}";
         let summary = "<p>Police identify the \u{200C}bodies of 80 migrants in Ceuta.</p>";
-        let (system, user) = prompt_ai(title, summary);
+        let (system, user) = prompt_ai(title, summary, &[]);
         assert!(system.contains("MUST receive 2-5 tags"));
         assert!(system.contains("never for a real news headline"));
         assert!(!user.contains('\u{200B}'));
@@ -1243,6 +1272,74 @@ Final: {"tags":["Rust","Go"]}"#;
         assert_eq!(attached.len(), 1);
         assert_eq!(attached[0].name, "Rust");
         assert_eq!(attached[0].id, rust);
+
+        remove_temp_db(conn, path);
+    }
+
+    #[test]
+    fn prompt_reuse_list_is_usage_ranked_and_bounded() {
+        let (conn, path) = temp_db();
+        let feed_id = db::insert_feed(
+            &conn,
+            "https://example.com/feed-reuse.xml",
+            None,
+            "Example",
+            None,
+            SourceType::Rss,
+            None,
+        )
+        .unwrap();
+        let mut add_article = |guid: &str| {
+            let a = NewArticle {
+                guid: guid.into(),
+                url: Some(format!("https://example.com/{guid}")),
+                title: "Article".into(),
+                author: None,
+                summary: Some("s".into()),
+                content_html: None,
+                body_text: "b".into(),
+                image_url: None,
+                published_at: None,
+                enclosures: vec![],
+            };
+            db::upsert_article(&conn, feed_id, &a, false, &[]).unwrap();
+        };
+        for i in 0..4 {
+            add_article(&format!("r{i}"));
+        }
+        let ids: Vec<i64> = conn
+            .prepare("SELECT id FROM articles ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let hot = db::create_tag(&conn, "Middle East", TAG_KIND_AI).unwrap();
+        let warm = db::create_tag(&conn, "Iran", TAG_KIND_AI).unwrap();
+        let cold = db::create_tag(&conn, "Obscure", TAG_KIND_AI).unwrap();
+        for id in &ids {
+            db::set_article_tag(&conn, *id, hot, true).unwrap();
+        }
+        db::set_article_tag(&conn, ids[0], warm, true).unwrap();
+        db::set_article_tag(&conn, ids[0], cold, true).unwrap();
+
+        // Usage-ranked: the 4-use tag leads, the 1-use tags follow by name.
+        let top = db::top_tag_names(&conn, TAG_KIND_AI, 2).unwrap();
+        assert_eq!(top, vec!["Middle East", "Iran"]);
+        // Limit 0 → empty; a cap larger than the vocabulary is a no-op.
+        assert!(db::top_tag_names(&conn, TAG_KIND_AI, 0).unwrap().is_empty());
+        assert_eq!(db::top_tag_names(&conn, TAG_KIND_AI, 99).unwrap().len(), 3);
+
+        // The prompt embeds the reuse list and asks the model to reuse it.
+        let (system, user) = prompt_ai("Iran strikes", "summary", &top);
+        assert!(system.contains("working vocabulary"));
+        assert!(system.contains("REUSE exact names"));
+        assert!(user.contains("Existing tags: Middle East, Iran"));
+        assert!(user.contains("Title: Iran strikes"));
+        // Interest-only prompt path is unchanged and list-free for AI tags.
+        let (_s, u) = prompt_interest("Iran strikes", "summary", &["中东局势".into()]);
+        assert!(u.contains("中东局势"));
+        assert!(!u.contains("Middle East"));
 
         remove_temp_db(conn, path);
     }
