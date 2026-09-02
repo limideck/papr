@@ -542,6 +542,23 @@ static MIGRATIONS: LazyLock<Migrations> = LazyLock::new(|| {
             );
             "#,
         ),
+        // v32 — taxonomy governance: a single-parent (two-level) hierarchy and a
+        // coarse tag type. `parent_id` nests a tag under one topic/region
+        // (ON DELETE SET NULL keeps children if the parent is removed); `tag_type`
+        // is either 'entity' (a concrete person/place/org, e.g. 伊朗) or 'topic'
+        // (an abstract subject, e.g. 中东局势). Drives the tag tidy pass:
+        // entities are *nested under* a region topic, never merged into it (so
+        // 伊朗 stays searchable on its own). Additive only; existing tags stay
+        // NULL/NULL until a tidy pass or an admin sets them. No backfill needed
+        // for correctness.
+        M::up(
+            r#"
+            ALTER TABLE tags ADD COLUMN parent_id INTEGER
+                REFERENCES tags(id) ON DELETE SET NULL;
+            ALTER TABLE tags ADD COLUMN tag_type TEXT;
+            CREATE INDEX idx_tags_parent ON tags(parent_id) WHERE parent_id IS NOT NULL;
+            "#,
+        ),
     ])
 });
 
@@ -594,6 +611,16 @@ pub fn open_reader(path: &Path) -> AppResult<Connection> {
     conn.pragma_update(None, "query_only", true)?;
     register_functions(&conn)?;
     Ok(conn)
+}
+
+/// Apply all pending schema migrations to an already-open connection and
+/// register the custom SQL functions. Exposed for tools and tests that open a
+/// connection directly (e.g. an in-memory database in a unit test) instead of
+/// going through [`open`]; production callers use [`open`], which does this.
+pub fn migrate_connection(conn: &mut Connection) -> AppResult<()> {
+    MIGRATIONS.to_latest(conn)?;
+    register_functions(conn)?;
+    Ok(())
 }
 
 // ─────────────────────────── folders ───────────────────────────
@@ -2155,6 +2182,199 @@ pub fn merge_tags(conn: &Connection, from_id: i64, to_id: i64) -> AppResult<usiz
     tx.execute("DELETE FROM tags WHERE id = ?1", params![from_id])?;
     tx.commit()?;
     Ok(moved)
+}
+
+/// One tag with its live article count, for taxonomy governance. Unlike the
+/// sidebar-oriented [`list_tags`] (which orders by position and carries unread
+/// counts), this is ordered by usage (descending) so a tidy pass sees the
+/// hottest fragmentation first.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TagUsage {
+    pub id: i64,
+    pub name: String,
+    pub kind: String,
+    pub article_count: i64,
+    pub parent_id: Option<i64>,
+    pub tag_type: Option<String>,
+}
+
+/// Tags of `kind` (or all) with article counts, ordered by count desc.
+pub fn list_tag_usage(conn: &Connection, kind: Option<&str>) -> AppResult<Vec<TagUsage>> {
+    let sql = "SELECT t.id, t.name, t.kind,
+                      (SELECT COUNT(*) FROM article_tags at WHERE at.tag_id = t.id),
+                      t.parent_id, t.tag_type
+               FROM tags t
+               WHERE (?1 IS NULL OR t.kind = ?1)
+               ORDER BY 4 DESC, t.name COLLATE NOCASE";
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt
+        .query_map(params![kind], |r| {
+            Ok(TagUsage {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                kind: r.get(2)?,
+                article_count: r.get(3)?,
+                parent_id: r.get(4)?,
+                tag_type: r.get(5)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Merge `from_id` into `to_id` AND keep `from_id`'s display name alive as an
+/// alias of the survivor, so the next auto-tag call that emits the old
+/// spelling resolves to `to_id` instead of recreating a fresh tag. This closes
+/// the fragmentation loop that plain [`merge_tags`] leaves open: a merge fixed
+/// history, but the model re-invented the same synonym on the very next
+/// article.
+///
+/// `extra_aliases` are additional surface forms (cross-language spellings,
+/// abbreviations) to pin to the survivor. All alias inserts are best-effort:
+/// an alias that already exists (including as another tag's name) is skipped.
+/// Returns the number of articles newly attached to the target.
+pub fn merge_tags_keep_alias(
+    conn: &Connection,
+    from_id: i64,
+    to_id: i64,
+    extra_aliases: &[String],
+) -> AppResult<usize> {
+    let tx = conn.unchecked_transaction()?;
+
+    // Capture the victim's name + kind before it is deleted.
+    let (from_name, kind): (String, String) = tx
+        .query_row("SELECT name, kind FROM tags WHERE id = ?1", params![from_id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .optional()?
+        .ok_or_else(|| AppError::code("tagNotFound"))?;
+    // Confirm the target exists and matches kind.
+    let to_kind: String = tx
+        .query_row("SELECT kind FROM tags WHERE id = ?1", params![to_id], |r| r.get(0))
+        .optional()?
+        .ok_or_else(|| AppError::code("tagNotFound"))?;
+    if from_id == to_id {
+        return Err(AppError::code("tagNotFound"));
+    }
+    if kind != to_kind {
+        return Err(AppError::code("tagKindMismatch"));
+    }
+
+    // Re-point articles onto the survivor (dedupe via INSERT OR IGNORE).
+    let moved = tx.execute(
+        "INSERT OR IGNORE INTO article_tags(article_id, tag_id)
+         SELECT article_id, ?1 FROM article_tags WHERE tag_id = ?2",
+        params![to_id, from_id],
+    )?;
+
+    // Harvest the victim's existing aliases before its cascade deletes them.
+    let mut aliases: Vec<String> = tx
+        .prepare("SELECT alias FROM tag_aliases WHERE tag_id = ?1")?
+        .query_map(params![from_id], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    aliases.push(from_name);
+    for a in extra_aliases {
+        aliases.push(a.clone());
+    }
+
+    // Delete the victim (cascades its article_tags + tag_aliases rows).
+    tx.execute("DELETE FROM tags WHERE id = ?1", params![from_id])?;
+
+    // Re-attach every surface form to the survivor, skipping anything that now
+    // collides with a tag name or an existing alias of the same kind.
+    for alias in aliases {
+        let alias = alias.trim();
+        if alias.is_empty() {
+            continue;
+        }
+        // Skip if it is (or equals) an actual tag name of this kind.
+        let name_hit: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM tags WHERE kind = ?1 AND name = ?2 COLLATE NOCASE",
+                params![kind, alias],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if name_hit.is_some() {
+            continue;
+        }
+        // Skip if an alias already maps this spelling (to anyone).
+        let alias_hit: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM tag_aliases WHERE kind = ?1 AND alias = ?2 COLLATE NOCASE",
+                params![kind, alias],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if alias_hit.is_some() {
+            continue;
+        }
+        tx.execute(
+            "INSERT INTO tag_aliases(alias, tag_id, kind) VALUES (?1, ?2, ?3)",
+            params![alias, to_id, kind],
+        )?;
+    }
+
+    tx.commit()?;
+    Ok(moved)
+}
+
+/// Set a tag's semantic type: `None` clears it; otherwise `"entity"` or
+/// `"topic"`. Rejects unknown values so the vocabulary stays closed.
+pub fn set_tag_type(conn: &Connection, id: i64, tag_type: Option<&str>) -> AppResult<()> {
+    let value = match tag_type.map(str::trim) {
+        None | Some("") => None,
+        Some("entity") | Some("topic") => Some(tag_type.unwrap().trim().to_string()),
+        Some(other) => return Err(AppError::other(format!("invalid tag type: {other}"))),
+    };
+    let n = conn.execute("UPDATE tags SET tag_type = ?2 WHERE id = ?1", params![id, value])?;
+    if n == 0 {
+        return Err(AppError::code("tagNotFound"));
+    }
+    Ok(())
+}
+
+/// Set a tag's parent (broader topic/region). `None` detaches. Rejects a
+/// self-parent and a missing parent. Cycle depth is kept shallow by callers
+/// (the tidy pass builds a 2-level forest); this guards the obvious error.
+pub fn set_tag_parent(
+    conn: &Connection,
+    id: i64,
+    parent_id: Option<i64>,
+) -> AppResult<()> {
+    if let Some(p) = parent_id {
+        if p == id {
+            return Err(AppError::code("tagParentSelf"));
+        }
+        let exists: Option<i64> = conn
+            .query_row("SELECT id FROM tags WHERE id = ?1", params![p], |r| r.get(0))
+            .optional()?;
+        if exists.is_none() {
+            return Err(AppError::code("tagNotFound"));
+        }
+    }
+    let n = conn.execute(
+        "UPDATE tags SET parent_id = ?2 WHERE id = ?1",
+        params![id, parent_id],
+    )?;
+    if n == 0 {
+        return Err(AppError::code("tagNotFound"));
+    }
+    Ok(())
+}
+
+/// The tag id and the full set of ids in its parent subtree (children only —
+/// hierarchy is a two-level forest). Used to list "this topic and everything
+/// nested under it".
+pub fn tag_with_descendant_ids(conn: &Connection, tag_id: i64) -> AppResult<Vec<i64>> {
+    let mut ids = vec![tag_id];
+    let mut children = conn.prepare("SELECT id FROM tags WHERE parent_id = ?1")?;
+    let mut kids: Vec<i64> = children
+        .query_map(params![tag_id], |r| r.get(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    ids.append(&mut kids);
+    Ok(ids)
 }
 
 /// Create a tag of the given kind, auto-assigning colour and list position.

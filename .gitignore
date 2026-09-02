@@ -66,3 +66,6 @@ feedoverflow/
 
 # Local server DB backups (large, never commit)
 backups/
+
+# CodeGraph local index
+.codegraph/

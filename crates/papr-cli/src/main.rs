@@ -14,6 +14,7 @@ use papr_core::db;
 use papr_core::ingestion::{fetch, parse, refresh};
 use papr_core::models::ArticleQuery;
 use papr_core::sync;
+use papr_core::tag_taxonomy;
 use rusqlite::Connection;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -303,6 +304,43 @@ enum TagCmd {
         #[arg(value_name = "ARTICLE_ID")]
         article_id: i64,
     },
+    /// Repairs fragmented AI tags: merge synonyms and nest entities under
+    /// topic/region parents. Produces a JSON plan (no changes yet).
+    Tidy(TidyArgs),
+    /// Apply a tidy plan from `papr tag tidy` (or an edited copy of one).
+    Apply(ApplyArgs),
+}
+
+#[derive(clap::Args)]
+struct TidyArgs {
+    /// Tag kind to tidy (default: the free-form AI vocabulary).
+    #[arg(long, default_value = "ai", value_parser = ["ai", "interest"])]
+    kind: String,
+    /// Ignore tags attached to fewer than this many articles (long tail).
+    #[arg(long, default_value_t = 3)]
+    min_count: i64,
+    /// Maximum number of tags to send to the LLM (highest-usage first).
+    #[arg(long, default_value_t = 800)]
+    max_tags: usize,
+    /// Tags per LLM batch.
+    #[arg(long, default_value_t = 60)]
+    batch_size: usize,
+    /// Apply the plan immediately instead of printing it for review.
+    #[arg(long)]
+    apply: bool,
+    /// Required with --apply (mutates tags).
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(clap::Args)]
+struct ApplyArgs {
+    /// Path to a tidy-plan JSON file. Use `-` to read the plan from stdin.
+    #[arg(value_name = "PLAN_FILE")]
+    file: String,
+    /// Confirm this mutation.
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(Subcommand)]
@@ -505,7 +543,7 @@ async fn run(cli: Cli) -> Result<String, AxiError> {
         Some(Cmd::Folders) => cmd_folders(&path),
         Some(Cmd::Folder { cmd }) => cmd_folder(&path, cmd),
         Some(Cmd::Feed { cmd }) => cmd_feed(&path, cmd),
-        Some(Cmd::Tag { cmd }) => cmd_tag(&path, cmd),
+        Some(Cmd::Tag { cmd }) => cmd_tag(&path, cmd).await,
         Some(Cmd::Rules) => cmd_rules(&path),
         Some(Cmd::Rule { cmd }) => cmd_rule(&path, cmd),
         Some(Cmd::Highlights { article }) => cmd_highlights(&path, article),
@@ -918,8 +956,26 @@ fn cmd_tags(path: &Path) -> Result<String, AxiError> {
         })
         .collect();
     d.set("tags", Value::Array(rows));
+    // Inventory so the scale of fragmentation (esp. one-hit AI tags) is visible
+    // at a glance, with a pointer to the tidy workflow.
+    if let Ok(s) = tag_taxonomy::stats(&conn, None) {
+        d.set(
+            "taxonomy",
+            json!({
+                "totalTags": s.total_tags,
+                "tagsWithArticles": s.tags_with_articles,
+                "oneHitTags": s.one_hit_tags,
+                "tagsWithParent": s.tags_with_parent,
+                "parentTopics": s.parent_topics,
+                "histogram": s.histogram,
+            }),
+        );
+    }
     if !tags.is_empty() {
-        d.help(vec!["Run `papr list --tag <id>` to list a tag's articles".into()]);
+        d.help(vec![
+            "Run `papr list --tag <id>` to list a tag's articles".into(),
+            "Run `papr tag tidy` to propose merging synonym tags and nesting entities".into(),
+        ]);
     }
     Ok(d.into_toon())
 }
@@ -1236,7 +1292,7 @@ fn cmd_feed(path: &Path, cmd: FeedCmd) -> Result<String, AxiError> {
 
 // ─────────────────────────────── tags ───────────────────────────────
 
-fn cmd_tag(path: &Path, cmd: TagCmd) -> Result<String, AxiError> {
+async fn cmd_tag(path: &Path, cmd: TagCmd) -> Result<String, AxiError> {
     let conn = open_rw(path)?;
     match cmd {
         TagCmd::Create { name } => {
@@ -1265,7 +1321,119 @@ fn cmd_tag(path: &Path, cmd: TagCmd) -> Result<String, AxiError> {
             db::set_article_tag(&conn, article_id, tag_id, false).map_err(db_err)?;
             ok_line(format!("untagged: article {article_id} -= tag {tag_id}"))
         }
+        TagCmd::Tidy(args) => cmd_tag_tidy(&conn, args).await,
+        TagCmd::Apply(args) => cmd_tag_apply(&conn, args),
     }
+}
+
+/// `papr tag tidy` — build (and optionally apply) a synonym/hierarchy plan.
+async fn cmd_tag_tidy(conn: &Connection, args: TidyArgs) -> Result<String, AxiError> {
+    // Inventory first so the operator sees the scale of the long tail.
+    let stats = tag_taxonomy::stats(conn, Some(&args.kind)).map_err(db_err)?;
+
+    if args.apply {
+        require_yes(
+            args.yes,
+            "tag tidy --apply",
+            "papr tag tidy --apply --yes",
+        )?;
+    }
+
+    let client = http_client()?;
+    let cfg = tag_taxonomy::load_ai_config(conn).map_err(db_err)?;
+    let plan = tag_taxonomy::build_plan(
+        conn,
+        &client,
+        &cfg,
+        &args.kind,
+        args.min_count,
+        args.max_tags,
+        args.batch_size,
+    )
+    .await
+    .map_err(db_err)?;
+
+    let mut d = Doc::new();
+    d.set(
+        "stats",
+        json!({
+            "kind": stats.kind,
+            "totalTags": stats.total_tags,
+            "tagsWithArticles": stats.tags_with_articles,
+            "oneHitTags": stats.one_hit_tags,
+            "tagsWithParent": stats.tags_with_parent,
+            "histogram": stats.histogram,
+        }),
+    );
+
+    if args.apply {
+        let report = tag_taxonomy::apply_plan(conn, &plan).map_err(db_err)?;
+        d.set(
+            "applied",
+            json!({
+                "mergedGroups": report.merged_groups,
+                "mergedTags": report.merged_tags,
+                "articlesRepointed": report.articles_repointed,
+                "hierarchySet": report.hierarchy_set,
+                "aliasesPinned": report.aliases_pinned,
+                "skipped": report.skipped,
+            }),
+        );
+        d.help(vec![
+            "Old spellings are pinned as aliases so the auto-tagger reuses the survivor".into(),
+            "Re-run `papr tags` to see the converged taxonomy".into(),
+        ]);
+    } else {
+        d.set(
+            "plan",
+            serde_json::to_value(&plan)
+                .map_err(|e| AxiError::runtime(format!("serialize plan: {e}")))?,
+        );
+        d.help(vec![
+            "Review the proposed groups/hierarchy above (no changes made)".into(),
+            "Apply now: `papr tag tidy --apply --yes`".into(),
+            "Or save/edit then: `papr tag apply plan.json --yes`".into(),
+        ]);
+    }
+    Ok(d.into_toon())
+}
+
+/// `papr tag apply <file>` — apply a reviewed (possibly edited) tidy plan.
+fn cmd_tag_apply(conn: &Connection, args: ApplyArgs) -> Result<String, AxiError> {
+    require_yes(args.yes, "tag apply", &format!("papr tag apply {} --yes", args.file))?;
+    let text = if args.file == "-" {
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .map_err(|e| AxiError::runtime(format!("read stdin: {e}")))?;
+        buf
+    } else {
+        std::fs::read_to_string(&args.file)
+            .map_err(|e| AxiError::runtime(format!("read {}: {e}", args.file)))?
+    };
+    // Accept either a raw plan, or a TOON/JSON doc carrying a `plan` object.
+    let root: Value =
+        serde_json::from_str(&text).map_err(|e| AxiError::runtime(format!("invalid JSON: {e}")))?;
+    let plan_value = root.get("plan").cloned().unwrap_or(root);
+    let plan: tag_taxonomy::TaxonomyPlan = serde_json::from_value(plan_value)
+        .map_err(|e| AxiError::runtime(format!("invalid tidy plan: {e}")))?;
+
+    let report = tag_taxonomy::apply_plan(conn, &plan).map_err(db_err)?;
+    let mut d = Doc::new();
+    d.set(
+        "applied",
+        json!({
+            "mergedGroups": report.merged_groups,
+            "mergedTags": report.merged_tags,
+            "articlesRepointed": report.articles_repointed,
+            "hierarchySet": report.hierarchy_set,
+            "aliasesPinned": report.aliases_pinned,
+            "skipped": report.skipped,
+        }),
+    );
+    d.help(vec!["Old spellings are pinned as aliases to prevent regrowth".into()]);
+    Ok(d.into_toon())
 }
 
 // ─────────────────────────────── rules ───────────────────────────────

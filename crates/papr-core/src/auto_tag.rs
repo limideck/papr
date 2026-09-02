@@ -641,6 +641,16 @@ pub fn apply_suggested_tags(
 }
 
 /// Create-or-attach free-form AI tags from suggestions.
+///
+/// Before creating anything, each suggested name is resolved to an existing
+/// AI tag via: (1) exact/alias lookup ([`db::resolve_tag_by_name_or_alias`],
+/// which covers case-insensitive names and the pinned synonyms from merges),
+/// then (2) a surface-variant match (case/punctuation/whitespace-insensitive,
+/// so `middle-east` lands on `Middle East`). Only a genuinely unknown spelling
+/// creates a new tag — this is the write-side counterpart to the tag-tidy
+/// merge: after variants have been merged onto a canonical tag and pinned as
+/// aliases, the worker reuses the survivor instead of regrowing the
+/// fragmentation (30k+ tags, 66% used once).
 pub fn apply_ai_tags(
     conn: &Connection,
     article_id: i64,
@@ -657,11 +667,51 @@ pub fn apply_ai_tags(
         let Some(name) = normalize_tag_name(name) else {
             continue;
         };
-        let tag_id = db::create_tag(conn, &name, TAG_KIND_AI)?;
+        let tag_id = resolve_ai_tag_for_writing(conn, &name)?
+            .unwrap_or_else(|| db::create_tag(conn, &name, TAG_KIND_AI).unwrap_or(0));
+        if tag_id <= 0 {
+            continue;
+        }
         db::set_article_tag(conn, article_id, tag_id, true)?;
         slots -= 1;
     }
     Ok(())
+}
+
+/// Resolve a suggested AI-tag spelling to an existing tag id without creating
+/// one. Checks exact name/alias first, then a surface-variant match.
+fn resolve_ai_tag_for_writing(conn: &Connection, name: &str) -> AppResult<Option<i64>> {
+    // 1) Exact name (case-insensitive) and pinned aliases.
+    if let Some(id) = db::resolve_tag_by_name_or_alias(conn, TAG_KIND_AI, name)? {
+        return Ok(Some(id));
+    }
+    // 2) Surface variant: same alphanumeric key (case/punct/space-insensitive).
+    let key = surface_alnum_key(name);
+    if key.is_empty() {
+        return Ok(None);
+    }
+    let mut stmt = conn.prepare("SELECT id, name FROM tags WHERE kind = ?1")?;
+    let mut rows = stmt.query_map(rusqlite::params![TAG_KIND_AI], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+    })?;
+    while let Some(row) = rows.next() {
+        let (tid, tname) = row?;
+        if surface_alnum_key(&tname) == key {
+            return Ok(Some(tid));
+        }
+    }
+    Ok(None)
+}
+
+/// Lowercase, keep alphanumerics only — a coarse key for case/hyphen/space
+/// variants (`middle-east` ≡ `Middle East`). Mirrors the deterministic tidy
+/// grouping; distinct concepts (`AI` vs `AIM`) keep different keys.
+fn surface_alnum_key(name: &str) -> String {
+    name.trim()
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect()
 }
 
 struct JobContext {
@@ -1864,7 +1914,7 @@ Final: {"tags":["Rust","Go"]}"#;
             content_html: None,
             body_text: "".into(),
             image_url: None,
-            published_at: Some("2026-08-01T00:00:00+00:00".into()),
+            published_at: None,
             enclosures: vec![],
         };
         let newer = NewArticle {
@@ -1876,7 +1926,7 @@ Final: {"tags":["Rust","Go"]}"#;
             content_html: None,
             body_text: "".into(),
             image_url: None,
-            published_at: Some("2026-08-06T00:00:00+00:00".into()),
+            published_at: None,
             enclosures: vec![],
         };
         assert!(db::upsert_article(&conn, feed_id, &older, false, &[]).unwrap());
@@ -1895,13 +1945,17 @@ Final: {"tags":["Rust","Go"]}"#;
                 |r| r.get(0),
             )
             .unwrap();
+        // Dates are relative to the clock so the backfill window (30d) always
+        // contains the older article regardless of when tests run.
         conn.execute(
-            "UPDATE articles SET fetched_at = '2026-08-01 09:00:00' WHERE id = ?1",
+            "UPDATE articles SET published_at = datetime('now','-2 days'),
+                 fetched_at = datetime('now','-2 days') WHERE id = ?1",
             rusqlite::params![old_id],
         )
         .unwrap();
         conn.execute(
-            "UPDATE articles SET fetched_at = '2026-08-06 09:00:00' WHERE id = ?1",
+            "UPDATE articles SET published_at = datetime('now','-1 day'),
+                 fetched_at = datetime('now','-1 day') WHERE id = ?1",
             rusqlite::params![new_id],
         )
         .unwrap();
@@ -1951,7 +2005,7 @@ Final: {"tags":["Rust","Go"]}"#;
             content_html: None,
             body_text: "".into(),
             image_url: None,
-            published_at: Some("2026-08-01T00:00:00+00:00".into()),
+            published_at: None,
             enclosures: vec![],
         };
         let newer = NewArticle {
@@ -1963,7 +2017,7 @@ Final: {"tags":["Rust","Go"]}"#;
             content_html: None,
             body_text: "".into(),
             image_url: None,
-            published_at: Some("2026-08-06T00:00:00+00:00".into()),
+            published_at: None,
             enclosures: vec![],
         };
         assert!(db::upsert_article(&conn, feed_id, &older, false, &[]).unwrap());
@@ -1982,13 +2036,17 @@ Final: {"tags":["Rust","Go"]}"#;
                 |r| r.get(0),
             )
             .unwrap();
+        // Dates are relative to the clock so the backfill window (30d) always
+        // contains the older article regardless of when tests run.
         conn.execute(
-            "UPDATE articles SET fetched_at = '2026-08-01 09:00:00' WHERE id = ?1",
+            "UPDATE articles SET published_at = datetime('now','-2 days'),
+                 fetched_at = datetime('now','-2 days') WHERE id = ?1",
             rusqlite::params![old_id],
         )
         .unwrap();
         conn.execute(
-            "UPDATE articles SET fetched_at = '2026-08-06 09:00:00' WHERE id = ?1",
+            "UPDATE articles SET published_at = datetime('now','-1 day'),
+                 fetched_at = datetime('now','-1 day') WHERE id = ?1",
             rusqlite::params![new_id],
         )
         .unwrap();

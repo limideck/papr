@@ -21,6 +21,7 @@ pub mod opml;
 pub mod sanitize;
 pub mod search;
 pub mod sync;
+pub mod tag_taxonomy;
 pub mod translate;
 pub mod user_db;
 pub mod wordcloud;
