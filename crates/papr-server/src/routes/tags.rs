@@ -98,6 +98,7 @@ pub struct CleanupEmptyBody {
 /// the source tag is deleted. Admin only. Used to repair AI-taxonomy
 /// fragmentation (near-synonym tags split across dozens of spellings).
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MergeBody {
     pub target_tag_id: i64,
 }
