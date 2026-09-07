@@ -559,6 +559,28 @@ static MIGRATIONS: LazyLock<Migrations> = LazyLock::new(|| {
             CREATE INDEX idx_tags_parent ON tags(parent_id) WHERE parent_id IS NOT NULL;
             "#,
         ),
+        // v33 — Meilisearch incremental sync queue. Every write that changes
+        // what a search index document contains (article content, body, tags)
+        // enqueues the article id here; a background worker batches them into
+        // Meili upserts. Article deletes are covered by a trigger (any path —
+        // retention purge, feed unsubscribe, rule skip, …): the queue row
+        // survives the article row, so the worker sees a missing article and
+        // drops its document; once handled it removes the queue row.
+        M::up(
+            r#"
+            CREATE TABLE meili_sync_queue (
+                article_id INTEGER PRIMARY KEY,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX idx_meili_sync_queue_updated
+                ON meili_sync_queue(updated_at);
+            CREATE TRIGGER articles_meili_del AFTER DELETE ON articles BEGIN
+                INSERT INTO meili_sync_queue(article_id, updated_at)
+                VALUES (old.id, datetime('now'))
+                ON CONFLICT(article_id) DO UPDATE SET updated_at = datetime('now');
+            END;
+            "#,
+        ),
     ])
 });
 
@@ -1529,6 +1551,9 @@ pub fn upsert_article(
         log::warn!("wordcloud index failed (article {id}): {e}");
     }
     tx.commit()?;
+    // New content enters the search index queue (content/tags may still be
+    // refined by extraction/auto-tag shortly after; those paths re-enqueue).
+    let _ = enqueue_search_index(conn, id);
     // A row inserted but pre-marked read by a `read` rule is not "new" from
     // the user's point of view — report it as not-inserted so it is excluded
     // from new-article tallies.
@@ -1963,6 +1988,8 @@ pub fn set_extracted_html(
         params![id, crate::sanitize::html_to_text(html)],
     )?;
     tx.commit()?;
+    // Extracted plain text changes what the search index embeds/indexes.
+    let _ = enqueue_search_index(conn, id);
     Ok(())
 }
 
@@ -2181,6 +2208,8 @@ pub fn merge_tags(conn: &Connection, from_id: i64, to_id: i64) -> AppResult<usiz
     )?;
     tx.execute("DELETE FROM tags WHERE id = ?1", params![from_id])?;
     tx.commit()?;
+    // The merged-away spelling leaves articles' indexed tag lists.
+    let _ = enqueue_search_index_for_tag(conn, to_id);
     Ok(moved)
 }
 
@@ -2317,6 +2346,9 @@ pub fn merge_tags_keep_alias(
     }
 
     tx.commit()?;
+    // Survivor's article set changed (and, via alias pinning, so may future
+    // auto-tag output) → re-index the survivor's articles.
+    let _ = enqueue_search_index_for_tag(conn, to_id);
     Ok(moved)
 }
 
@@ -2453,6 +2485,8 @@ pub fn rename_tag(conn: &Connection, id: i64, name: &str) -> AppResult<()> {
         return Err(AppError::code("tagNameExists"));
     }
     conn.execute("UPDATE tags SET name = ?2 WHERE id = ?1", params![id, name])?;
+    // Renamed tag text appears inside every affected article's index document.
+    let _ = enqueue_search_index_for_tag(conn, id);
     Ok(())
 }
 
@@ -2477,7 +2511,15 @@ pub fn reorder_tags(conn: &Connection, ids: &[i64]) -> AppResult<()> {
 }
 
 pub fn delete_tag(conn: &Connection, id: i64) -> AppResult<()> {
+    // Capture affected articles before the tag (and its article_tags) die.
+    let affected: Vec<i64> = conn
+        .prepare("SELECT article_id FROM article_tags WHERE tag_id = ?1")?
+        .query_map([id], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
     conn.execute("DELETE FROM tags WHERE id = ?1", params![id])?;
+    for aid in affected {
+        let _ = enqueue_search_index(conn, aid);
+    }
     Ok(())
 }
 
@@ -2747,6 +2789,8 @@ pub fn set_article_tag(conn: &Connection, article_id: i64, tag_id: i64, on: bool
             params![article_id, tag_id],
         )?;
     }
+    // The indexed tag list changed → re-index this article.
+    let _ = enqueue_search_index(conn, article_id);
     Ok(())
 }
 
@@ -2760,6 +2804,54 @@ pub fn article_tag_count(conn: &Connection, article_id: i64, kind: &str) -> AppR
         params![article_id, kind],
         |r| r.get(0),
     )?)
+}
+
+// ─────────────────────────── meili sync queue ───────────────────────────
+
+/// Mark an article's search-index document as stale (content, body, or tag
+/// list changed). The row is an id-deduplicated "needs re-index" marker
+/// consumed by the Meili worker / `papr meili` commands.
+pub fn enqueue_search_index(conn: &Connection, article_id: i64) -> AppResult<()> {
+    conn.execute(
+        "INSERT INTO meili_sync_queue(article_id, updated_at)
+         VALUES (?1, datetime('now'))
+         ON CONFLICT(article_id) DO UPDATE SET updated_at = datetime('now')",
+        [article_id],
+    )?;
+    Ok(())
+}
+
+/// Enqueue every article currently carrying `tag_id` (used after tag
+/// renames/deletes/merges, whose name appears inside the indexed tag list).
+pub fn enqueue_search_index_for_tag(conn: &Connection, tag_id: i64) -> AppResult<()> {
+    let mut stmt = conn.prepare(
+        "SELECT article_id FROM article_tags WHERE tag_id = ?1",
+    )?;
+    let ids: Vec<i64> = stmt
+        .query_map([tag_id], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    for id in ids {
+        enqueue_search_index(conn, id)?;
+    }
+    Ok(())
+}
+
+/// Remove processed ids from the queue (called by the Meili worker / CLI
+/// after the documents were upserted or dropped).
+pub fn drain_search_index(conn: &Connection, ids: &[i64]) -> AppResult<()> {
+    for chunk in ids.chunks(500) {
+        let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "DELETE FROM meili_sync_queue WHERE article_id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut binds = Vec::with_capacity(chunk.len());
+        for id in chunk {
+            binds.push(Value::Integer(*id));
+        }
+        stmt.execute(rusqlite::params_from_iter(binds.iter()))?;
+    }
+    Ok(())
 }
 
 // ─────────────────────────── auto-tag queue ───────────────────────────

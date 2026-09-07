@@ -68,6 +68,18 @@ papr stats
 papr sync status | papr sync run   # reconcile read/starred + subscriptions with FreshRSS/Miniflux
 ```
 
+## Search index (Meilisearch)
+
+The app searches through Meilisearch when configured (`meili_key` set), with
+FTS5 as automatic fallback. Incremental sync runs in the background; these
+commands operate on the index directly:
+
+```sh
+papr meili status              # engine config, health, queue depth, index stats
+papr meili sync                # push the pending incremental-sync queue once
+papr meili rebuild --yes       # full re-index from the database
+```
+
 There are no summarize/ask/digest/translate commands: you are the language
 model, so read the text with `papr read <id>` (or gather candidates with
 `papr search`) and summarize, answer or translate it yourself — no second AI

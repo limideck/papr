@@ -203,6 +203,25 @@ enum Cmd {
         #[command(subcommand)]
         cmd: Option<SyncCmd>,
     },
+    /// Meilisearch search-index maintenance (status / rebuild / sync).
+    Meili {
+        #[command(subcommand)]
+        cmd: Option<MeiliCmd>,
+    },
+}
+
+#[derive(Subcommand)]
+enum MeiliCmd {
+    /// Show engine config, queue depth and index stats (default).
+    Status,
+    /// Full rebuild of the index from the database (destructive on the index).
+    Rebuild {
+        /// Confirm this destructive operation.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Push the pending incremental-sync queue to the index once.
+    Sync,
 }
 
 #[derive(Subcommand)]
@@ -556,6 +575,7 @@ async fn run(cli: Cli) -> Result<String, AxiError> {
         Some(Cmd::Admin { cmd }) => cmd_admin(&path, cmd),
         Some(Cmd::Setup { .. }) => unreachable!("setup is dispatched before db_path"),
         Some(Cmd::Sync { cmd }) => cmd_sync(&path, cmd.unwrap_or(SyncCmd::Status)).await,
+        Some(Cmd::Meili { cmd }) => cmd_meili(&path, cmd.unwrap_or(MeiliCmd::Status)).await,
     }
 }
 
@@ -1170,6 +1190,124 @@ async fn cmd_sync(path: &Path, cmd: SyncCmd) -> Result<String, AxiError> {
                 .await
                 .map_err(|e| clean_err("sync failed", e))?;
             Ok(Doc::new().set("sync", json!({ "reconciled": n })).into_toon())
+        }
+    }
+}
+
+// ─────────────────────── Meilisearch maintenance ───────────────────────
+
+async fn cmd_meili(path: &Path, cmd: MeiliCmd) -> Result<String, AxiError> {
+    let conn = db::open(path).map_err(db_err)?;
+    let client = http_client()?;
+    let cfg = papr_core::meili::MeiliConfig::from_db(&conn);
+    if !cfg.enabled() {
+        return Err(AxiError::usage(
+            "Meilisearch not configured (meili_key missing)",
+            vec![
+                "Set the meili settings, e.g.:".into(),
+                "papr settings set meili_url http://127.0.0.1:7700".into(),
+                "papr settings set meili_key <admin-or-scoped-key>".into(),
+            ],
+        ));
+    }
+    match cmd {
+        MeiliCmd::Status => {
+            let healthy = papr_core::meili::healthy(&client, &cfg).await;
+            let queue: i64 = conn
+                .query_row("SELECT COUNT(*) FROM meili_sync_queue", [], |r| r.get(0))
+                .map_err(|e| AxiError::runtime(e.to_string()))?;
+            let engine = if papr_core::meili::engine_is_meili(&conn) {
+                "meili"
+            } else {
+                "fts"
+            };
+            let mut d = Doc::new();
+            d.set("engine", engine)
+                .set("index", cfg.index.clone())
+                .set("url", cfg.url.clone())
+                .set("embedder", format!("{} @ {}", cfg.embed_model, cfg.embed_url))
+                .set("healthy", healthy)
+                .set("syncQueue", queue);
+            if let Ok(st) = papr_core::meili::index_stats(&client, &cfg).await {
+                d.set(
+                    "indexStats",
+                    json!({
+                        "documents": st.get("numberOfDocuments").and_then(|v| v.as_u64()).unwrap_or(0),
+                        "indexing": st.get("isIndexing").and_then(|v| v.as_bool()).unwrap_or(false),
+                        "sizeMB": (st.get("indexSize").and_then(|v| v.as_u64()).unwrap_or(0) as f64) / 1e6,
+                    }),
+                );
+            }
+            Ok(d.into_toon())
+        }
+        MeiliCmd::Sync => {
+            // First run against an empty Meili: create the index + settings.
+            papr_core::meili::ensure_index(&client, &cfg)
+                .await
+                .map_err(|e| clean_err("meili ensure index", e))?;
+            let docs = papr_core::meili::load_queue(&conn, 500).map_err(db_err)?;
+            if docs.is_empty() {
+                return Ok(Doc::new().set("sync", json!({ "upserted": 0, "deleted": 0 })).into_toon());
+            }
+            let to_delete: Vec<i64> = docs
+                .iter()
+                .filter(|d| papr_core::meili::is_deleted(d))
+                .map(|d| d.id)
+                .collect();
+            let to_upsert: Vec<papr_core::meili::IndexDoc> = docs
+                .into_iter()
+                .filter(|d| !papr_core::meili::is_deleted(d))
+                .collect();
+            if !to_delete.is_empty() {
+                papr_core::meili::delete_docs(&client, &cfg, &to_delete)
+                    .await
+                    .map_err(|e| clean_err("meili delete", e))?;
+            }
+            if !to_upsert.is_empty() {
+                papr_core::meili::upsert_docs(&client, &cfg, &to_upsert)
+                    .await
+                    .map_err(|e| clean_err("meili upsert", e))?;
+            }
+            let mut processed = to_delete.clone();
+            processed.extend(to_upsert.iter().map(|d| d.id));
+            papr_core::db::drain_search_index(&conn, &processed).map_err(db_err)?;
+            Ok(Doc::new()
+                .set("sync", json!({ "upserted": to_upsert.len(), "deleted": to_delete.len() }))
+                .into_toon())
+        }
+        MeiliCmd::Rebuild { yes } => {
+            require_yes(yes, "meili rebuild", "papr meili rebuild --yes")?;
+            papr_core::meili::ensure_index(&client, &cfg)
+                .await
+                .map_err(|e| clean_err("meili ensure index", e))?;
+            papr_core::meili::delete_all_docs(&client, &cfg)
+                .await
+                .map_err(|e| clean_err("meili clear", e))?;
+            let mut after = 0i64;
+            let mut total = 0u64;
+            loop {
+                let ids = papr_core::meili::load_page(&conn, after, 500).map_err(db_err)?;
+                if ids.is_empty() {
+                    break;
+                }
+                let mut docs = Vec::with_capacity(ids.len());
+                for id in &ids {
+                    if let Some(d) = papr_core::meili::load_doc_one(&conn, *id).map_err(db_err)? {
+                        docs.push(d);
+                    }
+                }
+                if !docs.is_empty() {
+                    papr_core::meili::upsert_docs(&client, &cfg, &docs)
+                        .await
+                        .map_err(|e| clean_err("meili upsert", e))?;
+                }
+                after = *ids.last().unwrap();
+                total += docs.len() as u64;
+                eprintln!("indexed {total} articles (through id {after})");
+            }
+            Ok(Doc::new()
+                .set("rebuild", json!({ "indexed": total, "index": cfg.index }))
+                .into_toon())
         }
     }
 }

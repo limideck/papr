@@ -40,7 +40,76 @@ pub fn spawn_background_jobs(state: AppState) {
         tokio::spawn(auto_tag_worker(state.clone(), worker_id));
     }
     tokio::spawn(wordcloud_backfill_loop(state.clone()));
-    tokio::spawn(balance_snapshot_loop(state));
+    tokio::spawn(balance_snapshot_loop(state.clone()));
+    tokio::spawn(meili_sync_loop(state));
+}
+
+/// Push queued article changes to the Meilisearch index. Runs whenever Meili
+/// is configured (`meili_key` set), even while `search_engine` is still `fts`
+/// — the index stays fresh so the switch is instant. Backlog drains in a
+/// tight loop; an empty queue idles.
+async fn meili_sync_loop(state: AppState) {
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    let mut ensured = false;
+    loop {
+        let enabled = {
+            let conn = state.db.lock().await;
+            papr_core::meili::MeiliConfig::from_db(&conn).enabled()
+        };
+        if !enabled {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            continue;
+        }
+        let cfg = {
+            let conn = state.db.lock().await;
+            papr_core::meili::MeiliConfig::from_db(&conn)
+        };
+        if !ensured {
+            match papr_core::meili::ensure_index(&state.http, &cfg).await {
+                Ok(()) => ensured = true,
+                Err(e) => {
+                    tracing::warn!("meili ensure_index failed: {e}");
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    continue;
+                }
+            }
+        }
+        let docs = {
+            let conn = state.db.lock().await;
+            papr_core::meili::load_queue(&conn, 400).unwrap_or_default()
+        };
+        if docs.is_empty() {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            continue;
+        }
+        let to_delete: Vec<i64> = docs
+            .iter()
+            .filter(|d| papr_core::meili::is_deleted(d))
+            .map(|d| d.id)
+            .collect();
+        let to_upsert: Vec<papr_core::meili::IndexDoc> = docs
+            .into_iter()
+            .filter(|d| !papr_core::meili::is_deleted(d))
+            .collect();
+        let mut ok = true;
+        if let Err(e) = papr_core::meili::delete_docs(&state.http, &cfg, &to_delete).await {
+            tracing::warn!("meili delete failed ({} docs): {e}", to_delete.len());
+            ok = false;
+        }
+        if !to_upsert.is_empty() {
+            if let Err(e) = papr_core::meili::upsert_docs(&state.http, &cfg, &to_upsert).await {
+                tracing::warn!("meili upsert failed ({} docs): {e}", to_upsert.len());
+                ok = false;
+            }
+        }
+        if ok {
+            let mut processed = to_delete;
+            processed.extend(to_upsert.iter().map(|d| d.id));
+            if let Ok(conn) = state.db.try_lock() {
+                let _ = papr_core::db::drain_search_index(&conn, &processed);
+            }
+        }
+    }
 }
 
 async fn refresh_loop(state: AppState) {

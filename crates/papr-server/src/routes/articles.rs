@@ -5,6 +5,7 @@ use axum::Json;
 use papr_core::db;
 use papr_core::extraction;
 use papr_core::ingestion::fetch;
+use papr_core::meili;
 use papr_core::models::ArticleQuery;
 use papr_core::sanitize;
 use papr_core::user_db;
@@ -99,18 +100,55 @@ pub async fn list(
     Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<Value>> {
     let query = parse_article_query(q.kind.as_deref(), q.value);
+    let search = q.search.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    // Meili engine: relevance-sorted free-text search only. Everything else
+    // (date sort, boolean/field queries, engine off, backend unreachable)
+    // keeps the FTS path untouched.
+    let use_meili = q.sort_by_relevance
+        && !q.oldest_first
+        && search.is_some()
+        && meili::engine_is_meili(&*state.db.lock().await)
+        && meili::meili_eligible(search.unwrap());
+    let meili_ids: Option<Vec<i64>> = if use_meili {
+        let cfg = meili::MeiliConfig::from_db(&*state.db.lock().await);
+        if !cfg.enabled() {
+            None
+        } else {
+            match meili::search_ids(&state.http, &cfg, search.unwrap(), true, 10000, 0).await {
+                Ok(ids) => Some(ids),
+                Err(e) => {
+                    tracing::warn!("meili search failed, falling back to FTS: {e}");
+                    None
+                }
+            }
+        }
+    } else {
+        None
+    };
     let conn = state.db.lock().await;
-    let rows = user_db::list_articles_for_user_sorted(
-        &conn,
-        user.id(),
-        &query,
-        q.unread_only,
-        q.search.as_deref(),
-        q.oldest_first,
-        q.sort_by_relevance,
-        q.limit,
-        q.offset,
-    )
+    let rows = if let Some(ids) = meili_ids {
+        user_db::list_articles_for_user_in_ids(
+            &conn,
+            user.id(),
+            &query,
+            q.unread_only,
+            &ids,
+            q.limit,
+            q.offset,
+        )
+    } else {
+        user_db::list_articles_for_user_sorted(
+            &conn,
+            user.id(),
+            &query,
+            q.unread_only,
+            q.search.as_deref(),
+            q.oldest_first,
+            q.sort_by_relevance,
+            q.limit,
+            q.offset,
+        )
+    }
     .map_err(ApiError::from)?;
     Ok(Json(json!(rows)))
 }
@@ -121,18 +159,52 @@ pub async fn list_post(
     Json(body): Json<ListBody>,
 ) -> ApiResult<Json<Value>> {
     let query = ArticleQuery::from(body.query);
+    let search = body.search.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let use_meili = body.sort_by_relevance
+        && !body.oldest_first
+        && search.is_some()
+        && meili::engine_is_meili(&*state.db.lock().await)
+        && meili::meili_eligible(search.unwrap());
+    let meili_ids: Option<Vec<i64>> = if use_meili {
+        let cfg = meili::MeiliConfig::from_db(&*state.db.lock().await);
+        if !cfg.enabled() {
+            None
+        } else {
+            match meili::search_ids(&state.http, &cfg, search.unwrap(), true, 10000, 0).await {
+                Ok(ids) => Some(ids),
+                Err(e) => {
+                    tracing::warn!("meili search failed, falling back to FTS: {e}");
+                    None
+                }
+            }
+        }
+    } else {
+        None
+    };
     let conn = state.db.lock().await;
-    let rows = user_db::list_articles_for_user_sorted(
-        &conn,
-        user.id(),
-        &query,
-        body.unread_only,
-        body.search.as_deref(),
-        body.oldest_first,
-        body.sort_by_relevance,
-        body.limit,
-        body.offset,
-    )
+    let rows = if let Some(ids) = meili_ids {
+        user_db::list_articles_for_user_in_ids(
+            &conn,
+            user.id(),
+            &query,
+            body.unread_only,
+            &ids,
+            body.limit,
+            body.offset,
+        )
+    } else {
+        user_db::list_articles_for_user_sorted(
+            &conn,
+            user.id(),
+            &query,
+            body.unread_only,
+            body.search.as_deref(),
+            body.oldest_first,
+            body.sort_by_relevance,
+            body.limit,
+            body.offset,
+        )
+    }
     .map_err(ApiError::from)?;
     Ok(Json(json!(rows)))
 }
