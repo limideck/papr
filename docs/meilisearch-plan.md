@@ -123,3 +123,44 @@
 
 - 删除测试索引 `papr_articles_test`（可选保留供阶段 1 复用，重建 <2 分钟）。
 - 临时文档分块 `/tmp/papr_meili/*` 与脚本已生成，验证脚本留存（`/tmp/papr_meili_export.py` 等，不入库）。
+
+## 10. 补充：Hybrid（关键词 + 向量语义）本地验证
+
+> 结论：**语义混合检索在 BGE-M3 下验证通过**，多语言/意译类查询显著优于纯关键词；可作为 Meili 接入的增强选项（默认 semanticRatio 0.5 附近，可按体验调）。
+
+### 验证设置
+
+- 本地 Meilisearch（重启后换全新数据目录 `/tmp/papr-meili-data`，`--master-key=aSampleMasterKey`），BGE-M3 经本机 ollama（`localhost:11434/api/embed`，1024 维）。
+- 索引 `papr_articles_hybrid`：2,000 篇真实快照子集，`_vectors` 用 `userProvided` embedder 注入（**嵌入文本 = 标题+源+作者+标签+正文前 600 字**——全量正文嵌入 CPU 太慢且非必要）。
+- 嵌入吞吐：批量 96/次 ≈ 2000 篇 1 分钟内完成（CPU）。索引体积：2k 篇 ≈ 213MB（向量为增量大头，30k 篇估 ~3GB，规划数据盘应上调到 10GB 级）。
+
+### 结果（要点）
+
+| 查询 | 模式 | 效果 |
+| --- | --- | --- |
+| `伊朗` | 关键词 | 命中精确（含中文标签的文章） |
+| `特朗普`（无同义词词典） | hybrid 0.5 | 命中含西语 Trump 文章——向量跨语言桥接 |
+| `中国经济放缓担忧`（正文全是英文） | 关键词 | 基本无效（无字面命中） |
+| 同上 | hybrid 0.6 | 命中 Walmart 增长疲弱/Slovak 竞争力下降等**语义相关**英文报道 |
+| `中东紧张局势推高原油价格`（中文查英文） | hybrid 0.5 | 顶部全部命中 Oil price/Middle East tension 类英文文章（强） |
+| `关税 供应链冲击` | vector-only 1.0 | 命中关税/贸易战相关英文文章 |
+| 欧央行加息（英查多语） | hybrid 0.6 | 命中多国央行加息文章 |
+| 延迟 | — | 2–17ms（localhost，2k 文档） |
+
+- `estimatedTotalHits` 在混合模式会回到全库规模（语义分不设硬过滤），只作分页用。
+- 生产中查询需**先对查询词做一次嵌入**再带 `vector` 调 Meili（userProvided 模式），或改用 Meili 托管 embedder 让 Meili 自行嵌入查询词。
+
+### 踩坑记录（影响生产选型）
+
+1. Meili 内建 `ollama` embedder：settings 校验要求 URL 以 `/api/embed` 结尾，但运行期实际请求报 `bad uri: Rejected URI` 并无限重试（1.53.1），**不可用**。
+2. Meili 内建 `rest` embedder：response 指针解析 ollama 响应结构失败（`"{{embedding}}" not found`），文档站为 JS 渲染无法快速核验 schema；需以 OpenAI 兼容结构（`{"data":[{"embedding":[...]}]}`）实测。
+3. 因此本地验证走 `userProvided`（向量自产自传），绕开托管 embedder 的坑。
+4. embedder 变更会触发**对存量文档补嵌入**（阻塞式、慢），配置前先清空/规划好再填。
+5. 调度器可被一个卡死的 embed 任务整体堵住（cancel 无效，需重启实例）；多任务队列在重启后恢复执行。
+
+### 对生产架构的影响（混合模式）
+
+- 需要一个稳定的嵌入服务：优先 **OpenAI 兼容 REST embedder**（BGE-M3 自己起一个 OpenAI 兼容端点，或在 Meili 侧用 `rest` 源并配 OpenAI 形状的 `request/response`），并在阶段 1 集成时先做 1 篇实测再全量。
+- 查询路径：papr-server 负责把查询文本交给嵌入服务取向量（userProvided 时）或配置 Meili 托管 embedder（rest/ollama 修好后）。
+- 索引字段模板应只嵌"标题+标签+摘要片段"，控制成本与体积。
+- `semanticRatio` 做成配置项（0=纯关键词，1=纯向量，默认 0.5），故障时回退关键词/FTS。
