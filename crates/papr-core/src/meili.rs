@@ -424,6 +424,11 @@ pub async fn search_ids(
         "q": query,
         "limit": limit,
         "offset": offset,
+        // Only ranked ids are needed — the caller re-fetches full rows from
+        // SQLite with its own filters. Returning whole documents (body up to
+        // 30k chars each) ballooned the response to tens of MB and made
+        // searches take seconds.
+        "attributesToRetrieve": ["id"],
     });
     // `strict` is accepted for signature parity with the FTS contract; the
     // `all` matchingStrategy only exists on Meili >= 1.8 and older servers
