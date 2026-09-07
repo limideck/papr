@@ -79,6 +79,29 @@ async fn meili_sync_loop(state: AppState) {
             papr_core::meili::load_queue(&conn, 400).unwrap_or_default()
         };
         if docs.is_empty() {
+            // Idle maintenance pass: this box is shared and its page cache is
+            // constantly evicted, so the *first* search after a quiet spell
+            // pays for cold Meili-index reads plus cold SQLite page reads and
+            // feels slow. Warm both caches once a minute (cheap probes, errors
+            // ignored) so a real user search is always hot:
+            //  - an empty Meili search loads the index into working memory;
+            //  - the recent-articles list read keeps the join + sort pages the
+            //    UI list endpoints touch resident in the OS page cache.
+            let _ = papr_core::meili::search_ids(&state.http, &cfg, "", false, 5, 0).await;
+            {
+                let conn = state.db.lock().await;
+                let _ = conn.query_row(
+                    "SELECT a.id, a.title, f.title, COALESCE(uas.is_read, 0)
+                     FROM articles a
+                     JOIN feeds f ON f.id = a.feed_id
+                     LEFT JOIN user_article_states uas
+                       ON uas.article_id = a.id AND uas.user_id = 1
+                     ORDER BY datetime(COALESCE(a.published_at, a.fetched_at)) DESC
+                     LIMIT 50",
+                    [],
+                    |_| Ok(()),
+                );
+            }
             tokio::time::sleep(Duration::from_secs(60)).await;
             continue;
         }
