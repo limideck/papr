@@ -327,11 +327,17 @@ pub fn is_deleted(doc: &IndexDoc) -> bool {
         && doc.tags.is_empty()
 }
 
+/// Body text indexed per document (chars). Full bodies (up to ~100k chars in
+/// this corpus) made the inverted index huge (multi-GB), which thrashes on a
+/// shared box with little free RAM. Keyword recall for the first few thousand
+/// chars covers headlines + leads, which is what users search for.
+pub const BODY_INDEX_CAP: usize = 6000;
+
 fn doc_json(doc: &IndexDoc, vector: Option<&[f32]>) -> Value {
     let mut body = json!({
         "id": doc.id,
         "title": doc.title,
-        "body": doc.body.chars().take(30000).collect::<String>(),
+        "body": doc.body.chars().take(BODY_INDEX_CAP).collect::<String>(),
         "feed": doc.feed,
         "author": doc.author,
         "tags": doc.tags,

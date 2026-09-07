@@ -114,7 +114,7 @@ pub async fn list(
         if !cfg.enabled() {
             None
         } else {
-            match meili::search_ids(&state.http, &cfg, search.unwrap(), true, 10000, 0).await {
+            match meili::search_ids(&state.http, &cfg, search.unwrap(), true, 2000, 0).await {
                 Ok(ids) => Some(ids),
                 Err(e) => {
                     tracing::warn!("meili search failed, falling back to FTS: {e}");
@@ -170,7 +170,7 @@ pub async fn list_post(
         if !cfg.enabled() {
             None
         } else {
-            match meili::search_ids(&state.http, &cfg, search.unwrap(), true, 10000, 0).await {
+            match meili::search_ids(&state.http, &cfg, search.unwrap(), true, 2000, 0).await {
                 Ok(ids) => Some(ids),
                 Err(e) => {
                     tracing::warn!("meili search failed, falling back to FTS: {e}");
