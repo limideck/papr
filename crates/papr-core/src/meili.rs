@@ -197,30 +197,41 @@ pub async fn ensure_index(client: &reqwest::Client, cfg: &MeiliConfig) -> AppRes
         .await?;
     }
     // Keyword-only mode (`semantic_ratio` = 0) does not need an embedder and
-    // must not configure one: documents are uploaded without `_vectors` and
-    // searches stay text-only, so the index works with no embedding service
-    // reachable at all. Setting the embedder requires a full re-embed, so
-    // switching 0 → hybrid later means re-running `papr meili rebuild`.
-    let embedders = if cfg.semantic_ratio > 0.0 {
-        json!({
+    // must not configure one — older Meili (< 1.9, where vector search was an
+    // experimental feature) rejects *any* `embedders` key in settings until
+    // `vectorStore` is enabled, even `{}`. Omit the field entirely: documents
+    // are uploaded without `_vectors` and searches stay text-only, so the
+    // index works with no embedding service (and no feature flag) at all.
+    // Hybrid mode enables the experimental flag best-effort (no-op where
+    // vector search is GA) and configures the embedder; switching 0 → hybrid
+    // later means re-running `papr meili rebuild`.
+    let mut settings = json!({
+        "searchableAttributes": ["title", "body", "feed", "author", "tags"],
+        "pagination": { "maxTotalHits": 10000 },
+    });
+    if cfg.semantic_ratio > 0.0 {
+        // Best-effort: harmless on versions where vector search is GA.
+        let _ = api(
+            client,
+            cfg,
+            reqwest::Method::PATCH,
+            "/experimental-features",
+            Some(json!({ "vectorStore": true })),
+        )
+        .await;
+        settings["embedders"] = json!({
             "default": {
                 "source": "userProvided",
                 "dimensions": cfg.embed_dims,
             }
-        })
-    } else {
-        json!({})
-    };
+        });
+    }
     api(
         client,
         cfg,
         reqwest::Method::PATCH,
         &format!("/indexes/{}/settings", cfg.index),
-        Some(json!({
-            "searchableAttributes": ["title", "body", "feed", "author", "tags"],
-            "embedders": embedders,
-            "pagination": { "maxTotalHits": 10000 },
-        })),
+        Some(settings),
     )
     .await?;
     Ok(())
