@@ -414,9 +414,11 @@ pub async fn search_ids(
         "limit": limit,
         "offset": offset,
     });
-    if strict {
-        body["matchingStrategy"] = json!("all");
-    }
+    // `strict` is accepted for signature parity with the FTS contract; the
+    // `all` matchingStrategy only exists on Meili >= 1.8 and older servers
+    // reject it, so ranking stays engine-default (docs with all terms outrank
+    // partial/typo matches; read-state filters are applied downstream anyway).
+    let _ = strict;
     if cfg.semantic_ratio > 0.0 {
         let vec = embed(client, cfg, &[query.to_string()]).await?;
         body["vector"] = Value::Array(vec[0].iter().map(|f| json!(f)).collect());
