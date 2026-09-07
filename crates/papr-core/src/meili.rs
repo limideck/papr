@@ -196,6 +196,21 @@ pub async fn ensure_index(client: &reqwest::Client, cfg: &MeiliConfig) -> AppRes
         )
         .await?;
     }
+    // Keyword-only mode (`semantic_ratio` = 0) does not need an embedder and
+    // must not configure one: documents are uploaded without `_vectors` and
+    // searches stay text-only, so the index works with no embedding service
+    // reachable at all. Setting the embedder requires a full re-embed, so
+    // switching 0 → hybrid later means re-running `papr meili rebuild`.
+    let embedders = if cfg.semantic_ratio > 0.0 {
+        json!({
+            "default": {
+                "source": "userProvided",
+                "dimensions": cfg.embed_dims,
+            }
+        })
+    } else {
+        json!({})
+    };
     api(
         client,
         cfg,
@@ -203,12 +218,7 @@ pub async fn ensure_index(client: &reqwest::Client, cfg: &MeiliConfig) -> AppRes
         &format!("/indexes/{}/settings", cfg.index),
         Some(json!({
             "searchableAttributes": ["title", "body", "feed", "author", "tags"],
-            "embedders": {
-                "default": {
-                    "source": "userProvided",
-                    "dimensions": cfg.embed_dims,
-                }
-            },
+            "embedders": embedders,
             "pagination": { "maxTotalHits": 10000 },
         })),
     )
@@ -306,19 +316,25 @@ pub fn is_deleted(doc: &IndexDoc) -> bool {
         && doc.tags.is_empty()
 }
 
-fn doc_json(doc: &IndexDoc, vector: &[f32]) -> Value {
-    json!({
+fn doc_json(doc: &IndexDoc, vector: Option<&[f32]>) -> Value {
+    let mut body = json!({
         "id": doc.id,
         "title": doc.title,
         "body": doc.body.chars().take(30000).collect::<String>(),
         "feed": doc.feed,
         "author": doc.author,
         "tags": doc.tags,
-        "_vectors": { "default": vector },
-    })
+    });
+    if let Some(v) = vector {
+        body["_vectors"] = json!({ "default": v });
+    }
+    body
 }
 
-/// Upsert documents (with freshly computed vectors) into the index.
+/// Upsert documents into the index. In hybrid mode (`semantic_ratio` > 0)
+/// vectors are computed through the configured embed endpoint before upload;
+/// in keyword-only mode (`semantic_ratio` = 0) no embedder is configured and
+/// no embedding call happens — the index works with no embedding service.
 pub async fn upsert_docs(
     client: &reqwest::Client,
     cfg: &MeiliConfig,
@@ -327,24 +343,36 @@ pub async fn upsert_docs(
     if docs.is_empty() {
         return Ok(());
     }
-    let texts: Vec<String> = docs
-        .iter()
-        .map(|d| semantic_text(&d.title, &d.feed, &d.author, &d.tags, &d.body))
-        .collect();
-    let vectors = embed(client, cfg, &texts).await?;
-    let payload: Vec<Value> = docs
-        .iter()
-        .zip(vectors.iter())
-        .map(|(d, v)| doc_json(d, v))
-        .collect();
-    api(
-        client,
-        cfg,
-        reqwest::Method::POST,
-        &format!("/indexes/{}/documents", cfg.index),
-        Some(Value::Array(payload)),
-    )
-    .await?;
+    if cfg.semantic_ratio > 0.0 {
+        let texts: Vec<String> = docs
+            .iter()
+            .map(|d| semantic_text(&d.title, &d.feed, &d.author, &d.tags, &d.body))
+            .collect();
+        let vectors = embed(client, cfg, &texts).await?;
+        let payload: Vec<Value> = docs
+            .iter()
+            .zip(vectors.iter())
+            .map(|(d, v)| doc_json(d, Some(v)))
+            .collect();
+        api(
+            client,
+            cfg,
+            reqwest::Method::POST,
+            &format!("/indexes/{}/documents", cfg.index),
+            Some(Value::Array(payload)),
+        )
+        .await?;
+    } else {
+        let payload: Vec<Value> = docs.iter().map(|d| doc_json(d, None)).collect();
+        api(
+            client,
+            cfg,
+            reqwest::Method::POST,
+            &format!("/indexes/{}/documents", cfg.index),
+            Some(Value::Array(payload)),
+        )
+        .await?;
+    }
     Ok(())
 }
 
