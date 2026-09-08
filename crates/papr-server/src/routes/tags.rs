@@ -3,7 +3,9 @@ use crate::state::{AppState, AuthUser};
 use axum::extract::{Path, Query, State};
 use axum::Json;
 use papr_core::db;
-use papr_core::models::TAG_KIND_INTEREST;
+use rusqlite::OptionalExtension;
+use papr_core::error::AppError;
+use papr_core::models::{TAG_KIND_AI, TAG_KIND_INTEREST};
 use papr_core::user_db;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -54,6 +56,39 @@ pub async fn create(
 pub struct UpdateBody {
     pub name: Option<String>,
     pub color: Option<String>,
+}
+
+/// `GET /api/tags/{id}` — single-tag admin info (type/parent/domain) for the
+/// tag-management detail panel.
+pub async fn get_one(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<Value>> {
+    user.require_admin()?;
+    let conn = state.db.lock().await;
+    let row: Option<(String, Option<String>, Option<i64>, Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT t.name, t.tag_type, t.parent_id, t.domain,
+                    (SELECT p.name FROM tags p WHERE p.id = t.parent_id)
+             FROM tags t WHERE t.id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()
+        .map_err(papr_core::error::AppError::from)
+        .map_err(ApiError::from)?;
+    let Some((name, tag_type, parent_id, domain, parent_name)) = row else {
+        return Err(ApiError::from(AppError::code("tagNotFound")));
+    };
+    Ok(Json(json!({
+        "id": id,
+        "name": name,
+        "tagType": tag_type,
+        "parentId": parent_id,
+        "parentName": parent_name,
+        "domain": domain,
+    })))
 }
 
 pub async fn update(
@@ -161,6 +196,167 @@ pub async fn set_article_tag(
     }
     let conn = state.db.lock().await;
     db::set_article_tag(&conn, article_id, tag_id, body.on).map_err(ApiError::from)?;
+    // Feedback loop, keyed on AI tags only (interest is the admin's own
+    // vocabulary — removals there carry no signal):
+    //  • detach records a *dismissal* → the worker skips this tag on every
+    //    future article until an admin restores it;
+    //  • explicit re-attach withdraws the dismissal (the reader is telling us
+    //    the tag belongs after all).
+    let kind = db::tag_kind(&conn, tag_id).map_err(ApiError::from)?;
+    if kind.as_deref() == Some(TAG_KIND_AI) {
+        if body.on {
+            db::unsuppress_tag(&conn, tag_id).map_err(ApiError::from)?;
+        } else {
+            db::record_tag_dismissal(&conn, tag_id).map_err(ApiError::from)?;
+        }
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+// ─────────────────── feedback loop: review queue / suppression ───────────────────
+
+#[derive(Deserialize)]
+pub struct ReviewQueueQuery {
+    /// `new` | `single` | `unparented` | `all` (default `new`).
+    #[serde(default = "default_review_filter")]
+    pub filter: String,
+    #[serde(default = "default_zero")]
+    pub offset: i64,
+    #[serde(default = "default_page_size")]
+    pub limit: i64,
+}
+
+fn default_review_filter() -> String {
+    "new".to_string()
+}
+fn default_zero() -> i64 {
+    0
+}
+fn default_page_size() -> i64 {
+    50
+}
+
+/// `GET /api/tags/review-queue` — unreviewed AI tags needing an admin
+/// decision (confirm / suppress / delete / nest). Reader can view; mutations
+/// are admin-only.
+pub async fn review_queue(
+    State(state): State<AppState>,
+    _user: AuthUser,
+    Query(q): Query<ReviewQueueQuery>,
+) -> ApiResult<Json<Value>> {
+    let conn = state.db.lock().await;
+    let (total, items) = db::review_queue(&conn, &q.filter, q.offset.max(0), q.limit.clamp(1, 100))
+        .map_err(ApiError::from)?;
+    Ok(Json(json!({ "total": total, "items": items })))
+}
+
+/// `POST /api/tags/{id}/review` — mark one tag as triaged (leaves the queue).
+pub async fn confirm_review(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<Value>> {
+    user.require_admin()?;
+    let conn = state.db.lock().await;
+    db::confirm_tag_reviewed(&conn, id).map_err(ApiError::from)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// `POST /api/tags/{id}/suppress` — stop auto-attaching this tag everywhere.
+pub async fn suppress(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<Value>> {
+    user.require_admin()?;
+    let conn = state.db.lock().await;
+    db::record_tag_dismissal(&conn, id).map_err(ApiError::from)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// `DELETE /api/tags/{id}/suppress` — restore a suppressed tag.
+pub async fn unsuppress(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<Value>> {
+    user.require_admin()?;
+    let conn = state.db.lock().await;
+    db::unsuppress_tag(&conn, id).map_err(ApiError::from)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+pub struct SuppressedQuery {
+    #[serde(default = "default_zero")]
+    pub offset: i64,
+    #[serde(default = "default_page_size")]
+    pub limit: i64,
+}
+
+/// `GET /api/tags/suppressed` — tags readers dismissed (or an admin blocked);
+/// the restore surface for the feedback loop.
+pub async fn suppressed_list(
+    State(state): State<AppState>,
+    _user: AuthUser,
+    Query(q): Query<SuppressedQuery>,
+) -> ApiResult<Json<Value>> {
+    let conn = state.db.lock().await;
+    let (total, items) =
+        db::list_suppressed_tags(&conn, q.offset.max(0), q.limit.clamp(1, 100))
+            .map_err(ApiError::from)?;
+    Ok(Json(json!({ "total": total, "items": items })))
+}
+
+/// `POST /api/tags/{id}/hierarchy` — manual nesting / type edit from the tag
+/// management UI. `parentName` may be a topic name (already existing in the
+/// tag's own vocabulary) or JSON `null` to detach; omitting it leaves the
+/// parent untouched. `tagType` is `"entity"` | `"topic"` | `null` (clear).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HierarchyBody {
+    /// `None` = leave the parent as-is; `Some(None)` = clear it;
+    /// `Some(Some(name))` = nest under that topic.
+    #[serde(default)]
+    pub parent_name: Option<Option<String>>,
+    #[serde(default)]
+    pub tag_type: Option<Option<String>>,
+    /// L1 domain: `Some(Some(name))` sets, `Some(None)` clears.
+    #[serde(default)]
+    pub domain: Option<Option<String>>,
+}
+
+pub async fn set_hierarchy(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+    Json(body): Json<HierarchyBody>,
+) -> ApiResult<Json<Value>> {
+    user.require_admin()?;
+    let conn = state.db.lock().await;
+
+    let kind = db::tag_kind(&conn, id)
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::from(AppError::code("tagNotFound")))?;
+
+    if let Some(ty) = &body.tag_type {
+        db::set_tag_type(&conn, id, ty.as_deref()).map_err(ApiError::from)?;
+    }
+    if let Some(dom) = &body.domain {
+        db::set_tag_domain(&conn, id, dom.as_deref()).map_err(ApiError::from)?;
+    }
+    if let Some(parent) = &body.parent_name {
+        match parent {
+            None => db::set_tag_parent(&conn, id, None).map_err(ApiError::from)?,
+            Some(name) => {
+                let parent_id = db::find_tag_id_by_name(&conn, &kind, name)
+                    .map_err(ApiError::from)?
+                    .ok_or_else(|| ApiError::from(AppError::code("tagNotFound")))?;
+                db::validate_tag_parent_link(&conn, id, parent_id).map_err(ApiError::from)?;
+                db::set_tag_parent(&conn, id, Some(parent_id)).map_err(ApiError::from)?;
+            }
+        }
+    }
     Ok(Json(json!({ "ok": true })))
 }
 

@@ -91,11 +91,19 @@ pub fn api_router() -> Router<AppState> {
         .route("/api/tags", get(tags::list).post(tags::create))
         .route(
             "/api/tags/{id}",
-            patch(tags::update).delete(tags::delete),
+            get(tags::get_one).patch(tags::update).delete(tags::delete),
         )
         .route("/api/tags/reorder", post(tags::reorder))
         .route("/api/tags/{id}/merge", post(tags::merge))
         .route("/api/tags/cleanup-empty", post(tags::cleanup_empty))
+        .route("/api/tags/review-queue", get(tags::review_queue))
+        .route("/api/tags/suppressed", get(tags::suppressed_list))
+        .route("/api/tags/{id}/review", post(tags::confirm_review))
+        .route(
+            "/api/tags/{id}/suppress",
+            post(tags::suppress).delete(tags::unsuppress),
+        )
+        .route("/api/tags/{id}/hierarchy", post(tags::set_hierarchy))
         .route(
             "/api/tags/aliases",
             get(tags::list_aliases).post(tags::create_alias),
