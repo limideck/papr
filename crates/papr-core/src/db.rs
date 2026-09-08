@@ -613,6 +613,24 @@ static MIGRATIONS: LazyLock<Migrations> = LazyLock::new(|| {
             ALTER TABLE tags ADD COLUMN domain TEXT;
             "#,
         ),
+        // v36 — interest-tag shelf definitions. An interest tag may carry a
+        // JSON "definition" (description / positive keywords / excluded
+        // keywords / linked AI-topic names). Auto-tag then deterministically
+        // attaches the interest tag to every article whose AI tags or text
+        // match the definition — turning a shelf like "AI、芯片及算力相关"
+        // into a reliable AI ∪ chips ∪ compute collection instead of a
+        // per-article LLM guess. NULL = unchanged LLM-chosen behaviour.
+        // Definition content is admin-owned; the UPDATE below only seeds the
+        // well-known shelf on installs that already carry the standard
+        // 14-topic interest list (fresh installs have no rows yet).
+        M::up(
+            r#"
+            ALTER TABLE tags ADD COLUMN definition TEXT;
+            UPDATE tags
+               SET definition = '{"description":"核心议题属于人工智能、芯片或半导体、算力或数据中心之一即可收录；仅顺带提及AI的泛科技或宏观文章不收。","keywords":["芯片","半导体","算力","人工智能","大模型","数据中心","智算","GPU","OpenAI","Anthropic","DeepSeek","Nvidia","TSMC","AI半導体","半導体"],"exclude":[],"aiTopics":["AI","artificial intelligence","AI模型","AI芯片","AI agents","AI infrastructure","AI safety","AI regulation","AI startup","semiconductors","半导体"]}'
+             WHERE kind = 'interest' AND name = 'AI、芯片及算力相关' AND definition IS NULL;
+            "#,
+        ),
     ])
 });
 

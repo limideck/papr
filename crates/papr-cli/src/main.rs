@@ -12,6 +12,7 @@ mod toon;
 use clap::{Parser, Subcommand};
 use papr_core::db;
 use papr_core::ingestion::{fetch, parse, refresh};
+use papr_core::interest_expand;
 use papr_core::models::ArticleQuery;
 use papr_core::sync;
 use papr_core::tag_taxonomy;
@@ -328,6 +329,11 @@ enum TagCmd {
     Tidy(TidyArgs),
     /// Apply a tidy plan from `papr tag tidy` (or an edited copy of one).
     Apply(ApplyArgs),
+    /// Deterministic interest shelves: attach interest tags that carry a
+    /// `tags.definition` rule (AI-family anchors + keywords) to every matching
+    /// article — history backfill for shelves like "AI、芯片及算力相关".
+    /// Dry-runs by default; pass `--apply --yes` to attach.
+    BackfillInterest(BackfillInterestArgs),
 }
 
 #[derive(clap::Args)]
@@ -368,6 +374,16 @@ struct ApplyArgs {
     #[arg(value_name = "PLAN_FILE")]
     file: String,
     /// Confirm this mutation.
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(clap::Args)]
+struct BackfillInterestArgs {
+    /// Attach the tags instead of just reporting what would be attached.
+    #[arg(long)]
+    apply: bool,
+    /// Required with --apply (mutates article_tags).
     #[arg(long)]
     yes: bool,
 }
@@ -1471,6 +1487,7 @@ async fn cmd_tag(path: &Path, cmd: TagCmd) -> Result<String, AxiError> {
         }
         TagCmd::Tidy(args) => cmd_tag_tidy(&conn, args).await,
         TagCmd::Apply(args) => cmd_tag_apply(&conn, args),
+        TagCmd::BackfillInterest(args) => cmd_tag_backfill_interest(&conn, args),
     }
 }
 
@@ -1590,6 +1607,37 @@ fn cmd_tag_apply(conn: &Connection, args: ApplyArgs) -> Result<String, AxiError>
         }),
     );
     d.help(vec!["Old spellings are pinned as aliases to prevent regrowth".into()]);
+    Ok(d.into_toon())
+}
+
+/// `papr tag backfill-interest` — apply interest-tag definitions to history.
+fn cmd_tag_backfill_interest(
+    conn: &Connection,
+    args: BackfillInterestArgs,
+) -> Result<String, AxiError> {
+    if args.apply {
+        require_yes(
+            args.yes,
+            "tag backfill-interest --apply",
+            "papr tag backfill-interest --apply --yes",
+        )?;
+    }
+    let report = interest_expand::backfill(conn, args.apply).map_err(db_err)?;
+    let mut d = Doc::new();
+    d.set(
+        "interestBackfill",
+        json!({
+            "rules": report.rules,
+            "applied": report.applied,
+            "distinctArticles": report.distinct_articles,
+            "wouldAdd": report.would_add,
+        }),
+    );
+    d.help(vec![
+        "Interest tags with a tags.definition rule are attached to every matching article".into(),
+        "Dry-run by default; attach with `papr tag backfill-interest --apply --yes`".into(),
+        "New articles keep getting these shelves via the auto-tag deterministic pass".into(),
+    ]);
     Ok(d.into_toon())
 }
 

@@ -1036,6 +1036,15 @@ pub async fn process_article(
         load_job_context(&conn, article_id)?
     };
 
+    // Deterministic interest shelves: tags with a definition attach by rule
+    // (AI-family anchor / keywords), independent of the LLM's per-article
+    // guesses — this is what keeps "AI、芯片及算力相关" covering AI ∪ chips ∪
+    // compute instead of whatever the model happened to pick.
+    if ctx.interest_on {
+        let conn = db.lock().await;
+        crate::interest_expand::attach_for_article(&conn, article_id)?;
+    }
+
     // Closed interest vocab with nothing configured: skip that path only.
     let run_interest = ctx.interest_on && !ctx.interest_names.is_empty();
     let run_ai = ctx.ai_on;

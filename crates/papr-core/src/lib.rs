@@ -16,6 +16,7 @@ pub mod db;
 pub mod error;
 pub mod extraction;
 pub mod ingestion;
+pub mod interest_expand;
 pub mod meili;
 pub mod models;
 pub mod opml;
