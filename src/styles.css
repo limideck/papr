@@ -4567,3 +4567,35 @@ button.tag-picker-chip-name:focus-visible {
 .tgm-btn:disabled{opacity:.5;cursor:default}
 .tgm-btn.primary{background:var(--accent,#3b82f6);border-color:transparent;color:#fff}
 .tgm-btn.danger{color:#b91c1c;border-color:#fca5a5}
+
+/* ── Tags toolbar row: keep controls from being crushed into vertical text ──
+   `.sb-tags-card-head .sb-section-actions > button` sizes every direct button
+   as a 22×22 icon square — including the text 「管理」, which then wraps into
+   stacked characters. Restore auto sizing for manage and let the head wrap
+   gracefully (items move to a second line instead of shrinking mid-glyph). */
+.sb-tags-card-head {
+  flex-wrap: wrap;
+  row-gap: 4px;
+}
+.sb-tags-card-head > span:first-child {
+  flex: none;
+  white-space: nowrap;
+}
+.sb-section-actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.sb-section-actions .sb-feed-sort button,
+.sb-tags-card-head .sb-section-actions > button.sb-manage-btn {
+  white-space: nowrap;
+  flex: none;
+}
+.sb-tags-card-head .sb-section-actions > button.sb-manage-btn {
+  width: auto;
+  height: auto;
+  padding: 3px 10px;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.4;
+  border-radius: 6px;
+}
