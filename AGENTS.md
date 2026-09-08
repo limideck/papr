@@ -46,6 +46,14 @@ cargo test -p papr-cli
   - `papr tag apply <PLAN_FILE|-> --yes` — 应用人工审核/编辑后的计划（`-` 从 stdin 读）。
 - 写入侧防复发：`auto_tag.rs::apply_ai_tags` 写入前先 `resolve_ai_tag_for_writing`（精确名/别名 → surface 变体扫描），命中复用已有 tag，只有真未知才 `create_tag`。
 
+### 反馈闭环（v34 迁移，`tag_suppressions` / review 队列）
+
+- v34 迁移：`tags.created_at`（新词判定）、`tags.reviewed_at`（已人工过目）、`tag_suppressions(tag_id PK, count, updated_at)`（对 tags 级联删除）。
+- 用户移除 AI 标签 → `routes/tags.rs::set_article_tag`(on=false, kind=ai) 记 `record_tag_dismissal`;显式重新加回（on=true）自动 `unsuppress_tag`。写侧 `apply_ai_tags` 命中被屏蔽 tag 直接跳过，prompt 复用列表（`load_job_context`）也剔除。
+- merge（`merge_tags` / `merge_tags_keep_alias`）把否定记录**转移到保留词**（`carry_suppression`），防合并后复发。
+- 治理端点（`routes/tags.rs` / `mod.rs`）：`GET /api/tags/review-queue`（filter=new/single/unparented/all，30 天新词默认）、`POST /api/tags/{id}/review`（确认）、`POST|DELETE /api/tags/{id}/suppress`、`GET /api/tags/suppressed`、`POST /api/tags/{id}/hierarchy`（改父级/类型，走 `validate_tag_parent_link`：同 kind、禁自父/三层/已有子级下挂/entity 作父）。
+- 前端：设置 → 标签管理新增「待确认」「已屏蔽」两个 tab；TagPicker 移除 AI 标签即时 toast（`tagPicker.aiDetached`）。侧栏 Tags tab 树状浏览：`GET /api/tags` 每 tag 带 `parentId`/`tagType`，带子级的 topic 可展开/收起（`papr.aiTagTreeCollapsed` 持久化）；**点击父级 = 列出子树文章**——`ArticleQuery::Tag` 的过滤含直接子级（`db.rs`/`user_db.rs` 两处 + `mark_all_read` 同语义），改过滤时三者要保持一致。
+
 ## 代码风格
 
 - Rust 2021，clap derive 定义 CLI，rusqlite + rusqlite_migration。

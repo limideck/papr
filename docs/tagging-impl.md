@@ -11,7 +11,7 @@
 | `interest` | 用户定义的**封闭兴趣词表** | 14 | 手工增删；模型只许"选"，不许造 |
 | `ai` | **自由生成**的打标词表 | ~32,772（清理 876 零使用后） | 模型可造新词，但写侧防碎片 + 定期治理 |
 
-标签结构（迁移 v30/v32）：`tags(name, color, position, kind)`、`tag_aliases(kind, alias → tag_id)`（旧拼写钉定，防复发）、`tags.parent_id`（**单父、最多两层**）+ `tags.tag_type`（`entity`/`topic`）。
+标签结构（迁移 v30/v32/v34）：`tags(name, color, position, kind, created_at, reviewed_at, parent_id, tag_type)`、`tag_aliases(kind, alias → tag_id)`（旧拼写钉定，防复发）、`tag_suppressions(tag_id, count)`（被用户否定的标签，自动打标跳过）、`tags.parent_id`（**单父、最多两层**）+ `tags.tag_type`（`entity`/`topic`）。
 
 ## 2. 触发与队列
 
@@ -80,6 +80,8 @@ AI 自由打标 + 模型每篇微调措辞 → 词表长尾：线上曾 33,810 A
 | 层 | 机制 | 位置 |
 | --- | --- | --- |
 | 写侧 | 别名 + 表面变体复用，杜绝复发 | `auto_tag.rs::apply_ai_tags` |
+| 反馈抑制 | 阅读中**移除 AI 标签 = 一次否定**：写侧跳过该标签（复用列表也剔除），管理员可恢复；merge 时否定记录随词合并到保留词 | `routes/tags.rs`（detach 落 `tag_suppressions`）、`db.rs`、`auto_tag.rs::apply_ai_tags` |
+| 待审队列 | 30 天内新建 / 仅 1 篇 / 未挂父级 entity 的 AI 标签进 **review 队列**，可确认（`reviewed_at`）、屏蔽、删除、挂父级/设类型 | `routes/tags.rs`（`/api/tags/review-queue`、`/review`、`/suppress`、`/hierarchy`）、`db.rs::review_queue` |
 | 确定性合并 | surface fold：case/标点/空格/连字符不敏感归并（`Middle East`≡`middle-east`），全词表零 LLM 成本 | `tag_taxonomy.rs::deterministic_groups` |
 | LLM 语义聚类 | 仅对 **≥min_count(3)** 的长尾分批（上限 800，60/批）问模型分组/层级，坏批跳过；`ai_usage` 记 `tag-tidy` | `tag_taxonomy.rs::build_plan` |
 | 落地 | `apply_plan`：`merge_tags_keep_alias`（旧拼写写 `tag_aliases`）+ 设 `parent_id`/`tag_type`；plan 可存 JSON、审阅、编辑、`papr tag apply plan.json` 重放（已验证本地/线上 1:1） | CLI `papr tag tidy` / `papr tag apply` |
@@ -90,11 +92,19 @@ AI 自由打标 + 模型每篇微调措辞 → 词表长尾：线上曾 33,810 A
 - 语义：`entity`（人/地/机构）挂到 `topic`（区域/主题）下，如 `伊朗(entity) → Middle East`、`Kenya → Africa`、`ChatGPT → artificial intelligence`。
 - 约束：**单父、两层深**（无孙级），所以"中东 → 伊朗 → 伊朗危机"放不下；事件类 topic 与实体分开挂。
 - 已应用：合并 179 标签、重指 700 关联、179 别名、402 层级/类型行（2026-09）。
-- 注意：**UI/API 目前仍是扁平列表**，不展示/编辑层级（数据层已就绪，展示未做）。
+- UI/API：`GET /api/tags` 的每个 tag 现携带 `parentId` / `tagType`；侧栏 Tags tab 按 **topic → entity 树**展示（父级可展开/收起，状态持久化）；**点击父级 = 列出该标签及其子级全部文章**（`ArticleQuery::Tag` 的 WHERE 含直接子级：`tag_id = ? OR tag_id IN (SELECT id FROM tags WHERE parent_id = ?)`，列表与 mark-all-read 共用同一语义）；review tab 可改类型/父级，`POST /api/tags/{id}/hierarchy` 做合法性校验（见 §4）。
 
 ### UI 侧（2026-09）
 
 AI 标签列表新增**最小使用数筛选**（`全部 / ≥1 / ≥5 / ≥10 / ≥20`，localStorage 持久化），避免长尾噪音淹没浏览；默认仍为"全部"。
+
+标签管理（设置 → 标签管理）新增两个 tab：
+- **待确认（review）**：默认近 30 天新建未过目的 AI 标签，可按 `新标签 / 仅 1 篇 / 未挂父级实体 / 全部` 切换；每行给出使用数与最近 2 条文章标题便于判断，动作 = 确认（`reviewed_at`，离开队列）/ 屏蔽 / 删除 / 改类型（entity/topic）/ 挂父级（输入已存在的 topic 名，留空回到顶层；entity 不能作父、两层深、已有子级的标签不能下挂——`db::validate_tag_parent_link`）。
+- **已屏蔽（suppressed）**：被否定的标签列表（含否定次数），一键恢复后写侧重新允许自动附上。
+
+侧栏 **Tags tab**：AI 标签按层级**树状展示**——带子级的 topic 顶层显示（默认展开，箭头可收起，`papr.aiTagTreeCollapsed` 持久化），其下缩进列出 entity/子标签；点击父级列出**整棵子树**的文章（列表 + 标记已读同语义），点击子级只看自身。当前选中的子标签若父级被收起会自动展开（同 folder reveal 逻辑）。子级行用小圆点弱化视觉，父级保留彩色 dot。
+
+阅读器里移除 AI 标签会即时提示"已记住，不再自动打"，可在上列 tab 恢复。
 
 ## 5. settings 速查（DB `settings` 表）
 
