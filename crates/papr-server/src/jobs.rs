@@ -84,10 +84,15 @@ async fn meili_sync_loop(state: AppState) {
             // pays for cold Meili-index reads plus cold SQLite page reads and
             // feels slow. Warm both caches once a minute (cheap probes, errors
             // ignored) so a real user search is always hot:
-            //  - an empty Meili search loads the index into working memory;
+            //  - several representative Meili searches (incl. CJK and
+            //    synonym-expanded terms, the slow-to-cold-load paths);
             //  - the recent-articles list read keeps the join + sort pages the
             //    UI list endpoints touch resident in the OS page cache.
-            let _ = papr_core::meili::search_ids(&state.http, &cfg, "", false, 5, 0).await;
+            const WARM_QUERIES: [&str; 6] =
+                ["", "tariff", "trump", "伊朗", "特朗普", "middle east"];
+            for q in WARM_QUERIES {
+                let _ = papr_core::meili::search_ids(&state.http, &cfg, q, false, 5, 0).await;
+            }
             {
                 let conn = state.db.lock().await;
                 let _ = conn.query_row(
@@ -333,16 +338,28 @@ async fn wordcloud_backfill_loop(state: AppState) {
             .wordcloud
             .with_dict(|dict| wordcloud::tokenize_backfill_batch(&rows, dict));
 
-        let conn = state.db.lock().await;
-        match wordcloud::write_backfill_batch(&conn, dict_version, &prepared) {
-            Ok(()) => {
-                tracing::info!(
-                    processed = prepared.len(),
-                    "wordcloud term backfill batch complete"
-                );
+        // The app uses one DB connection behind a single mutex, so every read
+        // request (lists / search / tag views) queues behind this writer while
+        // a batch transaction is open. Writing 64 rows in one lock-up made
+        // HTTP requests stall for hundreds of ms to seconds on busy boxes.
+        // Write in small chunks and yield between them so readers interleave.
+        const WRITE_CHUNK: usize = 8;
+        for chunk in prepared.chunks(WRITE_CHUNK) {
+            let conn = state.db.lock().await;
+            match wordcloud::write_backfill_batch(&conn, dict_version, chunk) {
+                Ok(()) => {}
+                Err(e) => {
+                    tracing::warn!("wordcloud backfill write failed: {e}");
+                    break;
+                }
             }
-            Err(e) => tracing::warn!("wordcloud backfill write failed: {e}"),
+            drop(conn);
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
+        tracing::info!(
+            processed = prepared.len(),
+            "wordcloud term backfill batch complete"
+        );
     }
 }
 

@@ -99,6 +99,8 @@ pub async fn list(
     user: AuthUser,
     Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<Value>> {
+    let debug_timing = std::env::var("PAPR_DEBUG_TIMING").is_ok();
+    let _t0 = std::time::Instant::now();
     let query = parse_article_query(q.kind.as_deref(), q.value);
     let search = q.search.as_deref().map(str::trim).filter(|s| !s.is_empty());
     // Meili engine: relevance-sorted free-text search only. Everything else
@@ -109,13 +111,21 @@ pub async fn list(
         && search.is_some()
         && meili::engine_is_meili(&*state.db.lock().await)
         && meili::meili_eligible(search.unwrap());
+    if debug_timing {
+        tracing::info!("list: eligibility={} t={:?}", use_meili, _t0.elapsed());
+    }
     let meili_ids: Option<Vec<i64>> = if use_meili {
         let cfg = meili::MeiliConfig::from_db(&*state.db.lock().await);
         if !cfg.enabled() {
             None
         } else {
             match meili::search_ids(&state.http, &cfg, search.unwrap(), true, 2000, 0).await {
-                Ok(ids) => Some(ids),
+                Ok(ids) => {
+                    if debug_timing {
+                        tracing::info!("list: meili ids={} t={:?}", ids.len(), _t0.elapsed());
+                    }
+                    Some(ids)
+                }
                 Err(e) => {
                     tracing::warn!("meili search failed, falling back to FTS: {e}");
                     None
@@ -126,8 +136,11 @@ pub async fn list(
         None
     };
     let conn = state.db.lock().await;
+    if debug_timing {
+        tracing::info!("list: db locked t={:?}", _t0.elapsed());
+    }
     let rows = if let Some(ids) = meili_ids {
-        user_db::list_articles_for_user_in_ids(
+        let rows = user_db::list_articles_for_user_in_ids(
             &conn,
             user.id(),
             &query,
@@ -135,7 +148,11 @@ pub async fn list(
             &ids,
             q.limit,
             q.offset,
-        )
+        );
+        if debug_timing {
+            tracing::info!("list: in_ids done t={:?}", _t0.elapsed());
+        }
+        rows
     } else {
         user_db::list_articles_for_user_sorted(
             &conn,
@@ -150,6 +167,9 @@ pub async fn list(
         )
     }
     .map_err(ApiError::from)?;
+    if debug_timing {
+        tracing::info!("list: total t={:?}", _t0.elapsed());
+    }
     Ok(Json(json!(rows)))
 }
 
