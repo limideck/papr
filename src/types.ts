@@ -202,6 +202,10 @@ export interface Tag {
   articleCount: number;
   /** Unread articles with this tag — used as the sidebar "update" count. */
   unreadCount?: number;
+  /** `entity` (person/place/org) | `topic` (abstract subject) — AI taxonomy. */
+  tagType?: "entity" | "topic" | null;
+  /** Broader parent topic id (`null`/missing = top level). */
+  parentId?: number | null;
 }
 
 /** Synonym → canonical tag mapping (Settings → Auto-tag → Aliases). */
@@ -212,6 +216,32 @@ export interface TagAlias {
   kind: TagKind | string;
   /** Canonical tag display name. */
   tagName: string;
+}
+
+/** One unreviewed AI tag from the governance queue (Settings → Auto-tag). */
+export interface ReviewQueueItem {
+  id: number;
+  name: string;
+  articleCount: number;
+  tagType?: "entity" | "topic" | null;
+  parentId?: number | null;
+  parentName?: string | null;
+  createdAt?: string | null;
+  /** Readers dismissed it (or an admin blocked it): auto-tag skips it. */
+  suppressed: boolean;
+  dismissals: number;
+  /** Recent article titles carrying the tag, to judge what it means. */
+  samples: string[];
+}
+
+/** One suppressed tag row (the restore surface of the feedback loop). */
+export interface SuppressedTagItem {
+  id: number;
+  name: string;
+  kind: TagKind | string;
+  articleCount: number;
+  dismissals: number;
+  suppressedAt: string;
 }
 
 export type RuleField = "title" | "author" | "content" | "any";

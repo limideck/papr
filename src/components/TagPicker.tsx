@@ -4,7 +4,7 @@ import { useTranslation } from "react-i18next";
 import * as api from "../api";
 import { useAuth } from "../auth";
 import { useDismiss } from "../hooks/useDismiss";
-import { reportError } from "../toast";
+import { reportError, toast } from "../toast";
 import { tagColor } from "../lib/tagColors";
 import { clampToViewport } from "../lib/viewport";
 import { NO_AUTOCORRECT } from "../lib/inputProps";
@@ -71,11 +71,17 @@ export default function TagPicker({
     qc.invalidateQueries({ queryKey: ["tags"] });
   };
 
-  const detach = (tagId: number) => {
+  const detach = (tag: Tag) => {
     if (!loggedIn) return;
     api
-      .setArticleTag(articleId, tagId, false)
-      .then(sync)
+      .setArticleTag(articleId, tag.id, false)
+      .then(() => {
+        sync();
+        // Dismissing an AI tag feeds the feedback loop: the server records a
+        // dismissal, so auto-tag skips this tag on future articles. Tell the
+        // reader it happened and where to undo it.
+        if (tag.kind === "ai") toast.show(t("tagPicker.aiDetached"));
+      })
       .catch((e) => reportError(e));
   };
 
@@ -167,7 +173,7 @@ export default function TagPicker({
                     <button
                       type="button"
                       className="tag-picker-chip-remove"
-                      onClick={() => detach(tag.id)}
+                      onClick={() => detach(tag)}
                       title={t("tagPicker.detach")}
                       aria-label={t("tagPicker.detach")}
                     >

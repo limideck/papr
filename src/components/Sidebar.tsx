@@ -15,6 +15,7 @@ import ContextMenu, { type MenuEntry } from "./ContextMenu";
 import FeedAvatar from "./FeedAvatar";
 import PromptDialog from "./PromptDialog";
 import WordCloudPanel from "./WordCloudPanel";
+import TagManageDialog from "./TagManageDialog";
 
 interface Props {
   onAddFeed: () => void;
@@ -242,6 +243,34 @@ export default function Sidebar({
   // filter lets the user view only tags that earn their row.
   const AI_MIN_COUNT_KEY = "papr.aiTagMinCount";
   const AI_MIN_COUNT_OPTIONS = [0, 1, 5, 10, 20];
+  // Tree view: parent tags whose child rows are collapsed. Empty = expanded
+  // (every parent with visible children shows its entities by default).
+  const AI_TREE_KEY = "papr.aiTagTreeCollapsed";
+  const [collapsedTags, setCollapsedTags] = useState<Set<number>>(() => {
+    try {
+      const arr = JSON.parse(localStorage.getItem(AI_TREE_KEY) ?? "[]");
+      return Array.isArray(arr)
+        ? new Set(arr.filter((n: unknown) => typeof n === "number"))
+        : new Set();
+    } catch {
+      return new Set();
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem(AI_TREE_KEY, JSON.stringify([...collapsedTags]));
+    } catch {
+      /* storage full/unavailable — the tree still works for this session */
+    }
+  }, [collapsedTags]);
+  const toggleTagTree = (id: number) => () => {
+    setCollapsedTags((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
   const [aiMinCount, setAiMinCount] = useState<number>(() => {
     try {
       const raw = parseInt(localStorage.getItem(AI_MIN_COUNT_KEY) ?? "0", 10);
@@ -253,6 +282,7 @@ export default function Sidebar({
   useEffect(() => {
     localStorage.setItem(AI_MIN_COUNT_KEY, String(aiMinCount));
   }, [aiMinCount]);
+  const [manageOpen, setManageOpen] = useState(false);
 
   const tagUnread = (tag: Tag) => tag.unreadCount ?? 0;
 
@@ -470,8 +500,46 @@ export default function Sidebar({
     () => sortTags(visibleAiTags),
     [visibleAiTags, tagSort],
   );
+  // Flatten the parent→child forest into display rows: each top-level tag is
+  // followed by its children (depth 1) unless collapsed; an expanded parent
+  // shows entities nested under its topic. Orphans (a child whose parent was
+  // filtered out by the usage floor) fall back to top-level rows so they
+  // never vanish from the list.
+  const aiTreeRows = useMemo(() => {
+    type TreeRow = {
+      tag: Tag;
+      depth: 0 | 1;
+      expandable: boolean;
+      expanded: boolean;
+    };
+    const rows: TreeRow[] = [];
+    const children = new Map<number, Tag[]>();
+    for (const t of sortedAiTags) {
+      if (t.parentId == null) continue;
+      const list = children.get(t.parentId);
+      if (list) list.push(t);
+      else children.set(t.parentId, [t]);
+    }
+    const inList = new Set(sortedAiTags.map((t) => t.id));
+    for (const t of sortedAiTags) {
+      if (t.parentId != null && inList.has(t.parentId)) {
+        // Emitted under its parent below (when expanded) — skip the dup row.
+        continue;
+      }
+      const kids = children.get(t.id);
+      const expandable = (kids?.length ?? 0) > 0;
+      const expanded = expandable && !collapsedTags.has(t.id);
+      rows.push({ tag: t, depth: 0, expandable, expanded });
+      if (expanded && kids) {
+        for (const c of kids) {
+          rows.push({ tag: c, depth: 1, expandable: false, expanded: false });
+        }
+      }
+    }
+    return rows;
+  }, [sortedAiTags, collapsedTags]);
   const tagsVirt = useVirtualizer({
-    count: sortedAiTags.length,
+    count: aiTreeRows.length,
     getScrollElement: () => tagsScrollRef.current,
     estimateSize: () => 28,
     overscan: 12,
@@ -506,6 +574,24 @@ export default function Sidebar({
     lastScrolledRef.current = key;
     activeFeedRef.current?.scrollIntoView({ block: "nearest" });
   }, [query, allFeeds, collapsed]);
+
+  // Reveal a collapsed parent when the selection is one of its children —
+  // otherwise the active row would be hidden under a collapsed topic (same
+  // idea as expanding a collapsed folder for the active feed).
+  useEffect(() => {
+    if (query.kind !== "tag") return;
+    const t = allTags.find((x) => x.id === query.value);
+    if (t?.parentId != null && collapsedTags.has(t.parentId)) {
+      setCollapsedTags((prev) => {
+        if (prev.has(t.parentId!)) {
+          const next = new Set(prev);
+          next.delete(t.parentId!);
+          return next;
+        }
+        return prev;
+      });
+    }
+  }, [query, allTags, collapsedTags]);
 
   // "Unread only" hides feeds with nothing unread, decluttering large
   // sidebars. The currently-selected feed is always kept so it doesn't vanish
@@ -846,10 +932,20 @@ export default function Sidebar({
     setListSearch(term);
   };
 
-  /** Tag row used on Feeds (preview) and Tags (full list, reorderable). */
+  /** Tag row used on Feeds (preview) and Tags (full list, tree view). */
   const tagRow = (
     tag: Tag,
-    opts: { reorderable: boolean; alwaysCount: boolean; showUnread?: boolean },
+    opts: {
+      reorderable: boolean;
+      alwaysCount: boolean;
+      showUnread?: boolean;
+      /** 1 = rendered as a child under an expanded parent topic. */
+      depth?: 0 | 1;
+      /** The tag has children and shows a collapse toggle. */
+      expandable?: boolean;
+      expanded?: boolean;
+      onToggleExpand?: () => void;
+    },
   ) => (
     <div
       key={tag.id}
@@ -857,7 +953,8 @@ export default function Sidebar({
         isActive({ kind: "tag", value: tag.id }) ? "active" : ""
       } ${opts.reorderable && tagDragId === tag.id ? "dragging" : ""} ${
         opts.reorderable && tagOverId === tag.id ? "drop-above" : ""
-      }`}
+      } ${opts.depth === 1 ? "sb-item-nested" : ""}`}
+      style={{ paddingLeft: 10 + (opts.depth ?? 0) * 18 }}
       role="button"
       tabIndex={0}
       aria-current={isActive({ kind: "tag", value: tag.id }) || undefined}
@@ -894,6 +991,25 @@ export default function Sidebar({
         setMenu({ x: e.clientX, y: e.clientY, kind: "tag", tag });
       }}
     >
+      {opts.expandable && (
+        <button
+          type="button"
+          className="sb-tree-toggle"
+          title={opts.expanded ? t("sidebar.tagCollapse") : t("sidebar.tagExpand")}
+          aria-label={opts.expanded ? t("sidebar.tagCollapse") : t("sidebar.tagExpand")}
+          aria-expanded={opts.expanded}
+          onClick={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            opts.onToggleExpand?.();
+          }}
+        >
+          <Icon
+            name={opts.expanded ? "chevron-down" : "chevron-right"}
+            size={11}
+          />
+        </button>
+      )}
       <span className="sb-ico">
         <span
           className="tag-dot"
@@ -1026,9 +1142,19 @@ export default function Sidebar({
                     </option>
                   ))}
                 </select>
+                <span className="sb-feed-sort-sep" aria-hidden="true">·</span>
+                <button
+                  type="button"
+                  className="sb-manage-btn"
+                  title={t("sidebar.tagManageTitle")}
+                  aria-label={t("sidebar.tagManageTitle")}
+                  onClick={() => setManageOpen(true)}
+                >
+                  {t("sidebar.tagManage")}
+                </button>
               </span>
             </div>
-            {sortedAiTags.length === 0 ? (
+            {aiTreeRows.length === 0 ? (
               <div className="sb-tags-empty">
                 {aiTags.length === 0
                   ? t("sidebar.aiTagsEmptyHint")
@@ -1043,10 +1169,10 @@ export default function Sidebar({
                 }}
               >
                 {tagsVirt.getVirtualItems().map((vi) => {
-                  const tag = sortedAiTags[vi.index];
+                  const row = aiTreeRows[vi.index];
                   return (
                     <div
-                      key={tag.id}
+                      key={row.tag.id}
                       style={{
                         position: "absolute",
                         top: 0,
@@ -1055,12 +1181,16 @@ export default function Sidebar({
                         transform: `translateY(${vi.start}px)`,
                       }}
                     >
-                      {tagRow(tag, {
+                      {tagRow(row.tag, {
                         // Client-side sort owns display order; drag-reorder
                         // would fight the selected mode (same idea as Feeds).
                         reorderable: false,
                         alwaysCount: true,
                         showUnread: true,
+                        depth: row.depth,
+                        expandable: row.expandable,
+                        expanded: row.expanded,
+                        onToggleExpand: toggleTagTree(row.tag.id),
                       })}
                     </div>
                   );
@@ -1474,6 +1604,7 @@ export default function Sidebar({
           onClose={() => setPrompt(null)}
         />
       )}
+      <TagManageDialog open={manageOpen} onClose={() => setManageOpen(false)} />
     </div>
   );
 }

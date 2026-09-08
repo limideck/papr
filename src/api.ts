@@ -24,6 +24,7 @@ import type {
   NewsletterInput,
   NewsletterSource,
   RefreshProgress,
+  ReviewQueueItem,
   Rule,
   RuleAction,
   RuleField,
@@ -31,6 +32,7 @@ import type {
   SessionUser,
   SmartCounts,
   StatsOverview,
+  SuppressedTagItem,
   Tag,
   TagAlias,
   TagKind,
@@ -614,6 +616,55 @@ export const renameTagAlias = (id: number, alias: string) =>
   });
 export const deleteTagAlias = (id: number) =>
   apiJson<void>(`${API}/tags/aliases/${id}`, { method: "DELETE" });
+
+// ── tag governance: review queue / suppression (feedback loop) ──
+
+export type ReviewFilter = "new" | "single" | "unparented" | "all";
+
+/** Unreviewed AI tags needing an admin decision (confirm / delete / nest). */
+export const reviewQueue = (filter: ReviewFilter, offset = 0, limit = 50) =>
+  apiJson<{ total: number; items: ReviewQueueItem[] }>(
+    `${API}/tags/review-queue${qs({ filter, offset, limit })}`,
+  );
+/** Mark one tag as triaged — it leaves the review queue. */
+export const confirmReviewTag = (id: number) =>
+  apiJson<void>(`${API}/tags/${id}/review`, { method: "POST" });
+/** Stop auto-attaching a tag anywhere (admin). */
+export const suppressTag = (id: number) =>
+  apiJson<void>(`${API}/tags/${id}/suppress`, { method: "POST" });
+/** Restore a suppressed tag (admin). */
+export const unsuppressTag = (id: number) =>
+  apiJson<void>(`${API}/tags/${id}/suppress`, { method: "DELETE" });
+/** Suppressed tags with dismissal counts — the restore surface. */
+export const listSuppressedTags = (offset = 0, limit = 50) =>
+  apiJson<{ total: number; items: SuppressedTagItem[] }>(
+    `${API}/tags/suppressed${qs({ offset, limit })}`,
+  );
+/** Manual nesting / type edit: `parentName` null clears, missing keeps. */
+export const setTagHierarchy = (
+  id: number,
+  body: {
+    parentName?: string | null;
+    tagType?: "entity" | "topic" | null;
+    domain?: string | null;
+  },
+) =>
+  apiJson<void>(`${API}/tags/${id}/hierarchy`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+
+/** Single-tag admin info (type / parent / domain) for the management panel. */
+export interface TagAdminInfo {
+  id: number;
+  name: string;
+  tagType?: string | null;
+  parentId?: number | null;
+  parentName?: string | null;
+  domain?: string | null;
+}
+export const getTagAdmin = (id: number) =>
+  apiJson<TagAdminInfo>(`${API}/tags/${id}`);
 
 /** Run interest + AI auto-tag on one article (sync). Returns updated tags. */
 export const autoTagArticle = (articleId: number) =>

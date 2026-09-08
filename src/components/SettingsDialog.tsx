@@ -13,11 +13,9 @@ import { reportError } from "../toast";
 import { downloadFile } from "../lib/download";
 import { NO_AUTOCORRECT } from "../lib/inputProps";
 import { renderMarkdown } from "../lib/markdown";
-import type { Feed, Rule, RuleAction, RuleField, RulePreview, Tag, TagAlias } from "../types";
-import { tagColor, TAG_PALETTE } from "../lib/tagColors";
+import type { Feed, Rule, RuleAction, RuleField, RulePreview } from "../types";
 import Icon, { type IconName } from "./Icon";
 import ConfirmDialog from "./ConfirmDialog";
-import PromptDialog from "./PromptDialog";
 import FeedAvatar from "./FeedAvatar";
 import FeedSourcesAdmin from "./FeedSourcesAdmin";
 import WordCloudConfigAdmin from "./WordCloudConfigAdmin";
@@ -2531,54 +2529,6 @@ function UsersSection({ onToast }: { onToast: (m: string) => void }) {
 }
 
 /* ── tag management: AI tags | interest tags (admin) ─────── */
-const TAG_LIST_PAGE_SIZE = 20;
-
-type TagSortMode = "alpha" | "count" | "unread";
-type TagSortDir = "asc" | "desc";
-
-function defaultTagSortDir(mode: TagSortMode): TagSortDir {
-  return mode === "alpha" ? "asc" : "desc";
-}
-
-function tagUnreadCount(tag: Tag): number {
-  return tag.unreadCount ?? 0;
-}
-
-function sortTagsList(
-  list: Tag[],
-  mode: TagSortMode,
-  dir: TagSortDir,
-): Tag[] {
-  const sorted = [...list];
-  const mul = dir === "asc" ? 1 : -1;
-  if (mode === "alpha") {
-    sorted.sort(
-      (a, b) =>
-        mul *
-        a.name.localeCompare(b.name, undefined, { sensitivity: "base" }),
-    );
-  } else if (mode === "count") {
-    sorted.sort((a, b) => {
-      const byCount = (a.articleCount - b.articleCount) * mul;
-      if (byCount !== 0) return byCount;
-      return a.name.localeCompare(b.name, undefined, {
-        sensitivity: "base",
-      });
-    });
-  } else {
-    sorted.sort((a, b) => {
-      const byUnread = (tagUnreadCount(a) - tagUnreadCount(b)) * mul;
-      if (byUnread !== 0) return byUnread;
-      const byCount = b.articleCount - a.articleCount;
-      if (byCount !== 0) return byCount;
-      return a.name.localeCompare(b.name, undefined, {
-        sensitivity: "base",
-      });
-    });
-  }
-  return sorted;
-}
-
 const STATS_DAILY_DAYS = 30;
 
 function StatsSection() {
@@ -2686,10 +2636,9 @@ function StatsSection() {
   );
 }
 
+/** Rows per page in the review / suppressed tag lists. */
 function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
   const { t } = useTranslation();
-  const qc = useQueryClient();
-  const [tab, setTab] = useState<"ai" | "interest" | "aliases">("ai");
   const [interestEnabled, setInterestEnabled] = useState(false);
   const [aiEnabled, setAiEnabled] = useState(false);
   const [interestMax, setInterestMax] = useState(5);
@@ -2700,39 +2649,7 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
   const [clearBusy, setClearBusy] = useState(false);
   const [confirmClearQueue, setConfirmClearQueue] = useState(false);
   const [statusError, setStatusError] = useState(false);
-  const [prompt, setPrompt] = useState<{
-    title: string;
-    initial: string;
-    onSubmit: (v: string) => void;
-  } | null>(null);
-  const [confirmDelete, setConfirmDelete] = useState<Tag | null>(null);
-  const [confirmCleanupEmpty, setConfirmCleanupEmpty] = useState(false);
-  const [cleanupBusy, setCleanupBusy] = useState(false);
-  // Tag merge: pick a source tag, then search the same-kind vocabulary for a
-  // canonical target. Used to repair AI-taxonomy fragmentation (one topic
-  // split across dozens of near-synonym tags).
-  const [mergeSource, setMergeSource] = useState<Tag | null>(null);
-  const [mergeQuery, setMergeQuery] = useState("");
-  const [mergeCandidates, setMergeCandidates] = useState<Tag[]>([]);
-  const [mergeTarget, setMergeTarget] = useState<Tag | null>(null);
-  const [mergeBusy, setMergeBusy] = useState(false);
-  const [tagSort, setTagSort] = useState<{
-    mode: TagSortMode;
-    dir: TagSortDir;
-  }>({ mode: "unread", dir: "desc" });
-  const [page, setPage] = useState(0);
-  const [aliasTagId, setAliasTagId] = useState<number | "">("");
-  const [aliasDraft, setAliasDraft] = useState("");
-  const [aliasFilter, setAliasFilter] = useState("");
-  const [confirmDeleteAlias, setConfirmDeleteAlias] = useState<TagAlias | null>(
-    null,
-  );
 
-  const tags = useQuery({ queryKey: ["tags"], queryFn: () => api.listTags() });
-  const aliases = useQuery({
-    queryKey: ["tag-aliases", "interest"],
-    queryFn: () => api.listTagAliases({ kind: "interest" }),
-  });
   const status = useQuery({
     queryKey: ["auto-tag-status", backfillDays],
     queryFn: () => api.getAutoTagStatus(backfillDays),
@@ -2761,166 +2678,11 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
       .catch(() => {});
   }, []);
 
-  const refreshTags = () => {
-    void qc.invalidateQueries({ queryKey: ["tags"] });
-  };
-
-  const refreshAliases = () => {
-    void qc.invalidateQueries({ queryKey: ["tag-aliases"] });
-  };
-
   const saveSetting = (key: string, value: string) => {
     api
       .setSetting(key, value)
       .then(() => onToast(t("settings.autoTag.saved")))
       .catch((e) => reportError(e));
-  };
-
-  const createInterestTag = () =>
-    setPrompt({
-      title: t("settings.autoTag.newTag"),
-      initial: "",
-      onSubmit: (v) => {
-        api
-          .createTag(v, "interest")
-          .then(() => {
-            refreshTags();
-            onToast(t("settings.autoTag.tagCreated"));
-          })
-          .catch((e) => reportError(e));
-      },
-    });
-
-  const renameTag = (tag: Tag) =>
-    setPrompt({
-      title:
-        tag.kind === "ai"
-          ? t("settings.autoTag.renameAiTag")
-          : t("settings.autoTag.renameTag"),
-      initial: tag.name,
-      onSubmit: (v) => {
-        api
-          .renameTag(tag.id, v)
-          .then(() => {
-            refreshTags();
-            refreshAliases();
-            onToast(
-              tag.kind === "ai"
-                ? t("settings.autoTag.aiTagRenamed")
-                : t("settings.autoTag.tagRenamed"),
-            );
-          })
-          .catch((e) => reportError(e));
-      },
-    });
-
-  const recolorTag = (tag: Tag, color: string) => {
-    api
-      .setTagColor(tag.id, color)
-      .then(() => refreshTags())
-      .catch((e) => reportError(e));
-  };
-
-  const removeTag = async (tag: Tag) => {
-    try {
-      await api.deleteTag(tag.id);
-      refreshTags();
-      refreshAliases();
-      onToast(
-        tag.kind === "ai"
-          ? t("settings.autoTag.aiTagDeleted")
-          : t("settings.autoTag.tagDeleted"),
-      );
-    } catch (e) {
-      reportError(e);
-    } finally {
-      setConfirmDelete(null);
-    }
-  };
-
-  // Open the merge picker: load the whole same-kind vocabulary once and let
-  // the admin search for a canonical target (e.g. merge 中东 → Middle East).
-  const openMerge = async (tag: Tag) => {
-    setMergeSource(tag);
-    setMergeQuery("");
-    setMergeTarget(null);
-    try {
-      const all = await api.listTags(tag.kind as "ai" | "interest");
-      setMergeCandidates(all.filter((t) => t.id !== tag.id));
-    } catch (e) {
-      reportError(e);
-      setMergeSource(null);
-    }
-  };
-
-  const runMerge = async () => {
-    if (!mergeSource || !mergeTarget) return;
-    setMergeBusy(true);
-    try {
-      const res = await api.mergeTags(mergeSource.id, mergeTarget.id);
-      refreshTags();
-      onToast(
-        t("settings.autoTag.mergeDone", {
-          from: mergeSource.name,
-          to: mergeTarget.name,
-          count: res.moved,
-        }),
-      );
-      setMergeSource(null);
-    } catch (e) {
-      reportError(e);
-    } finally {
-      setMergeBusy(false);
-      setMergeTarget(null);
-    }
-  };
-
-  // Candidates matching the query, most-used first, capped for the picker.
-  const mergeMatches = mergeCandidates
-    .filter((t) => {
-      const q = mergeQuery.trim().toLowerCase();
-      return !q || t.name.toLowerCase().includes(q);
-    })
-    .sort((a, b) => b.articleCount - a.articleCount)
-    .slice(0, 50);
-
-  const addAlias = async () => {
-    const alias = aliasDraft.trim();
-    if (aliasTagId === "" || !alias) return;
-    try {
-      await api.createTagAlias(aliasTagId, alias);
-      setAliasDraft("");
-      refreshAliases();
-      onToast(t("settings.autoTag.aliasCreated"));
-    } catch (e) {
-      reportError(e);
-    }
-  };
-
-  const removeAlias = async (row: TagAlias) => {
-    try {
-      await api.deleteTagAlias(row.id);
-      refreshAliases();
-      onToast(t("settings.autoTag.aliasDeleted"));
-    } catch (e) {
-      reportError(e);
-    } finally {
-      setConfirmDeleteAlias(null);
-    }
-  };
-
-  const cleanupEmptyAiTags = async () => {
-    setCleanupBusy(true);
-    try {
-      const res = await api.cleanupEmptyTags("ai");
-      refreshTags();
-      onToast(t("settings.autoTag.cleanupEmptyDone", { count: res.deleted }));
-    } catch (e) {
-      reportError(e);
-    } finally {
-      setCleanupBusy(false);
-      setConfirmCleanupEmpty(false);
-    }
   };
 
   const runBackfill = async () => {
@@ -2958,460 +2720,84 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
     }
   };
 
-  const setTagSortMode = (mode: TagSortMode) => {
-    setTagSort((prev) =>
-      prev.mode === mode
-        ? { mode, dir: prev.dir === "asc" ? "desc" : "asc" }
-        : { mode, dir: defaultTagSortDir(mode) },
-    );
-    setPage(0);
-  };
-
-  const switchTab = (next: "ai" | "interest" | "aliases") => {
-    setTab(next);
-    setPage(0);
-  };
-
   const st = status.data;
-  const allTags = tags.data ?? [];
-  const interestList = allTags.filter(
-    (tg) => (tg.kind ?? "interest") === "interest",
-  );
-  const aiList = allTags.filter((tg) => tg.kind === "ai");
-  const emptyAiCount = aiList.filter((tg) => (tg.articleCount ?? 0) === 0)
-    .length;
-  const activeList = tab === "ai" ? aiList : interestList;
-  const sortedList = sortTagsList(activeList, tagSort.mode, tagSort.dir);
-  const totalPages = Math.max(
-    1,
-    Math.ceil(sortedList.length / TAG_LIST_PAGE_SIZE),
-  );
-  const safePage = Math.min(page, totalPages - 1);
-  const pageList = sortedList.slice(
-    safePage * TAG_LIST_PAGE_SIZE,
-    (safePage + 1) * TAG_LIST_PAGE_SIZE,
-  );
-
-  const aliasRows = aliases.data ?? [];
-  const aliasFilterNorm = aliasFilter.trim().toLowerCase();
-  const filteredAliases = aliasFilterNorm
-    ? aliasRows.filter(
-        (a) =>
-          a.alias.toLowerCase().includes(aliasFilterNorm) ||
-          a.tagName.toLowerCase().includes(aliasFilterNorm),
-      )
-    : aliasRows;
-
-  // After delete (or other list shrinks), pull back if the current page
-  // would be empty past the last page.
-  useEffect(() => {
-    if (page !== safePage) setPage(safePage);
-  }, [page, safePage]);
-
-  // Prefer a valid interest tag once the vocabulary loads.
-  useEffect(() => {
-    if (aliasTagId !== "") return;
-    const first = interestList[0];
-    if (first) setAliasTagId(first.id);
-  }, [aliasTagId, interestList]);
-
-  const renderTagRows = (emptyKey: string, allowCreate: boolean) => (
-    <div className="settings-group">
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "space-between",
-          gap: 12,
-          marginBottom: 8,
-        }}
-      >
-        <div>
-          <h3 className="settings-group-title" style={{ margin: 0 }}>
-            {tab === "ai"
-              ? t("settings.autoTag.aiVocabulary")
-              : t("settings.autoTag.vocabulary")}
-          </h3>
-          <p className="settings-group-desc" style={{ margin: "4px 0 0" }}>
-            {tab === "ai"
-              ? t("settings.autoTag.aiVocabularyDesc")
-              : t("settings.autoTag.vocabularyDesc")}
-          </p>
-        </div>
-        <div className="s-tag-list-actions">
-          {sortedList.length > 0 && (
-            <span
-              className="s-tag-sort"
-              role="group"
-              aria-label={t("settings.autoTag.sortBy")}
-            >
-              <button
-                type="button"
-                className={tagSort.mode === "alpha" ? "active" : ""}
-                onClick={() => setTagSortMode("alpha")}
-                aria-pressed={tagSort.mode === "alpha"}
-                title={t("settings.autoTag.sortAlphaHint")}
-              >
-                {tagSort.mode === "alpha" && tagSort.dir === "desc"
-                  ? "Z-A ↓"
-                  : "A-Z ↑"}
-              </button>
-              <span className="s-tag-sort-sep" aria-hidden="true">
-                ·
-              </span>
-              <button
-                type="button"
-                className={tagSort.mode === "count" ? "active" : ""}
-                onClick={() => setTagSortMode("count")}
-                aria-pressed={tagSort.mode === "count"}
-                title={t("settings.autoTag.sortCountHint")}
-              >
-                {t("settings.autoTag.sortCount")}{" "}
-                {tagSort.mode === "count" && tagSort.dir === "asc" ? "↑" : "↓"}
-              </button>
-              <span className="s-tag-sort-sep" aria-hidden="true">
-                ·
-              </span>
-              <button
-                type="button"
-                className={tagSort.mode === "unread" ? "active" : ""}
-                onClick={() => setTagSortMode("unread")}
-                aria-pressed={tagSort.mode === "unread"}
-                title={t("settings.autoTag.sortUpdatesHint")}
-              >
-                {t("settings.autoTag.sortUpdates")}{" "}
-                {tagSort.mode === "unread" && tagSort.dir === "asc" ? "↑" : "↓"}
-              </button>
-            </span>
-          )}
-          {/* Always visible on AI tab — never gate on client empty count. */}
-          {tab === "ai" && (
-            <button
-              className="s-btn danger"
-              type="button"
-              disabled={cleanupBusy}
-              onClick={() => setConfirmCleanupEmpty(true)}
-              title={t("settings.autoTag.cleanupEmptyHint")}
-            >
-              {t("settings.autoTag.cleanupEmpty")}
-            </button>
-          )}
-          {allowCreate && (
-            <button
-              className="s-btn primary"
-              type="button"
-              onClick={createInterestTag}
-            >
-              <Icon name="plus" size={12} /> {t("common.add")}
-            </button>
-          )}
-        </div>
-      </div>
-      {sortedList.length === 0 ? (
-        <p className="settings-group-desc">{t(emptyKey)}</p>
-      ) : (
-        <>
-          <div className="s-interest-tags">
-            {pageList.map((tag) => (
-              <div key={tag.id} className="s-interest-tag-row">
-                <span
-                  className="s-interest-tag-dot"
-                  style={{ background: tagColor(tag.color) }}
-                  aria-hidden
-                />
-                <span className="s-interest-tag-name">{tag.name}</span>
-                <span className="s-interest-tag-count">
-                  {t("settings.autoTag.articleCountWithUnread", {
-                    total: tag.articleCount,
-                    unread: tagUnreadCount(tag),
-                  })}
-                </span>
-                <div className="s-interest-tag-swatches" role="group">
-                  {Object.entries(TAG_PALETTE).map(([key, color]) => (
-                    <button
-                      key={key}
-                      type="button"
-                      className={`s-interest-tag-swatch ${
-                        tag.color === key ? "on" : ""
-                      }`}
-                      style={{ background: color }}
-                      title={key}
-                      aria-label={key}
-                      aria-pressed={tag.color === key}
-                      onClick={() => recolorTag(tag, key)}
-                    />
-                  ))}
-                </div>
-                <button
-                  className="icon-btn"
-                  type="button"
-                  title={
-                    tag.kind === "ai"
-                      ? t("settings.autoTag.renameAiTag")
-                      : t("settings.autoTag.renameTag")
-                  }
-                  onClick={() => renameTag(tag)}
-                >
-                  <Icon name="settings" size={13} />
-                </button>
-                <button
-                  className="icon-btn"
-                  type="button"
-                  title={t("settings.autoTag.mergeTag")}
-                  onClick={() => void openMerge(tag)}
-                >
-                  <span aria-hidden>⇄</span>
-                </button>
-                <button
-                  className="icon-btn"
-                  type="button"
-                  title={t("common.delete")}
-                  onClick={() => setConfirmDelete(tag)}
-                >
-                  <Icon name="trash" size={13} />
-                </button>
-              </div>
-            ))}
-          </div>
-          {totalPages > 1 && (
-            <div className="s-tag-pager">
-              <span className="s-tag-pager-label">
-                {t("settings.autoTag.pageOf", {
-                  current: safePage + 1,
-                  total: totalPages,
-                })}
-              </span>
-              <button
-                type="button"
-                className="s-btn"
-                disabled={safePage <= 0}
-                onClick={() => setPage((p) => Math.max(0, p - 1))}
-                aria-label={t("settings.autoTag.prevPage")}
-              >
-                {t("settings.autoTag.prevPage")}
-              </button>
-              <button
-                type="button"
-                className="s-btn"
-                disabled={safePage >= totalPages - 1}
-                onClick={() =>
-                  setPage((p) => Math.min(totalPages - 1, p + 1))
-                }
-                aria-label={t("settings.autoTag.nextPage")}
-              >
-                {t("settings.autoTag.nextPage")}
-              </button>
-            </div>
-          )}
-        </>
-      )}
-    </div>
-  );
-
-  const renderAliases = () => (
-    <div className="settings-group">
-      <h3 className="settings-group-title" style={{ margin: 0 }}>
-        {t("settings.autoTag.aliases")}
-      </h3>
-      <p className="settings-group-desc" style={{ margin: "4px 0 12px" }}>
-        {t("settings.autoTag.aliasesDesc")}
-      </p>
-      {interestList.length === 0 ? (
-        <p className="settings-group-desc">
-          {t("settings.autoTag.aliasesNeedTags")}
-        </p>
-      ) : (
-        <>
-          <div className="s-alias-form">
-            <label className="s-alias-field">
-              <span>{t("settings.autoTag.aliasCanonical")}</span>
-              <select
-                className="s-text-input"
-                value={aliasTagId === "" ? "" : String(aliasTagId)}
-                onChange={(e) => {
-                  const v = e.target.value;
-                  setAliasTagId(v ? Number(v) : "");
-                }}
-              >
-                {interestList.map((tg) => (
-                  <option key={tg.id} value={tg.id}>
-                    {tg.name}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label className="s-alias-field s-alias-field-grow">
-              <span>{t("settings.autoTag.aliasName")}</span>
-              <input
-                className="s-text-input"
-                value={aliasDraft}
-                placeholder={t("settings.autoTag.aliasPlaceholder")}
-                onChange={(e) => setAliasDraft(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    e.preventDefault();
-                    void addAlias();
-                  }
-                }}
-                {...NO_AUTOCORRECT}
-              />
-            </label>
-            <button
-              className="s-btn primary"
-              type="button"
-              disabled={aliasTagId === "" || !aliasDraft.trim()}
-              onClick={() => void addAlias()}
-            >
-              <Icon name="plus" size={12} /> {t("common.add")}
-            </button>
-          </div>
-          {aliasRows.length > 0 && (
-            <input
-              className="s-text-input s-alias-filter"
-              value={aliasFilter}
-              placeholder={t("settings.autoTag.aliasFilter")}
-              onChange={(e) => setAliasFilter(e.target.value)}
-              {...NO_AUTOCORRECT}
-            />
-          )}
-          {filteredAliases.length === 0 ? (
-            <p className="settings-group-desc">
-              {aliasRows.length === 0
-                ? t("settings.autoTag.aliasesEmpty")
-                : t("settings.autoTag.aliasesFilterEmpty")}
-            </p>
-          ) : (
-            <div className="s-interest-tags">
-              {filteredAliases.map((row) => (
-                <div key={row.id} className="s-interest-tag-row">
-                  <span className="s-interest-tag-name">{row.alias}</span>
-                  <span className="s-interest-tag-count">
-                    → {row.tagName}
-                  </span>
-                  <button
-                    className="icon-btn"
-                    type="button"
-                    title={t("common.delete")}
-                    onClick={() => setConfirmDeleteAlias(row)}
-                  >
-                    <Icon name="trash" size={13} />
-                  </button>
-                </div>
-              ))}
-            </div>
-          )}
-        </>
-      )}
-    </div>
-  );
 
   return (
     <>
-      <div className="s-tag-mgmt-tabs" role="tablist">
-        <button
-          type="button"
-          role="tab"
-          aria-selected={tab === "ai"}
-          className={tab === "ai" ? "on" : ""}
-          onClick={() => switchTab("ai")}
-        >
-          {t("settings.autoTag.tabAi")}
-        </button>
-        <button
-          type="button"
-          role="tab"
-          aria-selected={tab === "interest"}
-          className={tab === "interest" ? "on" : ""}
-          onClick={() => switchTab("interest")}
-        >
-          {t("settings.autoTag.tabInterest")}
-        </button>
-        <button
-          type="button"
-          role="tab"
-          aria-selected={tab === "aliases"}
-          className={tab === "aliases" ? "on" : ""}
-          onClick={() => switchTab("aliases")}
-        >
-          {t("settings.autoTag.tabAliases")}
-        </button>
+      <div className="settings-group">
+        <h3 className="settings-group-title">{t("settings.autoTag.engine")}</h3>
+        <p className="settings-group-desc">{t("settings.autoTag.manageMoved")}</p>
       </div>
 
-      {tab === "ai" ? (
-        <>
-          {renderTagRows("settings.autoTag.aiVocabularyEmpty", false)}
-          <div className="settings-group">
-            <Row
-              label={t("settings.autoTag.aiEnabled")}
-              desc={t("settings.autoTag.aiEnabledDesc")}
-            >
-              <Toggle
-                checked={aiEnabled}
-                onChange={(on) => {
-                  setAiEnabled(on);
-                  saveSetting("ai_tag_enabled", on ? "1" : "0");
-                }}
-              />
-            </Row>
-            <Row
-              label={t("settings.autoTag.aiMaxTotal")}
-              desc={t("settings.autoTag.aiMaxTotalDesc")}
-            >
-              <input
-                className="s-text-input"
-                type="number"
-                min={1}
-                max={30}
-                value={aiMax}
-                onChange={(e) => setAiMax(Number(e.target.value) || 1)}
-                onBlur={() => {
-                  const v = clampSetting(String(aiMax), 5, 1, 30);
-                  setAiMax(v);
-                  saveSetting("ai_tag_max_tags_per_article", String(v));
-                }}
-              />
-            </Row>
-          </div>
-        </>
-      ) : tab === "interest" ? (
-        <>
-          {renderTagRows("settings.autoTag.vocabularyEmpty", true)}
-          <div className="settings-group">
-            <Row
-              label={t("settings.autoTag.enabled")}
-              desc={t("settings.autoTag.enabledDesc")}
-            >
-              <Toggle
-                checked={interestEnabled}
-                onChange={(on) => {
-                  setInterestEnabled(on);
-                  saveSetting("auto_tag_enabled", on ? "1" : "0");
-                }}
-              />
-            </Row>
-            <Row
-              label={t("settings.autoTag.maxTotal")}
-              desc={t("settings.autoTag.maxTotalDesc")}
-            >
-              <input
-                className="s-text-input"
-                type="number"
-                min={1}
-                max={30}
-                value={interestMax}
-                onChange={(e) => setInterestMax(Number(e.target.value) || 1)}
-                onBlur={() => {
-                  const v = clampSetting(String(interestMax), 5, 1, 30);
-                  setInterestMax(v);
-                  saveSetting("auto_tag_max_tags_per_article", String(v));
-                }}
-              />
-            </Row>
-          </div>
-        </>
-      ) : (
-        renderAliases()
-      )}
+      <div className="settings-group">
+        <h3 className="settings-group-title">{t("settings.autoTag.aiEngine")}</h3>
+        <Row
+          label={t("settings.autoTag.aiEnabled")}
+          desc={t("settings.autoTag.aiEnabledDesc")}
+        >
+          <Toggle
+            checked={aiEnabled}
+            onChange={(on) => {
+              setAiEnabled(on);
+              saveSetting("ai_tag_enabled", on ? "1" : "0");
+            }}
+          />
+        </Row>
+        <Row
+          label={t("settings.autoTag.aiMaxTotal")}
+          desc={t("settings.autoTag.aiMaxTotalDesc")}
+        >
+          <input
+            className="s-text-input"
+            type="number"
+            min={1}
+            max={30}
+            value={aiMax}
+            onChange={(e) => setAiMax(Number(e.target.value) || 1)}
+            onBlur={() => {
+              const v = clampSetting(String(aiMax), 5, 1, 30);
+              setAiMax(v);
+              saveSetting("ai_tag_max_tags_per_article", String(v));
+            }}
+          />
+        </Row>
+      </div>
+
+      <div className="settings-group">
+        <h3 className="settings-group-title">
+          {t("settings.autoTag.interestEngine")}
+        </h3>
+        <Row
+          label={t("settings.autoTag.enabled")}
+          desc={t("settings.autoTag.enabledDesc")}
+        >
+          <Toggle
+            checked={interestEnabled}
+            onChange={(on) => {
+              setInterestEnabled(on);
+              saveSetting("auto_tag_enabled", on ? "1" : "0");
+            }}
+          />
+        </Row>
+        <Row
+          label={t("settings.autoTag.maxTotal")}
+          desc={t("settings.autoTag.maxTotalDesc")}
+        >
+          <input
+            className="s-text-input"
+            type="number"
+            min={1}
+            max={30}
+            value={interestMax}
+            onChange={(e) => setInterestMax(Number(e.target.value) || 1)}
+            onBlur={() => {
+              const v = clampSetting(String(interestMax), 5, 1, 30);
+              setInterestMax(v);
+              saveSetting("auto_tag_max_tags_per_article", String(v));
+            }}
+          />
+        </Row>
+      </div>
 
       <div className="settings-group">
         <h3 className="settings-group-title">{t("settings.autoTag.queue")}</h3>
@@ -3432,9 +2818,7 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
               }}
             >
               {st.pending != null && (
-                <span>
-                  {t("settings.autoTag.pending", { count: st.pending })}
-                </span>
+                <span>{t("settings.autoTag.pending", { count: st.pending })}</span>
               )}
               {st.processing != null && (
                 <span>
@@ -3442,9 +2826,7 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
                 </span>
               )}
               {st.failed != null && (
-                <span>
-                  {t("settings.autoTag.failed", { count: st.failed })}
-                </span>
+                <span>{t("settings.autoTag.failed", { count: st.failed })}</span>
               )}
               {st.done != null && (
                 <span>{t("settings.autoTag.done", { count: st.done })}</span>
@@ -3468,9 +2850,7 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
 
       <div className="settings-group">
         <h3 className="settings-group-title">{t("settings.autoTag.backfill")}</h3>
-        <p className="settings-group-desc">
-          {t("settings.autoTag.backfillDesc")}
-        </p>
+        <p className="settings-group-desc">{t("settings.autoTag.backfillDesc")}</p>
         <Row
           label={t("settings.autoTag.backfillDays")}
           desc={t("settings.autoTag.backfillDaysHint")}
@@ -3492,10 +2872,7 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
               backfillDays === 0
                 ? "settings.autoTag.backfillWindowHintAll"
                 : "settings.autoTag.backfillWindowHint",
-              {
-                untagged: st.untaggedInWindow,
-                total: st.articlesInWindow,
-              },
+              { untagged: st.untaggedInWindow, total: st.articlesInWindow },
             )}
           </p>
         )}
@@ -3535,66 +2912,6 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
         </div>
       </div>
 
-      {prompt && (
-        <PromptDialog
-          title={prompt.title}
-          initialValue={prompt.initial}
-          placeholder={t("settings.autoTag.tagPlaceholder")}
-          onSubmit={(v) => {
-            prompt.onSubmit(v);
-            setPrompt(null);
-          }}
-          onClose={() => setPrompt(null)}
-        />
-      )}
-      {confirmDelete && (
-        <ConfirmDialog
-          title={
-            confirmDelete.kind === "ai"
-              ? t("settings.autoTag.deleteAiTag")
-              : t("settings.autoTag.deleteTag")
-          }
-          message={t(
-            confirmDelete.kind === "ai"
-              ? "settings.autoTag.deleteAiConfirm"
-              : "settings.autoTag.deleteConfirm",
-            { name: confirmDelete.name },
-          )}
-          confirmLabel={t("common.delete")}
-          danger
-          onConfirm={() => void removeTag(confirmDelete)}
-          onClose={() => setConfirmDelete(null)}
-        />
-      )}
-      {confirmDeleteAlias && (
-        <ConfirmDialog
-          title={t("settings.autoTag.deleteAlias")}
-          message={t("settings.autoTag.deleteAliasConfirm", {
-            alias: confirmDeleteAlias.alias,
-            tag: confirmDeleteAlias.tagName,
-          })}
-          confirmLabel={t("common.delete")}
-          danger
-          onConfirm={() => void removeAlias(confirmDeleteAlias)}
-          onClose={() => setConfirmDeleteAlias(null)}
-        />
-      )}
-      {confirmCleanupEmpty && (
-        <ConfirmDialog
-          title={t("settings.autoTag.cleanupEmpty")}
-          message={
-            emptyAiCount > 0
-              ? t("settings.autoTag.cleanupEmptyConfirm", {
-                  count: emptyAiCount,
-                })
-              : t("settings.autoTag.cleanupEmptyConfirmUnknown")
-          }
-          confirmLabel={t("settings.autoTag.cleanupEmpty")}
-          danger
-          onConfirm={() => void cleanupEmptyAiTags()}
-          onClose={() => setConfirmCleanupEmpty(false)}
-        />
-      )}
       {confirmClearQueue && (
         <ConfirmDialog
           title={t("settings.autoTag.clearQueue")}
@@ -3605,101 +2922,10 @@ function AutoTagSection({ onToast }: { onToast: (m: string) => void }) {
           onClose={() => setConfirmClearQueue(false)}
         />
       )}
-      {mergeSource && (
-        <div
-          className="modal-backdrop"
-          onClick={() => setMergeSource(null)}
-        >
-          <div
-            className="modal"
-            role="dialog"
-            aria-modal="true"
-            aria-label={t("settings.autoTag.mergeTitle", {
-              name: mergeSource.name,
-            })}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <h2>
-              {t("settings.autoTag.mergeTitle", { name: mergeSource.name })}
-            </h2>
-            <input
-              className="modal-input"
-              type="search"
-              value={mergeQuery}
-              autoFocus
-              placeholder={t("settings.autoTag.mergeSearchPlaceholder")}
-              aria-label={t("settings.autoTag.mergeSearchPlaceholder")}
-              onChange={(e) => setMergeQuery(e.target.value)}
-              style={{ marginTop: 8 }}
-            />
-            <div
-              className="s-interest-tags"
-              style={{ maxHeight: 260, overflowY: "auto", marginTop: 8 }}
-            >
-              {mergeMatches.length === 0 ? (
-                <p className="settings-group-desc">
-                  {t("settings.autoTag.mergeNoMatches")}
-                </p>
-              ) : (
-                mergeMatches.map((t) => (
-                  <div
-                    key={t.id}
-                    className="s-interest-tag-row"
-                    style={{ cursor: "pointer" }}
-                    role="button"
-                    tabIndex={0}
-                    onClick={() => setMergeTarget(t)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") setMergeTarget(t);
-                    }}
-                  >
-                    <span
-                      className="s-interest-tag-dot"
-                      style={{ background: tagColor(t.color) }}
-                      aria-hidden
-                    />
-                    <span className="s-interest-tag-name">{t.name}</span>
-                    <span className="s-interest-tag-count">
-                      {t.articleCount} 篇
-                    </span>
-                    {mergeTarget?.id === t.id && <Icon name="check" size={13} />}
-                  </div>
-                ))
-              )}
-            </div>
-            <div className="modal-actions">
-              <button
-                className="s-btn"
-                onClick={() => setMergeSource(null)}
-              >
-                {t("common.cancel")}
-              </button>
-              <button
-                className="s-btn primary"
-                disabled={!mergeTarget || mergeBusy}
-                onClick={() => void runMerge()}
-              >
-                {mergeBusy ? t("common.loading") : t("settings.autoTag.mergeTag")}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-      {mergeTarget && mergeSource && (
-        <ConfirmDialog
-          title={t("settings.autoTag.mergeConfirmTitle")}
-          message={t("settings.autoTag.mergeConfirmMessage", {
-            from: mergeSource.name,
-            to: mergeTarget.name,
-          })}
-          confirmLabel={t("settings.autoTag.mergeTag")}
-          onConfirm={() => void runMerge()}
-          onClose={() => setMergeTarget(null)}
-        />
-      )}
     </>
   );
 }
+
 
 /* ── filters ─────────────────────────────────────────────── */
 function FiltersSection({
