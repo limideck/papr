@@ -309,6 +309,15 @@ pub fn list_articles_for_user_sorted(
 /// (per-user `user_article_states` via `state_join`), so the UI treats both
 /// engines the same. Date / oldest-first sort requests are not expressible
 /// here — callers fall back to FTS for those.
+///
+/// Performance: candidate pools can be wide (up to the 2000-id Meili cap),
+/// and these ids are scattered across a large table whose rows embed full
+/// article text. Full-row materialisation over every candidate measured
+/// seconds on production, so this runs in two passes: a cheap pass that
+/// reads only `a.id` (+ the state/filter joins) across all candidates to
+/// determine which survive and where the page falls, then an expensive pass
+/// that materialises the preview rows (title/feed/snippet/state) — and
+/// tags — for just the requested page.
 pub fn list_articles_for_user_in_ids(
     conn: &Connection,
     user_id: i64,
@@ -323,35 +332,69 @@ pub fn list_articles_for_user_in_ids(
     }
     let (join_sql, join_bind) = state_join(user_id);
     let (where_clauses, binds) = article_filter_for_user(query, unread_only);
-    let order: std::collections::HashMap<i64, usize> = ids
-        .iter()
-        .enumerate()
-        .map(|(i, id)| (*id, i))
-        .collect();
+    let where_sql = if where_clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" AND {}", where_clauses.join(" AND "))
+    };
 
-    let base = format!(
-        "SELECT a.id, a.feed_id, f.title, f.source_type, a.title, a.author,
-                substr(a.body_text,1,{snippet_len}), a.image_url, a.url, a.published_at,
-                COALESCE(uas.is_read, 0), COALESCE(uas.is_starred, 0), COALESCE(uas.read_later, 0)
-         FROM articles a JOIN feeds f ON f.id = a.feed_id {join_sql} ",
-        snippet_len = PREVIEW_SNIPPET_CHARS,
-        join_sql = join_sql,
-    );
-    let mut collected: Vec<ArticleSummary> = Vec::new();
-    let mut collected_ids = std::collections::HashSet::new();
-    // Chunk the IN list to stay under SQLite's variable limit.
+    // Pass 1 — which candidates survive the per-user filters, in Meili order.
+    let mut surviving: Vec<i64> = Vec::new();
     for chunk in ids.chunks(400) {
         let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let mut sql = format!("{base} WHERE a.id IN ({placeholders})");
-        if !where_clauses.is_empty() {
-            sql.push_str(" AND ");
-            sql.push_str(&where_clauses.join(" AND "));
-        }
+        let sql = format!(
+            "SELECT a.id FROM articles a JOIN feeds f ON f.id = a.feed_id {join_sql}
+             WHERE a.id IN ({placeholders}){where_sql}",
+            join_sql = join_sql,
+        );
         let mut all = vec![join_bind.clone()];
         for id in chunk {
             all.push(Value::Integer(*id));
         }
         all.extend(binds.iter().cloned());
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(all), |r| r.get::<_, i64>(0))?;
+        for row in rows {
+            surviving.push(row?);
+        }
+    }
+    if surviving.is_empty() {
+        return Ok(Vec::new());
+    }
+    // `surviving` is already in Meili order (chunks preserved the input order
+    // and `ids` carried duplicates never occur); drop any repeats defensively.
+    surviving.dedup();
+
+    let total = surviving.len();
+    let start = (offset as usize).min(total);
+    let end = ((offset + limit) as usize).min(total);
+    if start >= end {
+        return Ok(Vec::new());
+    }
+    let page_ids = &surviving[start..end];
+
+    // Pass 2 — materialise the requested page only.
+    let order: std::collections::HashMap<i64, usize> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (*id, i))
+        .collect();
+    let mut page: Vec<ArticleSummary> = Vec::with_capacity(page_ids.len());
+    for chunk in page_ids.chunks(400) {
+        let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT a.id, a.feed_id, f.title, f.source_type, a.title, a.author,
+                    substr(a.body_text,1,{snippet_len}), a.image_url, a.url, a.published_at,
+                    COALESCE(uas.is_read, 0), COALESCE(uas.is_starred, 0), COALESCE(uas.read_later, 0)
+             FROM articles a JOIN feeds f ON f.id = a.feed_id {join_sql}
+             WHERE a.id IN ({placeholders})",
+            snippet_len = PREVIEW_SNIPPET_CHARS,
+            join_sql = join_sql,
+        );
+        let mut all = vec![join_bind.clone()];
+        for id in chunk {
+            all.push(Value::Integer(*id));
+        }
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
             .query_map(params_from_iter(all), |r| {
@@ -373,17 +416,9 @@ pub fn list_articles_for_user_in_ids(
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
-        for row in rows {
-            if collected_ids.insert(row.id) {
-                collected.push(row);
-            }
-        }
+        page.extend(rows);
     }
-    collected.sort_by_key(|r| order.get(&r.id).copied().unwrap_or(usize::MAX));
-    let total = collected.len();
-    let start = (offset as usize).min(total);
-    let end = ((offset + limit) as usize).min(total);
-    let mut page: Vec<ArticleSummary> = collected[start..end].to_vec();
+    page.sort_by_key(|r| order.get(&r.id).copied().unwrap_or(usize::MAX));
     attach_article_tags(conn, &mut page)?;
     Ok(page)
 }
