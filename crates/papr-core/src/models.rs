@@ -82,6 +82,22 @@ pub const TAG_KIND_INTEREST: &str = "interest";
 /// Free-form tags created/attached by AI from title + summary.
 pub const TAG_KIND_AI: &str = "ai";
 
+/// L1 domain vocabulary (tag-system design: Domain → Topic → Entity/Region).
+/// Single domain per tag; article-level cross-domain comes from multi-tag.
+/// English keys; frontend localises display names.
+pub const TAG_DOMAINS: [&str; 6] = [
+    "Economy",
+    "Finance",
+    "National Security",
+    "Geopolitics",
+    "Technology",
+    "Society",
+];
+
+pub fn valid_tag_domain(d: &str) -> bool {
+    TAG_DOMAINS.contains(&d)
+}
+
 /// A label that can be attached to any number of articles.
 ///
 /// Two taxonomies share the `tags` table, distinguished by [`Tag::kind`]:
@@ -103,6 +119,14 @@ pub struct Tag {
     /// Treated as the sidebar "update" count (new content waiting to be read).
     #[serde(default)]
     pub unread_count: i64,
+    /// `entity` (concrete person/place/org) | `topic` (abstract subject) —
+    /// the AI-taxonomy semantic type (v32). `None` = unclassified leaf.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag_type: Option<String>,
+    /// The broader topic/region this tag nests under (v32 single-parent,
+    /// two-level forest). `None` = top level.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<i64>,
 }
 
 /// Synonym that resolves to a canonical [`Tag`] during auto-tag matching.

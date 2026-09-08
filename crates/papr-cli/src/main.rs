@@ -344,12 +344,22 @@ struct TidyArgs {
     /// Tags per LLM batch.
     #[arg(long, default_value_t = 60)]
     batch_size: usize,
+    /// Auto-create level-1 parent topics. Hierarchy parents may then reference
+    /// any existing level-1 topic of the vocabulary, or propose brand-new ones
+    /// (created during apply). Without this flag, parents are limited to tags
+    /// in the same LLM batch, exactly as before.
+    #[arg(long)]
+    auto_parents: bool,
     /// Apply the plan immediately instead of printing it for review.
     #[arg(long)]
     apply: bool,
     /// Required with --apply (mutates tags).
     #[arg(long)]
     yes: bool,
+    /// Also write the generated plan as JSON to this file (default: printed
+    /// to stdout only). Handy for review/editing before `papr tag apply`.
+    #[arg(long, value_name = "PATH")]
+    plan_out: Option<PathBuf>,
 }
 
 #[derive(clap::Args)]
@@ -1487,6 +1497,7 @@ async fn cmd_tag_tidy(conn: &Connection, args: TidyArgs) -> Result<String, AxiEr
         args.min_count,
         args.max_tags,
         args.batch_size,
+        args.auto_parents,
     )
     .await
     .map_err(db_err)?;
@@ -1504,6 +1515,13 @@ async fn cmd_tag_tidy(conn: &Connection, args: TidyArgs) -> Result<String, AxiEr
         }),
     );
 
+    if let Some(p) = &args.plan_out {
+        let bytes = serde_json::to_vec_pretty(&plan)
+            .map_err(|e| AxiError::runtime(format!("serialize plan: {e}")))?;
+        std::fs::write(p, bytes)
+            .map_err(|e| AxiError::runtime(format!("write {}: {e}", p.display())))?;
+    }
+
     if args.apply {
         let report = tag_taxonomy::apply_plan(conn, &plan).map_err(db_err)?;
         d.set(
@@ -1513,6 +1531,7 @@ async fn cmd_tag_tidy(conn: &Connection, args: TidyArgs) -> Result<String, AxiEr
                 "mergedTags": report.merged_tags,
                 "articlesRepointed": report.articles_repointed,
                 "hierarchySet": report.hierarchy_set,
+                "parentsCreated": report.parents_created,
                 "aliasesPinned": report.aliases_pinned,
                 "skipped": report.skipped,
             }),

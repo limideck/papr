@@ -44,9 +44,19 @@ fn article_filter_for_user(
             binds.push(Value::Integer(*id));
         }
         ArticleQuery::Tag(id) => {
+            // Tag clicks include the tag's direct children (parent topic →
+            // nested entities), the per-user twin of `db::article_filter`.
+            // Two unnamed placeholders (one per subquery side): `state_join`
+            // above already occupies the first unnamed slot with the user id,
+            // so an explicit `?1` here collides with it and desyncs the later
+            // LIMIT/OFFSET numbering.
             where_clauses.push(
-                "a.id IN (SELECT article_id FROM article_tags WHERE tag_id = ?)".into(),
+                "a.id IN (SELECT at.article_id FROM article_tags at
+                           WHERE at.tag_id = ?
+                              OR at.tag_id IN (SELECT id FROM tags WHERE parent_id = ?))"
+                    .into(),
             );
+            binds.push(Value::Integer(*id));
             binds.push(Value::Integer(*id));
         }
     }
@@ -120,7 +130,8 @@ pub fn list_tags_for_user(
                    JOIN articles a ON a.id = at.article_id
                    LEFT JOIN user_article_states uas
                      ON uas.article_id = a.id AND uas.user_id = ?1
-                  WHERE at.tag_id = t.id AND COALESCE(uas.is_read, 0) = 0)
+                  WHERE at.tag_id = t.id AND COALESCE(uas.is_read, 0) = 0),
+                t.tag_type, t.parent_id
          FROM tags t WHERE t.kind = ?2
          ORDER BY t.position, t.name COLLATE NOCASE"
     } else {
@@ -130,7 +141,8 @@ pub fn list_tags_for_user(
                    JOIN articles a ON a.id = at.article_id
                    LEFT JOIN user_article_states uas
                      ON uas.article_id = a.id AND uas.user_id = ?1
-                  WHERE at.tag_id = t.id AND COALESCE(uas.is_read, 0) = 0)
+                  WHERE at.tag_id = t.id AND COALESCE(uas.is_read, 0) = 0),
+                t.tag_type, t.parent_id
          FROM tags t ORDER BY t.position, t.name COLLATE NOCASE"
     };
     let mut stmt = conn.prepare(sql)?;
@@ -144,6 +156,8 @@ pub fn list_tags_for_user(
                 kind: r.get(4)?,
                 article_count: r.get(5)?,
                 unread_count: r.get(6)?,
+                tag_type: r.get(7)?,
+                parent_id: r.get(8)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?
@@ -157,6 +171,8 @@ pub fn list_tags_for_user(
                 kind: r.get(4)?,
                 article_count: r.get(5)?,
                 unread_count: r.get(6)?,
+                tag_type: r.get(7)?,
+                parent_id: r.get(8)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?

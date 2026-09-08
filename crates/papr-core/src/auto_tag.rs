@@ -711,6 +711,12 @@ pub fn apply_ai_tags(
 ) -> AppResult<()> {
     let already = db::article_tag_count(conn, article_id, TAG_KIND_AI)?;
     let mut slots = (max_total - already).max(0);
+    // Reader-dismissed tags (removed from an article) must never be
+    // auto-attached again until an admin restores them — the feedback loop
+    // that stops the model re-pinning the same unwanted tag.
+    let suppressed: std::collections::HashSet<i64> = db::suppressed_tag_ids(conn, TAG_KIND_AI)?
+        .into_iter()
+        .collect();
 
     for name in suggested {
         if slots <= 0 {
@@ -719,8 +725,17 @@ pub fn apply_ai_tags(
         let Some(name) = normalize_tag_name(name) else {
             continue;
         };
-        let tag_id = resolve_ai_tag_for_writing(conn, &name)?
-            .unwrap_or_else(|| db::create_tag(conn, &name, TAG_KIND_AI).unwrap_or(0));
+        let tag_id = match resolve_ai_tag_for_writing(conn, &name)? {
+            // Resolved onto a dismissed tag → skip (do not attach, do not
+            // create). A suppressed tag always exists, so a genuinely new
+            // spelling can never collide with the suppression set.
+            Some(id) if suppressed.contains(&id) => {
+                log::debug!("auto-tag: skip suppressed AI tag {name} (tag #{id})");
+                continue;
+            }
+            Some(id) => id,
+            None => db::create_tag(conn, &name, TAG_KIND_AI).unwrap_or(0),
+        };
         if tag_id <= 0 {
             continue;
         }
@@ -868,7 +883,16 @@ fn load_job_context(conn: &Connection, article_id: i64) -> AppResult<JobContext>
     // (hot topics stay listed) against per-call cost (format rules added
     // ~10% tokens in the P0/P1 rework).
     let ai_cap = db::setting_parsed::<i64>(conn, "ai_tag_prompt_cap", 150).max(0);
-    let ai_names = db::top_tag_names(conn, TAG_KIND_AI, ai_cap)?;
+    let mut ai_names = db::top_tag_names(conn, TAG_KIND_AI, ai_cap)?;
+    // Reader-dismissed tags drop out of the reuse vocabulary too: showing them
+    // to the model would waste a tag slot on something the writer refuses.
+    if ai_cap > 0 {
+        let suppressed_names: std::collections::HashSet<String> =
+            db::suppressed_tag_names(conn, TAG_KIND_AI)?.into_iter().collect();
+        if !suppressed_names.is_empty() {
+            ai_names.retain(|n| !suppressed_names.contains(n));
+        }
+    }
     let cfg = AiConfig::new(
         db::get_setting(conn, "ai_provider")?,
         db::get_setting(conn, "ai_api_key")?,
@@ -1660,6 +1684,77 @@ Final: {"tags":["Rust","Go"]}"#;
                 .len(),
             1
         );
+
+        remove_temp_db(conn, path);
+    }
+
+    #[test]
+    fn apply_ai_tags_skips_suppressed_tags() {
+        let (conn, path) = temp_db();
+        let feed_id = db::insert_feed(
+            &conn,
+            "https://example.com/feed-sup.xml",
+            None,
+            "Example",
+            None,
+            SourceType::Rss,
+            None,
+        )
+        .unwrap();
+        let article = NewArticle {
+            guid: "gsup".into(),
+            url: Some("https://example.com/sup".into()),
+            title: "Fed".into(),
+            author: None,
+            summary: Some("Tags".into()),
+            content_html: None,
+            body_text: "Tags".into(),
+            image_url: None,
+            published_at: None,
+            enclosures: vec![],
+        };
+        assert!(db::upsert_article(&conn, feed_id, &article, false, &[]).unwrap());
+        let article_id: i64 = conn
+            .query_row("SELECT id FROM articles WHERE guid = 'gsup'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+
+        // "Federal Reserve" was dismissed by a reader → suppressed. OpenAI and
+        // a genuinely new spelling are free to attach.
+        let fed = db::create_tag(&conn, "Federal Reserve", TAG_KIND_AI).unwrap();
+        db::record_tag_dismissal(&conn, fed).unwrap();
+        db::create_tag(&conn, "OpenAI", TAG_KIND_AI).unwrap();
+
+        apply_ai_tags(
+            &conn,
+            article_id,
+            &[
+                "Federal Reserve".into(),
+                "OpenAI".into(),
+                "brand-new".into(),
+            ],
+            5,
+        )
+        .unwrap();
+
+        let attached = db::tags_for_article(&conn, article_id).unwrap();
+        assert!(
+            attached.iter().all(|t| t.id != fed),
+            "suppressed tag must not be auto-attached"
+        );
+        let names: Vec<String> = attached.iter().map(|t| t.name.clone()).collect();
+        assert!(names.contains(&"OpenAI".to_string()));
+        assert!(names.contains(&"brand-new".to_string()));
+        // No duplicate was created for the suppressed spelling either.
+        let fed_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tags WHERE kind = 'ai' AND name = 'Federal Reserve'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fed_count, 1);
 
         remove_temp_db(conn, path);
     }

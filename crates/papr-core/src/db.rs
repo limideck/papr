@@ -581,6 +581,38 @@ static MIGRATIONS: LazyLock<Migrations> = LazyLock::new(|| {
             END;
             "#,
         ),
+        // v34 — auto-tag feedback loop. When a reader removes an AI tag from
+        // an article we record a *dismissal* (`tag_suppressions`); the worker
+        // then never auto-attaches that tag to new articles again until an
+        // admin restores it (re-attaching it by hand clears the suppression).
+        // `tags.created_at` distinguishes brand-new tags (review queue "new"
+        // filter) from legacy rows; `tags.reviewed_at` marks a tag an admin has
+        // already triaged so the queue stays a finite review backlog. Additive
+        // only; legacy tags keep NULL created_at/reviewed_at (treated as
+        // "existing, unqueued"), the suppression table starts empty.
+        M::up(
+            r#"
+            ALTER TABLE tags ADD COLUMN created_at TEXT;
+            ALTER TABLE tags ADD COLUMN reviewed_at TEXT;
+            CREATE TABLE tag_suppressions (
+                tag_id     INTEGER PRIMARY KEY REFERENCES tags(id) ON DELETE CASCADE,
+                count      INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            "#,
+        ),
+        // v35 — L1 domain layer (labels live in a two-level tree; this adds the
+        // top *grouping* dimension from the tag-system design:
+        // Domain (L1) → Topic (L2) → Entity/Region (L3). A tag carries at most
+        // one domain (single-valued); entities inherit their parent topic's
+        // domain in the UI. NULL/'' = none yet (review/tidy assigns).
+        // Curated vocabulary is enforced in code (TAG_DOMAINS), not a CHECK,
+        // so the list can evolve without a migration.
+        M::up(
+            r#"
+            ALTER TABLE tags ADD COLUMN domain TEXT;
+            "#,
+        ),
     ])
 });
 
@@ -1584,8 +1616,15 @@ fn article_filter(query: &ArticleQuery, unread_only: bool) -> (Vec<String>, Vec<
             binds.push(Value::Integer(*id));
         }
         ArticleQuery::Tag(id) => {
+            // A tag click surfaces the tag *and its direct children*: nesting a
+            // topic (中东) is only useful if clicking it also shows the
+            // entities under it (伊朗、以色列…). Mirrors
+            // `tag_with_descendant_ids` (two-level forest).
             where_clauses.push(
-                "a.id IN (SELECT article_id FROM article_tags WHERE tag_id = ?)".into(),
+                "a.id IN (SELECT at.article_id FROM article_tags at
+                           WHERE at.tag_id = ?1
+                              OR at.tag_id IN (SELECT id FROM tags WHERE parent_id = ?1))"
+                    .into(),
             );
             binds.push(Value::Integer(*id));
         }
@@ -2066,7 +2105,9 @@ pub fn mark_all_read(
             Some(*id),
         ),
         ArticleQuery::Tag(id) => (
-            "id IN (SELECT article_id FROM article_tags WHERE tag_id = ?1)",
+            "id IN (SELECT article_id FROM article_tags
+                     WHERE tag_id = ?1
+                        OR tag_id IN (SELECT id FROM tags WHERE parent_id = ?1))",
             Some(*id),
         ),
     };
@@ -2141,6 +2182,8 @@ fn map_tag_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Tag> {
         article_count: r.get(5)?,
         // Per-article tag chips pass a literal 0; list endpoints compute live unread.
         unread_count: r.get(6)?,
+        tag_type: r.get(7)?,
+        parent_id: r.get(8)?,
     })
 }
 
@@ -2156,7 +2199,8 @@ pub fn list_tags(conn: &Connection, kind: Option<&str>) -> AppResult<Vec<Tag>> {
                 (SELECT COUNT(*) FROM article_tags at WHERE at.tag_id = t.id),
                 (SELECT COUNT(*) FROM article_tags at
                    JOIN articles a ON a.id = at.article_id
-                  WHERE at.tag_id = t.id AND a.is_read = 0)
+                  WHERE at.tag_id = t.id AND a.is_read = 0),
+                t.tag_type, t.parent_id
          FROM tags t WHERE t.kind = ?1
          ORDER BY t.position, t.name COLLATE NOCASE"
     } else {
@@ -2164,7 +2208,8 @@ pub fn list_tags(conn: &Connection, kind: Option<&str>) -> AppResult<Vec<Tag>> {
                 (SELECT COUNT(*) FROM article_tags at WHERE at.tag_id = t.id),
                 (SELECT COUNT(*) FROM article_tags at
                    JOIN articles a ON a.id = at.article_id
-                  WHERE at.tag_id = t.id AND a.is_read = 0)
+                  WHERE at.tag_id = t.id AND a.is_read = 0),
+                t.tag_type, t.parent_id
          FROM tags t ORDER BY t.position, t.name COLLATE NOCASE"
     };
     let mut stmt = conn.prepare(sql)?;
@@ -2206,6 +2251,9 @@ pub fn merge_tags(conn: &Connection, from_id: i64, to_id: i64) -> AppResult<usiz
          SELECT article_id, ?1 FROM article_tags WHERE tag_id = ?2",
         params![to_id, from_id],
     )?;
+    // A dismissal on the merged-away tag means the *concept* was rejected —
+    // carry it onto the survivor so auto-tag keeps skipping it after the merge.
+    carry_suppression(&tx, from_id, to_id)?;
     tx.execute("DELETE FROM tags WHERE id = ?1", params![from_id])?;
     tx.commit()?;
     // The merged-away spelling leaves articles' indexed tag lists.
@@ -2306,6 +2354,9 @@ pub fn merge_tags_keep_alias(
     for a in extra_aliases {
         aliases.push(a.clone());
     }
+
+    // Dismissal carries onto the survivor (see carry_suppression).
+    carry_suppression(&tx, from_id, to_id)?;
 
     // Delete the victim (cascades its article_tags + tag_aliases rows).
     tx.execute("DELETE FROM tags WHERE id = ?1", params![from_id])?;
@@ -2447,7 +2498,8 @@ pub fn create_tag(conn: &Connection, name: &str, kind: &str) -> AppResult<i64> {
     )?;
     let color = TAG_COLORS[(next as usize) % TAG_COLORS.len()];
     conn.execute(
-        "INSERT INTO tags(name, color, position, kind) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO tags(name, color, position, kind, created_at)
+         VALUES (?1, ?2, ?3, ?4, datetime('now'))",
         params![name, color, next, kind],
     )?;
     Ok(conn.last_insert_rowid())
@@ -2544,6 +2596,345 @@ pub fn top_tag_names(conn: &Connection, kind: &str, limit: i64) -> AppResult<Vec
         .query_map(params![kind, limit], |r| r.get(0))?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+// ─────────────────── tag dismissals, suppression & review queue ───────────────────
+
+/// Carry a dismissed tag's suppression onto a merge survivor before the victim
+/// row is deleted (the suppression table cascades on delete). When the
+/// survivor is itself suppressed the dismissal counts are summed.
+fn carry_suppression(
+    tx: &rusqlite::Transaction<'_>,
+    from_id: i64,
+    to_id: i64,
+) -> AppResult<()> {
+    let dismissed: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM tag_suppressions WHERE tag_id = ?1",
+        params![from_id],
+        |r| r.get(0),
+    )?;
+    if dismissed == 0 {
+        return Ok(());
+    }
+    tx.execute(
+        "INSERT INTO tag_suppressions(tag_id, count)
+         SELECT ?1, count FROM tag_suppressions WHERE tag_id = ?2
+         ON CONFLICT(tag_id) DO UPDATE SET
+             count = count + excluded.count,
+             updated_at = datetime('now')",
+        params![to_id, from_id],
+    )?;
+    Ok(())
+}
+
+/// Record one user dismissal of a tag (a reader removed it from an article).
+/// Once dismissed, the auto-tag writer skips the tag on every future article
+/// until an admin restores it. Every removal bumps the counter so the UI can
+/// show how often a tag was rejected before it was suppressed.
+pub fn record_tag_dismissal(conn: &Connection, tag_id: i64) -> AppResult<()> {
+    conn.execute(
+        "INSERT INTO tag_suppressions(tag_id, count) VALUES (?1, 1)
+         ON CONFLICT(tag_id) DO UPDATE SET
+             count = count + 1,
+             updated_at = datetime('now')",
+        params![tag_id],
+    )?;
+    Ok(())
+}
+
+/// Remove a tag's suppression (admin restore). The tag is auto-attachable
+/// again from the next worker run.
+pub fn unsuppress_tag(conn: &Connection, tag_id: i64) -> AppResult<()> {
+    conn.execute(
+        "DELETE FROM tag_suppressions WHERE tag_id = ?1",
+        params![tag_id],
+    )?;
+    Ok(())
+}
+
+/// Ids of every suppressed tag of `kind`. The auto-tag writer loads this once
+/// per article and skips any resolved tag that is suppressed.
+pub fn suppressed_tag_ids(conn: &Connection, kind: &str) -> AppResult<Vec<i64>> {
+    let kind = normalize_tag_kind(kind)?;
+    let mut stmt = conn.prepare(
+        "SELECT s.tag_id FROM tag_suppressions s
+         JOIN tags t ON t.id = s.tag_id
+         WHERE t.kind = ?1",
+    )?;
+    let ids = stmt
+        .query_map(params![kind], |r| r.get::<_, i64>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ids)
+}
+
+/// Suppressed tag *names* of `kind`, so the prompt reuse list can exclude them
+/// (no point showing the model a tag the writer would refuse to attach).
+pub fn suppressed_tag_names(conn: &Connection, kind: &str) -> AppResult<Vec<String>> {
+    let kind = normalize_tag_kind(kind)?;
+    let mut stmt = conn.prepare(
+        "SELECT t.name FROM tag_suppressions s
+         JOIN tags t ON t.id = s.tag_id
+         WHERE t.kind = ?1",
+    )?;
+    let names = stmt
+        .query_map(params![kind], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(names)
+}
+
+/// One row of the suppression-management UI.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuppressedTag {
+    pub id: i64,
+    pub name: String,
+    pub kind: String,
+    pub article_count: i64,
+    /// How many times readers removed this tag before it stayed suppressed.
+    pub dismissals: i64,
+    pub suppressed_at: String,
+}
+
+/// Paginated list of suppressed tags, most recently dismissed first.
+pub fn list_suppressed_tags(
+    conn: &Connection,
+    offset: i64,
+    limit: i64,
+) -> AppResult<(i64, Vec<SuppressedTag>)> {
+    let total: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM tag_suppressions s
+         JOIN tags t ON t.id = s.tag_id",
+        [],
+        |r| r.get(0),
+    )?;
+    let mut stmt = conn.prepare(
+        "SELECT t.id, t.name, t.kind,
+                (SELECT COUNT(*) FROM article_tags at WHERE at.tag_id = t.id),
+                s.count, s.updated_at
+         FROM tag_suppressions s
+         JOIN tags t ON t.id = s.tag_id
+         ORDER BY s.updated_at DESC, t.id DESC
+         LIMIT ?1 OFFSET ?2",
+    )?;
+    let rows = stmt
+        .query_map(params![limit, offset], |r| {
+            Ok(SuppressedTag {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                kind: r.get(2)?,
+                article_count: r.get(3)?,
+                dismissals: r.get(4)?,
+                suppressed_at: r.get(5)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((total, rows))
+}
+
+/// Mark a tag as triaged by an admin: it leaves the review queue for good.
+/// Repeated confirmations are no-ops; a missing tag is silently fine (it was
+/// deleted from the queue, which also removes it from review).
+pub fn confirm_tag_reviewed(conn: &Connection, tag_id: i64) -> AppResult<()> {
+    conn.execute(
+        "UPDATE tags SET reviewed_at = datetime('now')
+         WHERE id = ?1 AND reviewed_at IS NULL",
+        params![tag_id],
+    )?;
+    Ok(())
+}
+
+/// One row of the review queue (AI tags still needing an admin decision).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewQueueItem {
+    pub id: i64,
+    pub name: String,
+    pub article_count: i64,
+    pub tag_type: Option<String>,
+    pub parent_id: Option<i64>,
+    pub parent_name: Option<String>,
+    pub created_at: Option<String>,
+    /// Suppressed tags are flagged so the queue can double as a restore
+    /// surface; `dismissals` is then how often readers rejected the tag.
+    pub suppressed: bool,
+    pub dismissals: i64,
+    /// Recent article titles carrying this tag, to judge what it means.
+    pub samples: Vec<String>,
+}
+
+/// The review queue: unreviewed AI tags, one page at a time. `filter` is one
+/// of `new` (created in the last 30 days), `single` (used by exactly one
+/// article), `unparented` (entity tags without a parent topic), or `all`
+/// (every unreviewed AI tag). Each filter maps to a fixed SQL fragment — the
+/// input is never spliced into the query.
+pub fn review_queue(
+    conn: &Connection,
+    filter: &str,
+    offset: i64,
+    limit: i64,
+) -> AppResult<(i64, Vec<ReviewQueueItem>)> {
+    let usage = "(SELECT COUNT(*) FROM article_tags at WHERE at.tag_id = t.id)";
+    let (predicate, order): (String, String) = match filter {
+        "new" => (
+            "t.reviewed_at IS NULL AND t.created_at IS NOT NULL
+             AND t.created_at >= datetime('now', '-30 days')"
+                .to_string(),
+            "t.created_at DESC, t.id DESC".to_string(),
+        ),
+        "single" => (
+            "t.reviewed_at IS NULL AND {usage} = 1".replace("{usage}", usage),
+            "t.id DESC".to_string(),
+        ),
+        "unparented" => (
+            "t.reviewed_at IS NULL AND t.tag_type = 'entity' AND t.parent_id IS NULL".to_string(),
+            format!("{usage} DESC, t.id DESC"),
+        ),
+        _ => ("t.reviewed_at IS NULL".to_string(), "t.id DESC".to_string()),
+    };
+    let where_clause = format!("t.kind = 'ai' AND {predicate}");
+    let total: i64 = conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM tags t
+             LEFT JOIN tag_suppressions s ON s.tag_id = t.id
+             WHERE {where_clause}"
+        ),
+        [],
+        |r| r.get(0),
+    )?;
+    if total == 0 || limit <= 0 {
+        return Ok((total, Vec::new()));
+    }
+    let sql = format!(
+        "SELECT t.id, t.name, {usage}, t.tag_type, t.parent_id,
+                (SELECT p.name FROM tags p WHERE p.id = t.parent_id),
+                t.created_at, (s.tag_id IS NOT NULL), COALESCE(s.count, 0)
+         FROM tags t
+         LEFT JOIN tag_suppressions s ON s.tag_id = t.id
+         WHERE {where_clause}
+         ORDER BY {order}
+         LIMIT ?1 OFFSET ?2"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(params![limit, offset], |r| {
+            Ok(ReviewQueueItem {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                article_count: r.get(2)?,
+                tag_type: r.get(3)?,
+                parent_id: r.get(4)?,
+                parent_name: r.get(5)?,
+                created_at: r.get(6)?,
+                suppressed: r.get(7)?,
+                dismissals: r.get(8)?,
+                samples: Vec::new(),
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    // Attach sample titles (a bounded query per row, matching the tidy pass).
+    let mut out = Vec::with_capacity(rows.len());
+    for mut item in rows {
+        item.samples = tag_sample_titles(conn, item.id, 3)?;
+        out.push(item);
+    }
+    Ok((total, out))
+}
+
+/// The most recent article titles carrying `tag_id`, newest first — used to
+/// disambiguate what a tag means when reviewing the vocabulary.
+pub fn tag_sample_titles(conn: &Connection, tag_id: i64, n: i64) -> AppResult<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT a.title FROM articles a
+         JOIN article_tags at ON at.article_id = a.id
+         WHERE at.tag_id = ?1 AND trim(a.title) != ''
+         ORDER BY datetime(COALESCE(a.published_at, a.fetched_at)) DESC, a.id DESC
+         LIMIT ?2",
+    )?;
+    let rows = stmt
+        .query_map(params![tag_id, n], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Find a tag id by (kind, name), case-insensitive and trimmed. `None` when
+/// it does not exist. Used by the manual hierarchy editor — a parent topic
+/// must already exist before a tag is nested under it.
+pub fn find_tag_id_by_name(conn: &Connection, kind: &str, name: &str) -> AppResult<Option<i64>> {
+    let kind = normalize_tag_kind(kind)?;
+    let id = conn
+        .query_row(
+            "SELECT id FROM tags WHERE kind = ?1 AND name = ?2 COLLATE NOCASE",
+            params![kind, name.trim()],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()?;
+    Ok(id)
+}
+
+/// The kind of one tag (`interest` | `ai`); `None` when it does not exist.
+pub fn tag_kind(conn: &Connection, tag_id: i64) -> AppResult<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT kind FROM tags WHERE id = ?1",
+            params![tag_id],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+/// Validate nesting `child_id` under `parent_id` for the manual hierarchy
+/// editor — stricter than the batch tidy pass, which guarantees its own shape.
+/// Rejects: missing/self/same-kind violations, a parent that is already a
+/// level-1 child (would make the tree three levels deep), a child that
+/// already has children (would push its subtree down a level), and an
+/// `entity` parent (entities are leaves, not containers). Returns a
+/// localisable error code on violation.
+pub fn validate_tag_parent_link(
+    conn: &Connection,
+    child_id: i64,
+    parent_id: i64,
+) -> AppResult<()> {
+    if child_id == parent_id {
+        return Err(AppError::code("tagParentSelf"));
+    }
+    let child: Option<(String,)> = conn
+        .query_row(
+            "SELECT kind FROM tags WHERE id = ?1",
+            params![child_id],
+            |r| Ok((r.get(0)?,)),
+        )
+        .optional()?;
+    let Some((child_kind,)) = child else {
+        return Err(AppError::code("tagNotFound"));
+    };
+    let parent: Option<(String, Option<String>, Option<i64>)> = conn
+        .query_row(
+            "SELECT kind, tag_type, parent_id FROM tags WHERE id = ?1",
+            params![parent_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let Some((parent_kind, parent_type, parent_parent)) = parent else {
+        return Err(AppError::code("tagNotFound"));
+    };
+    if parent_kind != child_kind {
+        return Err(AppError::code("tagKindMismatch"));
+    }
+    if parent_parent.is_some() {
+        return Err(AppError::code("tagParentTooDeep"));
+    }
+    if parent_type.as_deref() == Some("entity") {
+        return Err(AppError::code("tagParentEntity"));
+    }
+    let child_kids: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM tags WHERE parent_id = ?1",
+        params![child_id],
+        |r| r.get(0),
+    )?;
+    if child_kids > 0 {
+        return Err(AppError::code("tagParentWouldNest"));
+    }
+    Ok(())
 }
 
 // ─────────────────────────── tag aliases ───────────────────────────
@@ -3272,7 +3663,7 @@ pub fn clear_auto_tag_queue(conn: &Connection) -> AppResult<usize> {
 /// Tags attached to one article (counts left at 0 — unused per-article).
 pub fn tags_for_article(conn: &Connection, article_id: i64) -> AppResult<Vec<Tag>> {
     let mut stmt = conn.prepare(
-        "SELECT t.id, t.name, t.color, t.position, t.kind, 0, 0
+        "SELECT t.id, t.name, t.color, t.position, t.kind, 0, 0, NULL, NULL
          FROM tags t JOIN article_tags at ON at.tag_id = t.id
          WHERE at.article_id = ?1
          ORDER BY t.kind, t.position, t.name COLLATE NOCASE",
@@ -3300,7 +3691,8 @@ pub fn tags_for_articles(
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!(
-        "SELECT at.article_id, t.id, t.name, t.color, t.position, t.kind, 0, 0
+        "SELECT at.article_id, t.id, t.name, t.color, t.position, t.kind, 0, 0,
+                t.tag_type, t.parent_id
          FROM tags t JOIN article_tags at ON at.tag_id = t.id
          WHERE at.article_id IN ({placeholders})
          ORDER BY at.article_id, t.kind, t.position, t.name COLLATE NOCASE"
@@ -3317,6 +3709,8 @@ pub fn tags_for_articles(
             kind: r.get(5)?,
             article_count: r.get(6)?,
             unread_count: r.get(7)?,
+            tag_type: r.get(8)?,
+            parent_id: r.get(9)?,
         };
         Ok((article_id, tag))
     })?;
@@ -4505,6 +4899,29 @@ pub fn requeue_sync(conn: &Connection, article_id: i64, field: &str, value: bool
     Ok(())
 }
 
+/// Assign (or clear) a tag's L1 domain. Validates against [`TAG_DOMAINS`];
+/// `None` clears. Entities are expected to inherit their parent topic's domain
+/// at display time.
+pub fn set_tag_domain(conn: &Connection, id: i64, domain: Option<&str>) -> AppResult<()> {
+    let value = match domain.map(str::trim) {
+        None | Some("") => None,
+        Some(d) => {
+            if !crate::models::valid_tag_domain(d) {
+                return Err(AppError::other(format!("invalid tag domain: {d}")));
+            }
+            Some(d.to_string())
+        }
+    };
+    let n = conn.execute(
+        "UPDATE tags SET domain = ?2 WHERE id = ?1",
+        params![id, value],
+    )?;
+    if n == 0 {
+        return Err(AppError::code("tagNotFound"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5079,6 +5496,60 @@ mod tests {
         assert!(
             order.iter().position(|&x| x == a) < order.iter().position(|&x| x == zoo),
         );
+    }
+
+    #[test]
+    fn tag_click_includes_nested_children() {
+        // Clicking a parent topic surfaces the tag *and* its direct children
+        // (the two-level forest: topic → entities). Both list + mark-all-read
+        // must agree so a tag view never hides or leaves unread sub-articles.
+        let (conn, article_id) = test_db();
+        let feed_id: i64 = conn
+            .query_row("SELECT id FROM feeds", [], |r| r.get(0))
+            .unwrap();
+        let child_article = NewArticle {
+            guid: "child-of-tag".into(),
+            url: Some("https://example.com/child-of-tag".into()),
+            title: "Child".into(),
+            author: None,
+            summary: None,
+            content_html: None,
+            body_text: "b".into(),
+            image_url: None,
+            published_at: None,
+            enclosures: Vec::new(),
+        };
+        upsert_article(&conn, feed_id, &child_article, false, &[]).unwrap();
+        let child_aid: i64 = conn
+            .query_row(
+                "SELECT id FROM articles WHERE guid = 'child-of-tag'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        let parent = create_tag(&conn, "Middle East", TAG_KIND_AI).unwrap();
+        let child = create_tag(&conn, "Iran", TAG_KIND_AI).unwrap();
+        set_article_tag(&conn, article_id, parent, true).unwrap();
+        set_article_tag(&conn, child_aid, child, true).unwrap();
+        set_tag_parent(&conn, child, Some(parent)).unwrap();
+
+        // Parent click → both the parent's article and the child's article.
+        let rows =
+            list_articles(&conn, &ArticleQuery::Tag(parent), false, None, true, 50, 0).unwrap();
+        let mut ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+        ids.sort_unstable();
+        let mut expect = vec![article_id, child_aid];
+        expect.sort_unstable();
+        assert_eq!(ids, expect, "parent tag click includes nested children");
+        // Child click → only the child's own article (children have none).
+        let rows =
+            list_articles(&conn, &ArticleQuery::Tag(child), false, None, true, 50, 0).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, child_aid);
+        // Mark-all-read on the parent covers both too.
+        let n = mark_all_read(&conn, &ArticleQuery::Tag(parent), false).unwrap();
+        assert_eq!(n, 2);
     }
 
     #[test]
@@ -7319,4 +7790,183 @@ mod tests {
             .unwrap();
         assert_eq!(leftover, 0);
     }
+
+    // ── feedback loop: dismissals / suppression / review queue ──────────
+
+    #[test]
+    fn dismissal_counts_restores_and_lists() {
+        let (conn, _) = test_db();
+        let fed = create_tag(&conn, "Fed", TAG_KIND_AI).unwrap();
+
+        record_tag_dismissal(&conn, fed).unwrap();
+        record_tag_dismissal(&conn, fed).unwrap();
+        assert_eq!(suppressed_tag_ids(&conn, TAG_KIND_AI).unwrap(), vec![fed]);
+        assert_eq!(
+            suppressed_tag_names(&conn, TAG_KIND_AI).unwrap(),
+            vec!["Fed"]
+        );
+        // The interest vocabulary is untouched by AI dismissals.
+        assert!(suppressed_tag_ids(&conn, TAG_KIND_INTEREST)
+            .unwrap()
+            .is_empty());
+
+        let (total, list) = list_suppressed_tags(&conn, 0, 20).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(list[0].id, fed);
+        assert_eq!(list[0].name, "Fed");
+        assert_eq!(list[0].dismissals, 2);
+
+        unsuppress_tag(&conn, fed).unwrap();
+        assert!(suppressed_tag_ids(&conn, TAG_KIND_AI).unwrap().is_empty());
+        let (total, _) = list_suppressed_tags(&conn, 0, 20).unwrap();
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn new_tags_enter_review_until_confirmed() {
+        let (conn, _) = test_db();
+        let fresh = create_tag(&conn, "fresh-topic", TAG_KIND_AI).unwrap();
+        let created: Option<String> = conn
+            .query_row(
+                "SELECT created_at FROM tags WHERE id = ?1",
+                params![fresh],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(created.is_some(), "new tags carry a created_at timestamp");
+
+        // Fresh + unreviewed → listed under the "new" filter.
+        let (total, items) = review_queue(&conn, "new", 0, 50).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(items[0].id, fresh);
+        assert!(!items[0].suppressed);
+
+        confirm_tag_reviewed(&conn, fresh).unwrap();
+        confirm_tag_reviewed(&conn, fresh).unwrap(); // idempotent
+        let (total, _) = review_queue(&conn, "new", 0, 50).unwrap();
+        assert_eq!(total, 0, "reviewed tags leave the queue");
+
+        // Legacy rows (created_at NULL) never surface as "new".
+        conn.execute(
+            "UPDATE tags SET created_at = NULL, reviewed_at = NULL WHERE id = ?1",
+            params![fresh],
+        )
+        .unwrap();
+        let (total, _) = review_queue(&conn, "new", 0, 50).unwrap();
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn review_queue_filters_single_and_unparented() {
+        let (conn, article_id) = test_db();
+        let feed_id: i64 = conn
+            .query_row("SELECT id FROM feeds", [], |r| r.get(0))
+            .unwrap();
+
+        // cold: used once (single). hot: used twice (not single).
+        let hot = create_tag(&conn, "hot-topic", TAG_KIND_AI).unwrap();
+        let cold = create_tag(&conn, "cold-topic", TAG_KIND_AI).unwrap();
+        set_article_tag(&conn, article_id, cold, true).unwrap();
+        set_article_tag(&conn, article_id, hot, true).unwrap();
+        let second = NewArticle {
+            guid: "single-2".into(),
+            url: Some("https://example.com/single-2".into()),
+            title: "Second".into(),
+            author: None,
+            summary: None,
+            content_html: None,
+            body_text: "b".into(),
+            image_url: None,
+            published_at: None,
+            enclosures: Vec::new(),
+        };
+        upsert_article(&conn, feed_id, &second, false, &[]).unwrap();
+        let a2: i64 = conn
+            .query_row("SELECT id FROM articles WHERE guid = 'single-2'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        set_article_tag(&conn, a2, hot, true).unwrap();
+
+        let (total, items) = review_queue(&conn, "single", 0, 50).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(items[0].id, cold);
+        assert_eq!(items[0].samples.len(), 1);
+
+        // An entity without a parent is the unparented queue's target.
+        let iran = create_tag(&conn, "Iran", TAG_KIND_AI).unwrap();
+        let middle_east = create_tag(&conn, "Middle East", TAG_KIND_AI).unwrap();
+        set_tag_type(&conn, iran, Some("entity")).unwrap();
+        set_tag_type(&conn, middle_east, Some("topic")).unwrap();
+        let (total, items) = review_queue(&conn, "unparented", 0, 50).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(items[0].id, iran);
+
+        // Nesting it removes it from the queue.
+        set_tag_parent(&conn, iran, Some(middle_east)).unwrap();
+        let (total, _) = review_queue(&conn, "unparented", 0, 50).unwrap();
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn merge_carries_suppression_onto_survivor() {
+        let (conn, _) = test_db();
+        let victim = create_tag(&conn, "Middle-East", TAG_KIND_AI).unwrap();
+        let survivor = create_tag(&conn, "Middle East", TAG_KIND_AI).unwrap();
+        record_tag_dismissal(&conn, victim).unwrap();
+
+        // Both merge flavours (plain merge_tags, tidy's merge_tags_keep_alias)
+        // must move the dismissal to the survivor.
+        let victim2 = create_tag(&conn, "middle_east", TAG_KIND_AI).unwrap();
+        let moved = merge_tags(&conn, victim, survivor).unwrap();
+        assert_eq!(moved, 0);
+        let moved = merge_tags_keep_alias(&conn, victim2, survivor, &[]).unwrap();
+        assert_eq!(moved, 0);
+
+        let suppressed = suppressed_tag_ids(&conn, TAG_KIND_AI).unwrap();
+        assert!(suppressed.contains(&survivor));
+        assert_eq!(suppressed.len(), 1, "victims deleted → only survivor left");
+    }
+
+    #[test]
+    fn validate_parent_link_enforces_two_level_forest() {
+        let (conn, _) = test_db();
+        let region = create_tag(&conn, "Middle East", TAG_KIND_AI).unwrap();
+        let iran = create_tag(&conn, "Iran", TAG_KIND_AI).unwrap();
+        let sub_topic = create_tag(&conn, "Iran Economy", TAG_KIND_AI).unwrap();
+        let entity = create_tag(&conn, "OpenAI", TAG_KIND_AI).unwrap();
+        set_tag_type(&conn, region, Some("topic")).unwrap();
+        set_tag_type(&conn, iran, Some("entity")).unwrap();
+        set_tag_type(&conn, entity, Some("entity")).unwrap();
+
+        // Region already has a child (Iran) → using region as a child would
+        // push its subtree down a level.
+        set_tag_parent(&conn, iran, Some(region)).unwrap();
+        assert!(matches!(
+            validate_tag_parent_link(&conn, region, sub_topic).unwrap_err(),
+            AppError::Coded("tagParentWouldNest")
+        ));
+        // sub_topic (no children) is fine under region — but region already
+        // holds iran… region itself is top-level, so nesting sub_topic under
+        // region stays two levels. Exercise a deep-parent rejection: iran is
+        // already level-1, so it cannot be a parent.
+        assert!(matches!(
+            validate_tag_parent_link(&conn, sub_topic, iran).unwrap_err(),
+            AppError::Coded("tagParentTooDeep")
+        ));
+        // An entity cannot be a container.
+        assert!(matches!(
+            validate_tag_parent_link(&conn, sub_topic, entity).unwrap_err(),
+            AppError::Coded("tagParentEntity")
+        ));
+        // Self-parent rejected up front.
+        assert!(matches!(
+            validate_tag_parent_link(&conn, region, region).unwrap_err(),
+            AppError::Coded("tagParentSelf")
+        ));
+        // The happy path validates and applies.
+        validate_tag_parent_link(&conn, sub_topic, region).unwrap();
+        set_tag_parent(&conn, sub_topic, Some(region)).unwrap();
+    }
 }
+
