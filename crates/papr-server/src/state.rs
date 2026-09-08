@@ -11,6 +11,14 @@ use tokio::sync::Mutex;
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<Mutex<Connection>>,
+    /// Read-only connection (SQLite WAL) for HTTP list/search handlers.
+    ///
+    /// The app keeps a single writer connection behind one mutex; if read
+    /// handlers used it too, every background write batch (feed refresh,
+    /// word-cloud backfill, retention, …) would make lists/search/tag views
+    /// queue behind the writer for seconds. WAL lets reads run concurrently on
+    /// their own connection, so read handlers never wait on writers.
+    pub db_reader: Arc<Mutex<Connection>>,
     pub http: reqwest::Client,
     pub wordcloud: Arc<SharedWordCloudDict>,
     /// Count of in-flight manual `POST /api/articles/{id}/auto-tag` calls.
@@ -34,8 +42,11 @@ impl AppState {
             let _ = wordcloud::ensure_dict_version(&conn);
             let _ = wordcloud.with_dict(|dict| wordcloud::sync_dict_file_version(&conn, dict));
         }
+        // Reader must open after the writer migrated the schema.
+        let reader = db::open_reader(db_path)?;
         Ok(Self {
             db: Arc::new(Mutex::new(conn)),
+            db_reader: Arc::new(Mutex::new(reader)),
             http,
             wordcloud,
             auto_tag_manual_inflight: Arc::new(AtomicUsize::new(0)),

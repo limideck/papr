@@ -61,6 +61,13 @@ pub enum RefreshScope {
 /// shared DB lock between each so concurrent queries aren't starved while a
 /// large feed (hundreds of items) is being ingested. Returns the count newly
 /// inserted; `label` only distinguishes the warning text (`rss`/`newsletter`).
+/// How many articles are written under one DB-lock hold during a feed's
+/// refresh batch. Every article insert also tokenizes word-cloud terms, so a
+/// big chunk can pin the single shared connection for hundreds of ms and make
+/// HTTP lists/search/tag reads queue behind it. Small chunks bound the worst
+/// reader stall.
+const WRITE_CHUNK_ARTICLES: usize = 16;
+
 async fn upsert_articles(
     db: &Mutex<Connection>,
     feed_id: i64,
@@ -70,7 +77,7 @@ async fn upsert_articles(
     label: &str,
 ) -> usize {
     let mut new_count = 0usize;
-    for chunk in articles.chunks(64) {
+    for chunk in articles.chunks(WRITE_CHUNK_ARTICLES) {
         let conn = db.lock().await;
         for article in chunk {
             match db::upsert_article(&conn, feed_id, article, dedup, rules) {
@@ -79,6 +86,10 @@ async fn upsert_articles(
                 Err(e) => log::warn!("{label} upsert failed (feed {feed_id}): {e}"),
             }
         }
+        drop(conn);
+        // Yield between chunks so queued readers get a turn instead of a whole
+        // multi-hundred-article feed monopolizing the lock.
+        tokio::task::yield_now().await;
     }
     new_count
 }

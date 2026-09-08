@@ -109,13 +109,13 @@ pub async fn list(
     let use_meili = q.sort_by_relevance
         && !q.oldest_first
         && search.is_some()
-        && meili::engine_is_meili(&*state.db.lock().await)
+        && meili::engine_is_meili(&*state.db_reader.lock().await)
         && meili::meili_eligible(search.unwrap());
     if debug_timing {
         tracing::info!("list: eligibility={} t={:?}", use_meili, _t0.elapsed());
     }
     let meili_ids: Option<Vec<i64>> = if use_meili {
-        let cfg = meili::MeiliConfig::from_db(&*state.db.lock().await);
+        let cfg = meili::MeiliConfig::from_db(&*state.db_reader.lock().await);
         if !cfg.enabled() {
             None
         } else {
@@ -135,7 +135,7 @@ pub async fn list(
     } else {
         None
     };
-    let conn = state.db.lock().await;
+    let conn = state.db_reader.lock().await;
     if debug_timing {
         tracing::info!("list: db locked t={:?}", _t0.elapsed());
     }
@@ -183,10 +183,10 @@ pub async fn list_post(
     let use_meili = body.sort_by_relevance
         && !body.oldest_first
         && search.is_some()
-        && meili::engine_is_meili(&*state.db.lock().await)
+        && meili::engine_is_meili(&*state.db_reader.lock().await)
         && meili::meili_eligible(search.unwrap());
     let meili_ids: Option<Vec<i64>> = if use_meili {
-        let cfg = meili::MeiliConfig::from_db(&*state.db.lock().await);
+        let cfg = meili::MeiliConfig::from_db(&*state.db_reader.lock().await);
         if !cfg.enabled() {
             None
         } else {
@@ -201,7 +201,7 @@ pub async fn list_post(
     } else {
         None
     };
-    let conn = state.db.lock().await;
+    let conn = state.db_reader.lock().await;
     let rows = if let Some(ids) = meili_ids {
         user_db::list_articles_for_user_in_ids(
             &conn,
